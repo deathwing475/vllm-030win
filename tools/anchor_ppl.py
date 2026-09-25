@@ -5,7 +5,8 @@
 #   - PPL 在**裸 message content**上计算（不经 chat template），隔离权重/量化路径数值，
 #     跨栈稳定；模板渲染漂移由 prompt sha256 + tokenizer sha256 记录捕获
 #   - mean_nll = -sum(logprob)/n_tokens（prompt_logprobs=0 取实际 token 的 logprob）
-#   - eager 模式 + 默认 KV dtype，记录进 meta；新栈复跑必须同口径后才可比
+#   - eager 模式 + nvfp4 KV + language_model_only + max_num_batched_tokens=1024
+#     （对齐生产 N2 配方数值口径），全部记录进 meta；新栈复跑必须同口径后才可比
 #
 # 用法（现役栈 = vllm-win venv + overlay）：
 #   G:\qwen3.8model\vllm-win\Scripts\python.exe tools\anchor_ppl.py ^
@@ -28,7 +29,9 @@ def main() -> int:
     ap.add_argument("--model", default=r"G:\qwen3.8model\Qwen3.8-27B-3Bit-GSQ")
     ap.add_argument("--out", required=True)
     ap.add_argument("--max-model-len", type=int, default=57344)
-    ap.add_argument("--gpu-mem", type=float, default=0.90)
+    ap.add_argument("--gpu-mem", type=float, default=0.922)
+    ap.add_argument("--kv-dtype", default="nvfp4")
+    ap.add_argument("--max-num-batched-tokens", type=int, default=1024)
     args = ap.parse_args()
 
     t0 = time.time()
@@ -37,6 +40,8 @@ def main() -> int:
 
     llm = LLM(model=args.model, max_model_len=args.max_model_len,
               gpu_memory_utilization=args.gpu_mem, enforce_eager=True,
+              kv_cache_dtype=args.kv_dtype, language_model_only=True,
+              max_num_batched_tokens=args.max_num_batched_tokens,
               disable_log_stats=True)
     tok = llm.get_tokenizer()
 
@@ -48,7 +53,9 @@ def main() -> int:
         "max_model_len": args.max_model_len,
         "gpu_mem": args.gpu_mem,
         "enforce_eager": True,
-        "kv_dtype": "default",
+        "kv_dtype": args.kv_dtype,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "language_model_only": True,
         "tokenizer_sha256": sha256(tok.backend_tokenizer.to_str()
                                    if hasattr(tok, "backend_tokenizer") else str(type(tok))),
         "prompt_scheme": "raw message content (no chat template), _spec_eval_prompts",
