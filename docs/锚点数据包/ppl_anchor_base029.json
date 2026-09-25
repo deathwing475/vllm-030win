@@ -1,0 +1,76 @@
+{
+  "meta": {
+    "stack": "base-0.29-whl",
+    "vllm_version": "0.29.0",
+    "torch_version": "2.11.0+cu130",
+    "model": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ",
+    "max_model_len": 52288,
+    "gpu_mem": 0.922,
+    "enforce_eager": true,
+    "kv_dtype": "auto",
+    "max_num_batched_tokens": 1024,
+    "language_model_only": true,
+    "tokenizer_sha256": "ffb7a28b27dabcc333662fd3e0b0005d9e79a1c22e31453ab5a3017fbd5f25c0",
+    "prompt_scheme": "raw message content (no chat template), _spec_eval_prompts",
+    "created": "2026-09-26 03:32:32",
+    "elapsed_s": 246.4
+  },
+  "results": {
+    "code_4k": {
+      "prompt_sha256": "545d6de859f953e8cecf301c888c2b7dd972453603f4f1cd2487135ada331779",
+      "n_tokens": 4018,
+      "sum_logprob": -2034.843698,
+      "mean_nll": 0.506432,
+      "ppl": 1.65936
+    },
+    "doc_4k": {
+      "prompt_sha256": "a9534ac4a22d4c96ce18a06e234a4377e5d9a7c74f920851550ce1e0a767150c",
+      "n_tokens": 4070,
+      "sum_logprob": -9915.376009,
+      "mean_nll": 2.43621,
+      "ppl": 11.429644
+    },
+    "reason_4k": {
+      "prompt_sha256": "74a4dd2066dbbc8d0bc64b47a3e6531c0e145b5ba74cce29cfc13bb58c6bf6f8",
+      "n_tokens": 4038,
+      "sum_logprob": -4457.230759,
+      "mean_nll": 1.103821,
+      "ppl": 3.015668
+    },
+    "code_16k": {
+      "prompt_sha256": "2d02f14a6933ae57b72a3970d1473aa029691bbb1626cf7abc7c982545e8d2c7",
+      "n_tokens": 16322,
+      "sum_logprob": -16824.866295,
+      "mean_nll": 1.030809,
+      "ppl": 2.803333
+    },
+    "doc_16k": {
+      "prompt_sha256": "bbd37cb2a5a809889b534c187d02110e38389f62d5e6c6d88649a7bb0528cdda",
+      "n_tokens": 16236,
+      "sum_logprob": -39617.483072,
+      "mean_nll": 2.440101,
+      "ppl": 11.474202
+    },
+    "reason_16k": {
+      "prompt_sha256": "9e5895be1680a1bae13c0d1858f5edbeafb2ca8ed450084029bfd0e4e1179263",
+      "n_tokens": 16265,
+      "sum_logprob": -11726.871194,
+      "mean_nll": 0.720988,
+      "ppl": 2.056464
+    },
+    "code_48k": {
+      "prompt_sha256": "0fd331383f63e32886b476f9e4d2f662115a67ffc4e8247145d269ee91206b38",
+      "n_tokens": 49037,
+      "sum_logprob": -41565.061955,
+      "mean_nll": 0.847627,
+      "ppl": 2.3341
+    },
+    "doc_48k": {
+      "prompt_sha256": "6449bc157c966de668538a2afb08409aabab850bb2c70ee14f3e8bfe3bb895a6",
+      "n_tokens": 48753,
+      "sum_logprob": -127456.10226,
+      "mean_nll": 2.614323,
+      "ppl": 13.65797
+    }
+  }
+}
