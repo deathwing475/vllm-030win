@@ -1,0 +1,116 @@
+#pragma once
+
+#include <cerrno>
+#include <cstddef>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+class MappedFile {
+public:
+  explicit MappedFile(const std::string &path) {
+    int wide_len = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    std::wstring wpath(wide_len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wide_len);
+    HANDLE file = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) throw_error("open", path, GetLastError());
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0) {
+      DWORD error = GetLastError();
+      CloseHandle(file);
+      throw std::runtime_error("empty or unreadable file: " + path);
+    }
+    size_ = static_cast<size_t>(size.QuadPart);
+    HANDLE mapping = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    DWORD error = GetLastError();
+    CloseHandle(file);
+    if (mapping == nullptr) throw_error("CreateFileMapping", path, error);
+    data_ = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    error = GetLastError();
+    CloseHandle(mapping);
+    if (data_ == nullptr) throw_error("MapViewOfFile", path, error);
+  }
+
+  MappedFile(const MappedFile &) = delete;
+  MappedFile &operator=(const MappedFile &) = delete;
+
+  ~MappedFile() {
+    if (data_ != nullptr) UnmapViewOfFile(data_);
+  }
+
+  const void *data() const { return data_; }
+  size_t size() const { return size_; }
+
+private:
+  [[noreturn]] static void throw_error(const char *operation, const std::string &path, DWORD error) {
+    throw std::runtime_error(std::string(operation) + " failed for " + path + ": error " +
+                             std::to_string(error));
+  }
+
+  void *data_ = nullptr;
+  size_t size_ = 0;
+};
+
+#else
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+class MappedFile {
+public:
+  explicit MappedFile(const std::string &path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) throw_error("open", path, errno);
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+      int error = errno;
+      close(fd);
+      throw_error("fstat", path, error);
+    }
+    if (st.st_size <= 0) {
+      close(fd);
+      throw std::runtime_error("empty file: " + path);
+    }
+
+    size_ = static_cast<size_t>(st.st_size);
+    data_ = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
+    int error = errno;
+    close(fd);
+    if (data_ == MAP_FAILED) {
+      data_ = nullptr;
+      throw_error("mmap", path, error);
+    }
+  }
+
+  MappedFile(const MappedFile &) = delete;
+  MappedFile &operator=(const MappedFile &) = delete;
+
+  ~MappedFile() {
+    if (data_ != nullptr) munmap(data_, size_);
+  }
+
+  const void *data() const { return data_; }
+  size_t size() const { return size_; }
+
+private:
+  [[noreturn]] static void throw_error(const char *operation, const std::string &path, int error) {
+    throw std::runtime_error(
+        std::string(operation) + " failed for " + path + ": " + std::strerror(error));
+  }
+
+  void *data_ = nullptr;
+  size_t size_ = 0;
+};
+
+#endif
