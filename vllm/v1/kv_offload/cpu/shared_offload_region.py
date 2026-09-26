@@ -3,6 +3,7 @@
 import errno
 import mmap
 import os
+import tempfile
 import time
 from collections.abc import Callable
 
@@ -34,6 +35,27 @@ def _wait_for_file_size(fd: int, expected_size: int, timeout: float = 30.0) -> N
         time.sleep(0.005)
 
 
+def _wait_for_path_size(path: str, expected_size: int, timeout: float = 30.0) -> None:
+    """Wait for a creator to resize a file before opening it on Windows.
+
+    Opening the zero-length file from another Windows process can prevent the
+    creator from resizing it. Polling by path keeps joiners from acquiring a
+    file handle until initialization is complete.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            if os.path.getsize(path) >= expected_size:
+                return
+        except FileNotFoundError:
+            pass
+        if time.monotonic() > deadline:
+            raise TimeoutError(
+                f"Timed out waiting for mmap file {path} to reach {expected_size} bytes"
+            )
+        time.sleep(0.005)
+
+
 def _madvise_populate_write(mmap_obj: mmap.mmap, offset: int, length: int) -> None:
     mmap_obj.madvise(_MADV_POPULATE_WRITE, offset, length)
 
@@ -52,8 +74,8 @@ def _get_populate_write_fn(
     """Select the pre-faulting method once for this mmap."""
     try:
         _madvise_populate_write(mmap_obj, 0, mmap.PAGESIZE)
-    except OSError as e:
-        if e.errno != errno.EINVAL:
+    except (OSError, AttributeError) as e:
+        if isinstance(e, OSError) and e.errno != errno.EINVAL:
             raise
         logger.warning(
             "MADV_POPULATE_WRITE is not supported; falling back to per-page "
@@ -71,7 +93,8 @@ class SharedOffloadRegion:
     the rest open the existing file and wait until it reaches the expected
     size.  Each worker then mmap()s the full file.
 
-    File path: /dev/shm/vllm_offload_{engine_id}.mmap.  When a barrier is
+    File path: /dev/shm/vllm_offload_{engine_id}.mmap on POSIX; on Windows the
+    file lives in the system temporary directory.  When a barrier is
     given, the path is unlinked once every worker has mapped the file, so
     the kernel reclaims the memory when the last worker exits, no matter
     how it exits; mappings taken before the unlink stay valid.
@@ -95,7 +118,8 @@ class SharedOffloadRegion:
         self._row_stride = kv_bytes_per_block
         self.total_size_bytes = self.num_blocks * self._row_stride
 
-        self.mmap_path = f"/dev/shm/vllm_offload_{engine_id}.mmap"
+        mmap_root = tempfile.gettempdir() if os.name == "nt" else "/dev/shm"
+        self.mmap_path = os.path.join(mmap_root, f"vllm_offload_{engine_id}.mmap")
         self._creator = False  # set True only if this worker creates the file
         self.rank = rank
         if rank is not None:
@@ -110,13 +134,18 @@ class SharedOffloadRegion:
                 )
             except FileExistsError:
                 # Joiner path — another worker won O_EXCL. Reopen and wait
-                # for the file to reach expected size.
+                # for the file to reach expected size. On Windows, opening the
+                # zero-length file can block the creator's ftruncate, so poll
+                # the path size before acquiring a handle (overlay fix).
+                if os.name == "nt":
+                    _wait_for_path_size(self.mmap_path, self.total_size_bytes)
                 self.fd = os.open(self.mmap_path, os.O_RDWR)
-                try:
-                    _wait_for_file_size(self.fd, self.total_size_bytes)
-                except (TimeoutError, OSError):
-                    os.close(self.fd)
-                    raise
+                if os.name != "nt":
+                    try:
+                        _wait_for_file_size(self.fd, self.total_size_bytes)
+                    except (TimeoutError, OSError):
+                        os.close(self.fd)
+                        raise
                 logger.info("Opened existing mmap file %s", self.mmap_path)
             else:
                 # Creator path. We won O_EXCL, so we own the file: any
@@ -137,12 +166,17 @@ class SharedOffloadRegion:
                     self.total_size_bytes / 1e9,
                 )
 
-            self.mmap_obj: mmap.mmap | None = mmap.mmap(
-                self.fd,
-                self.total_size_bytes,
-                flags=mmap.MAP_SHARED,
-                prot=mmap.PROT_READ | mmap.PROT_WRITE,
-            )
+            if os.name == "nt":
+                self.mmap_obj: mmap.mmap | None = mmap.mmap(
+                    self.fd, self.total_size_bytes, access=mmap.ACCESS_WRITE
+                )
+            else:
+                self.mmap_obj = mmap.mmap(
+                    self.fd,
+                    self.total_size_bytes,
+                    flags=mmap.MAP_SHARED,
+                    prot=mmap.PROT_READ | mmap.PROT_WRITE,
+                )
         except Exception:
             if self._creator:
                 os.unlink(self.mmap_path)
