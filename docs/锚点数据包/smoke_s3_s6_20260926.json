@@ -1,0 +1,74 @@
+{
+  "capture": "2026-09-26, stage-1 smoke S3-S6 on pure 0.29 base (vllm 0.29.0+cu132, torch 2.11.0+cu130, flashinfer 0.6.11.post3, humming 0.1.15)",
+  "gpu": "RTX 5070 Ti 16GB (16,303 MiB)",
+  "A6_coresidency_memory_ledger": {
+    "config": "MiniCPM5-2B bf16 + fp8 KV pool 946,234,982 B + ctx 32768 + 20 seqs (port 8081) co-resident with bge-m3 fp16 (conda env, port 6380); NO dspark spec (S3b gap, see below)",
+    "idle": {
+      "vllm_engine_pid_dedicated_MiB": 6852,
+      "vllm_engine_shared_MiB": 94,
+      "bge_m3_dedicated_MiB": 2448,
+      "bge_m3_shared_MiB": 82
+    },
+    "after_concurrent_load": {
+      "vllm_engine_dedicated_MiB": 6852,
+      "vllm_engine_shared_MiB": 94,
+      "bge_m3_dedicated_MiB": 2448,
+      "bge_m3_shared_MiB": 82,
+      "adapter_used_MiB": 9368
+    },
+    "verdict": "shared flat under load (94/82 MiB, within 76-106 MiB WDDM baseline band) -> NO SPILL; card total 9,368/16,303 with ample headroom",
+    "historical_reference_0271_with_dspark": "14,335/15,032 MiB (includes DSpark draft + spec capture; larger than S3a config by design)"
+  },
+  "A8_toolcall": {
+    "request": "get_weather tool, city+unit schema, 'What is the weather in Beijing right now?'",
+    "finish_reason": "tool_calls",
+    "tool_calls": [{"id": "chatcmpl-tool-8ae4ae5ee817e4a0", "type": "function", "function": {"name": "get_weather", "arguments": "{\"location\": \"Beijing\"}"}}],
+    "usage": {"prompt_tokens": 347, "completion_tokens": 49, "reasoning_tokens": 20},
+    "note": "qwen3_coder parser structurally correct; model chose schema-adjacent arg name (model behavior, parser fine)"
+  },
+  "A8_reasoning": {
+    "parser": "qwen3",
+    "field_in_029": "message.reasoning (0.29 renamed from reasoning_content; MiniCPM5 responses also carry reasoning:null field)",
+    "case_normal_finish": {"prompt": "9.11 vs 9.9", "finish_reason": "stop", "reasoning_len_chars": 1319, "content": "answering text produced (off-target content -- see model-behavior note)"},
+    "case_enable_thinking_false": {"finish_reason": "length(300)", "reasoning_len": 0, "content": "direct answer stream (math slip: (x+12)*3 misread as (x-5)*3 -- model/quant behavior, not engine)"},
+    "model_behavior_note": "chat_template.jinja hardcodes system prompt 'Reasoning effort is set to xhigh. Please think carefully...' -- reasoning content references it verbatim; long-thinking divergence on some prompts (3000 tok no close) and one off-target reply are model+template behavior, NOT engine regression (S2 PPL bit-equivalence covers the forward path)",
+    "transformers_versions": {"new_base": "5.17.0", "old_prod": "5.16.1"}
+  },
+  "S5_piecewise_boundary": {
+    "explicit_config": "--compilation-config {\"cudagraph_mode\":\"PIECEWISE\"}",
+    "result": "EngineCore failed to start, IDENTICAL root cause as default FULL_AND_PIECEWISE first crash: dynamo graph-break retrace -> humming/forward.py:140 json.loads(parsed_compute_config) receives non-str (torch.compile Pattern.match graph break site gb0007)",
+    "conclusion": "humming int3 kernel is NOT torch.compile-safe on bare 0.29 -> ALL graph modes (PIECEWISE included) unavailable for GSQ; eager-only until batch-3 (quantization domain, overlay wiring) lands. 0.27.1 overlay ran PIECEWISE in production (54.3 vs eager 43 doc_4k), so overlay carries the compat shim."
+  },
+  "S6_steady": {
+    "config": "eager, fp8 KV pool 1,662,441,472 B (38,836 tokens, 1.19x concurrency @32k), max-model-len 32768, mbt 8192",
+    "steady_20_mixed_requests": {"ok": 20, "fail": 0, "lat_avg_s": 6.20, "lat_max_s": 13.98, "log_errors": 0},
+    "humming_cache": "warm start 50-75s vs minutes cold (device_info/nvrtc/launcher caches hit)",
+    "eager_decode_reference_ledger": [
+      {"ctx": "4k", "decode_tok_s": 21.2, "ttft_s": 1.49, "completion_tokens": 296},
+      {"ctx": "4k rep2 (prefix hit)", "decode_tok_s": 21.4, "ttft_s": 0.40},
+      {"ctx": "16k", "decode_tok_s": 21.6, "ttft_s": 4.14, "completion_tokens": 261}
+    ],
+    "caveat": "21.x vs 0.27.1 eager 43 (doc_4k historical) -- prime suspect = kernel split below"
+  },
+  "kernel_split_finding": {
+    "observation": "0.29 log: 'Using HummingLinearKernel for CompressedTensorsWNA16' AND 'Using MarlinLinearKernel for CompressedTensorsWNA16' (two instantiations)",
+    "mechanism": "CUDA platform kernel priority list _POSSIBLE_KERNELS tries MarlinLinearKernel BEFORE HummingLinearKernel; Marlin accepts int4 (embed_tokens/lm_head, g64) and rejects int3 (main body g128) which falls through to Humming. Checkpoint has actorder=null everywhere (g_idx keys: 0), so has_g_idx is NOT the discriminator.",
+    "old_stack_reference": "0.27.1 overlay used HummingLinearKernel for the whole WNA16 path (step-010 log, single line)",
+    "perf_suspect": "lm_head is a per-decode-step GEMM (151936x5120 int4); Marlin path is the prime suspect for eager 21.x vs 43 gap. A/B attempt: VLLM_DISABLED_KERNELS=MarlinLinearKernel -> load-time CUDA OOM (humming repack peak for embed/lm_head exceeds 16GB budget with 10.4GB weights resident). Batch-3 must solve repack peak when restoring all-humming semantics (old stack served 204k all-humming -> its repack is leaner)."
+  },
+  "S3b_dspark_gap": {
+    "error": "ValueError: xqa backend does not support cum_seq_lens_q (cudagraph capture warmup forward)",
+    "root_cause": "_get_flashinfer_trtllm_api_decode_kernel returns XQA unconditionally on capability family 120 (KV-dtype independent); 0.29 guard: 'FlashInfer XQA speculative decode is not wired in vLLM yet' (NotImplementedError; varlen path hits flashinfer ValueError first)",
+    "scope": "ALL multi-token spec decode (dspark/DFlash2/MTP) structurally unavailable on bare 0.29 SM120 -- same gap class as nvfp4-KV",
+    "re-enable": "batch-4 (spec wiring) + batch-5 (flashinfer.py +137 self-built hunks)"
+  },
+  "gsq_fp8_kv_measured_price": {
+    "bytes_per_token": 42810,
+    "derivation": "pool 1,662,441,472 B -> 38,836 tokens engine-reported; first-guess 32,768 B/token (pure full-attn 16 layers x 2 x 4 kv-heads x 256 x 1B) was 29% low -- GDN layer states share the pool",
+    "boot_floor": "one 32k request needs 1.29 GiB (engine check)"
+  },
+  "launchers_added": [
+    "tools/serve_minicpm5_2b_dspark_base029.cmd (S3a, dspark commented out with S3b rationale)",
+    "tools/serve_gsq_base029.cmd (S4/S6 eager + fp8 KV + tool-call parsers; --enforce-eager annotated with S5 rationale)"
+  ]
+}
