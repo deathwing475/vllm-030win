@@ -1321,6 +1321,30 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
+        # A --spec-model directory may ship its own quantization_config
+        # (quantized MTP weights with an adjusted ignore/group layout).
+        # Rebuild quant_config from the draft model config so MTP layer
+        # creation matches the draft checkpoint format. The baseline case
+        # (draft dir == target dir) keeps the inherited config untouched.
+        draft_mc = spec_cfg.draft_model_config
+        if (
+            draft_mc is not None
+            and spec_cfg.target_model_config is not None
+            and draft_mc.model != spec_cfg.target_model_config.model
+            and draft_mc.quantization
+        ):
+            from vllm.config.vllm import VllmConfig
+
+            # Use VllmConfig._get_quantization_config (not the bare
+            # get_quant_config) so maybe_update_config runs — it applies
+            # kernel/layout decisions the torch.compile path depends on.
+            draft_qc = VllmConfig._get_quantization_config(
+                draft_mc,
+                spec_cfg.draft_load_config or base.load_config,
+            )
+            if draft_qc is not None:
+                base = replace(base, quant_config=draft_qc)
+
         return base
 
     def _get_model(self) -> nn.Module:
@@ -1348,6 +1372,22 @@ class SpecDecodeBaseProposer:
         )
 
         self.model = self._get_model()
+
+        # Share embed_tokens / lm_head from target model when the draft
+        # model's checkpoint stores them in a quantized format that the
+        # unquantized MTP embedding cannot load directly (e.g. compressed-
+        # tensors GSQ with weight_packed/weight_scale/weight_shape).
+        if (
+            hasattr(self.model, "model")
+            and hasattr(self.model.model, "embed_tokens")
+            and hasattr(target_model, "model")
+        ):
+            tgt_emb = getattr(target_model.model, "embed_tokens", None) or \
+                      getattr(getattr(target_model.model, "language_model", None), "embed_tokens", None)
+            if tgt_emb is not None:
+                self.model.model.embed_tokens = tgt_emb
+            if hasattr(target_model, "lm_head") and hasattr(self.model, "lm_head"):
+                self.model.lm_head = target_model.lm_head
 
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(

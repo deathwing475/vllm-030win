@@ -11,6 +11,9 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
@@ -18,6 +21,125 @@ from .qwen3_dflash import (
     DFlashQwen3Model,
 )
 from .utils import maybe_prefix
+
+
+@triton.jit
+def _dflash2_grouped_conv_kernel(
+    x_ptr,
+    delta_ptr,
+    base_ptr,
+    output_ptr,
+    x_stride_row,
+    delta_stride_row,
+    delta_stride_tap,
+    base_stride_tap,
+    output_stride_row,
+    NUM_CHANNELS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    TAPS: tl.constexpr,
+    ELEMENT_BLOCK: tl.constexpr,
+) -> None:
+    row = tl.program_id(0) // triton.cdiv(NUM_CHANNELS, ELEMENT_BLOCK)
+    col_block = tl.program_id(0) % triton.cdiv(NUM_CHANNELS, ELEMENT_BLOCK)
+    channels = col_block * ELEMENT_BLOCK + tl.arange(0, ELEMENT_BLOCK)
+    mask = channels < NUM_CHANNELS
+    groups = channels // GROUP_SIZE
+    position = row % BLOCK_SIZE
+
+    delta_row = delta_ptr + row * delta_stride_row
+    x_row = x_ptr + row * x_stride_row
+    accumulator = (
+        tl.load(base_ptr + channels, mask=mask, other=0.0).to(tl.float32)
+        + tl.load(delta_row + groups, mask=mask, other=0.0).to(tl.float32)
+    ) * tl.load(x_row + channels, mask=mask, other=0.0).to(tl.float32)
+
+    for tap in tl.static_range(1, TAPS):
+        tap_mask = mask & (position >= tap)
+        coefficient = tl.load(
+            base_ptr + tap * base_stride_tap + channels,
+            mask=tap_mask,
+            other=0.0,
+        ).to(tl.float32) + tl.load(
+            delta_row + tap * delta_stride_tap + groups,
+            mask=tap_mask,
+            other=0.0,
+        ).to(tl.float32)
+        x = tl.load(
+            x_ptr + (row - tap) * x_stride_row + channels,
+            mask=tap_mask,
+            other=0.0,
+        ).to(tl.float32)
+        accumulator += coefficient * x
+
+    tl.store(
+        output_ptr + row * output_stride_row + channels,
+        accumulator,
+        mask=mask,
+    )
+
+
+def dflash2_grouped_conv_impl(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    """DFlash2 grouped convolution adapted from LightSeek TokenSpeed PR #1399."""
+    num_rows, num_channels = x.shape
+    output = torch.empty_like(x)
+    if num_rows == 0:
+        return output
+
+    element_block = 1024 if num_rows >= 128 and num_channels % 1024 == 0 else 512
+    grid = (num_rows * triton.cdiv(num_channels, element_block),)
+    _dflash2_grouped_conv_kernel[grid](
+        x,
+        delta,
+        base,
+        output,
+        x.stride(0),
+        delta.stride(0),
+        delta.stride(1),
+        base.stride(0),
+        output.stride(0),
+        NUM_CHANNELS=num_channels,
+        BLOCK_SIZE=block_size,
+        GROUP_SIZE=group_size,
+        TAPS=base.shape[0],
+        ELEMENT_BLOCK=element_block,
+        num_warps=4,
+    )
+    return output
+
+
+def dflash2_grouped_conv_fake(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+direct_register_custom_op(
+    op_name="dflash2_grouped_conv",
+    op_func=dflash2_grouped_conv_impl,
+    fake_impl=dflash2_grouped_conv_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+def dflash2_grouped_conv(
+    x: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    block_size: int,
+    group_size: int,
+) -> torch.Tensor:
+    return torch.ops.vllm.dflash2_grouped_conv(x, delta, base, block_size, group_size)
 
 
 def _grouped_conv(
@@ -29,6 +151,9 @@ def _grouped_conv(
     group_size: int,
     taps: int,
 ) -> torch.Tensor:
+    if hidden_states.is_cuda:
+        return dflash2_grouped_conv(hidden_states, delta, base, block_size, group_size)
+
     blocks = hidden_states.unflatten(-1, (num_groups, group_size))
     coefficients = base.view(1, taps, num_groups, group_size) + delta.unsqueeze(-1)
     output = coefficients[:, 0] * blocks
@@ -44,6 +169,14 @@ def _grouped_conv(
 
 
 class DFlashGroupedConv(nn.Module):
+    """Depthwise-style conv over the block, with coefficients that depend on the
+    block position.
+
+    Each group shares a base tap weight, and a per-position projection supplies
+    the deviation from it. Both are stored pre-split so the kernel reads one
+    coefficient per (tap, group, position).
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -52,6 +185,7 @@ class DFlashGroupedConv(nn.Module):
         block_size: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         if hidden_size % group_size:
@@ -66,12 +200,15 @@ class DFlashGroupedConv(nn.Module):
             torch.empty(2, taps, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
+        # Always built unquantized: AutoRound and compressed-tensors both skip
+        # it (see the ignore list in the checkpoint config), so the quantization
+        # is applied only when a scheme explicitly lists this prefix.
         self.kernel_projection = ReplicatedLinear(
             hidden_size,
             2 * taps * self.num_groups,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "kernel_projection"),
             return_bias=False,
         )
@@ -132,10 +269,14 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
             params_dtype=vllm_config.model_config.dtype,
         )
         self.attention_conv = DFlashGroupedConv(
-            **conv_args, prefix=maybe_prefix(prefix, "attention_conv")
+            **conv_args,
+            prefix=maybe_prefix(prefix, "attention_conv"),
+            quant_config=quant_config,
         )
         self.mlp_conv = DFlashGroupedConv(
-            **conv_args, prefix=maybe_prefix(prefix, "mlp_conv")
+            **conv_args,
+            prefix=maybe_prefix(prefix, "mlp_conv"),
+            quant_config=quant_config,
         )
 
     def forward(
@@ -162,23 +303,12 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
 
 
 def _score_edges(
-    predecessor_table: torch.Tensor,
-    successor_table: torch.Tensor,
-    candidate_ids: torch.Tensor,
+    predecessors: torch.Tensor,
+    successors: torch.Tensor,
     unary_logits: torch.Tensor,
     hidden: torch.Tensor,
-    anchor_token_ids: torch.Tensor,
     top_k: int,
 ) -> torch.Tensor:
-    successors = successor_table[candidate_ids]
-    predecessor_ids = torch.cat(
-        (
-            anchor_token_ids[:, None, None].expand(-1, 1, top_k),
-            candidate_ids[:, :-1],
-        ),
-        dim=1,
-    )
-    predecessors = predecessor_table[predecessor_ids]
     return unary_logits[:, :, None] + torch.einsum(
         "blpr,blcr->blpc", predecessors * hidden[:, :, None], successors
     )
@@ -186,6 +316,20 @@ def _score_edges(
 
 @support_torch_compile
 class CandidateSelector(nn.Module):
+    """Scores the edges of the shortlist so the walk can pick a path through it.
+
+    The unary term is the draft's own logit; the pairwise term is a rank-r
+    factorization over (predecessor, successor) embeddings, so a candidate's
+    score depends on what precedes it in the block.
+
+    The two codebooks are built as ``VocabParallelEmbedding`` rather than bare
+    ``nn.Parameter`` so the quantization framework can pack them like any other
+    weight: they are 2 x 121 MiB in bf16, and a plain Parameter is invisible to
+    ``get_quant_method``, so it would stay unquantized no matter what the
+    checkpoint says. The lookup is a plain row-gather, which is exactly what
+    the quantized embedding path implements.
+    """
+
     def __init__(
         self,
         hidden_size: int,
@@ -194,21 +338,30 @@ class CandidateSelector(nn.Module):
         top_k: int,
         params_dtype: torch.dtype,
         prefix: str,
+        quant_config: QuantizationConfig | None = None,
     ) -> None:
         super().__init__()
         self.top_k = top_k
-        self.predecessor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+        self.predecessor_codebook = VocabParallelEmbedding(
+            vocab_size,
+            rank,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "predecessor_codebook"),
         )
-        self.successor_codebook = nn.Parameter(
-            torch.empty(vocab_size, rank, dtype=params_dtype), requires_grad=False
+        self.successor_codebook = VocabParallelEmbedding(
+            vocab_size,
+            rank,
+            params_dtype=params_dtype,
+            quant_config=quant_config,
+            prefix=maybe_prefix(prefix, "successor_codebook"),
         )
         self.hidden_projection = ReplicatedLinear(
             hidden_size,
             rank,
             bias=False,
             params_dtype=params_dtype,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=maybe_prefix(prefix, "hidden_projection"),
             return_bias=False,
         )
@@ -221,13 +374,18 @@ class CandidateSelector(nn.Module):
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
         hidden = self.hidden_projection(hidden_states)
+        predecessor_ids = torch.cat(
+            (
+                anchor_token_ids[:, None, None].expand(-1, 1, self.top_k),
+                candidate_ids[:, :-1],
+            ),
+            dim=1,
+        )
         return _score_edges(
-            self.predecessor_codebook,
-            self.successor_codebook,
-            candidate_ids,
+            self.predecessor_codebook(predecessor_ids),
+            self.successor_codebook(candidate_ids),
             unary_logits,
             hidden,
-            anchor_token_ids,
             self.top_k,
         )
 
@@ -260,6 +418,7 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
                 top_k=int(draft_config["selector_top_k"]),
                 params_dtype=vllm_config.model_config.dtype,
                 prefix=maybe_prefix(prefix, "candidate_selector"),
+                quant_config=self.quant_config,
             )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:

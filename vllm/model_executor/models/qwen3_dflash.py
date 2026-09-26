@@ -167,6 +167,7 @@ class DFlashQwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         attention_bias: bool = False,
         add_swa_attention_sink_bias: bool = False,
+        v_scale: float | None = None,
         sliding_window: int | None = None,
         causal: bool = False,
         is_neox_style: bool = True,
@@ -192,6 +193,7 @@ class DFlashQwen3Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
+        self.v_scale = v_scale
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -263,6 +265,8 @@ class DFlashQwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
+        if self.v_scale is not None:
+            v = v * self.v_scale
         attn_output = self.attn(q, k, v)
         output, _ = self.o_proj(attn_output)
         return output
@@ -311,6 +315,7 @@ class DFlashQwen3DecoderLayer(nn.Module):
             rms_norm_eps=config.rms_norm_eps,
             attention_bias=getattr(config, "attention_bias", False),
             add_swa_attention_sink_bias=add_swa_attention_sink_bias,
+            v_scale=dflash_config.get("attention_value_scale"),
             sliding_window=sliding_window,
             causal=causal,
             is_neox_style=is_neox_style,
@@ -355,9 +360,306 @@ class DFlashQwen3DecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+def _unpack_gptq_qweight(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+    bits: int,
+    in_features: int,
+) -> torch.Tensor:
+    """Unpack an AutoRound GPTQ ``qweight`` into a dense bf16 [out, in] tensor.
+
+    The packing that AutoRound writes (``pack_248_bits`` / ``pack_3bits`` in
+    ``auto_round_extension``) stores ``bits`` codes per 32-bit word laid out
+    along K, so the tensor has ``ceil(in_features * bits / 32)`` rows. Codes are
+    biased non-negative: the packer rounds ``W / scale + 2**(bits-1)`` and sums
+    the shifted fields, so reading a field back requires subtracting that bias.
+
+    Verified bit-exact for 2/3/4-bit against AutoRound's own packer.
+    """
+    n_out = int(scales.shape[1])
+    n_groups = int(scales.shape[0])
+    group = in_features // n_groups
+
+    # Stay on the checkpoint's own device: the unpacked tensor is consumed by a
+    # CUDA matmul, so a CPU result here fails later with a device mismatch.
+    dev = qweight.device
+    qw = qweight.detach().to(torch.int64)
+    mask = (1 << bits) - 1
+
+    if bits == 3:
+        if int(qw.shape[0]) * 32 != in_features * 3:
+            raise ValueError(
+                f"_unpack_gptq_qweight: 3-bit qweight rows {int(qw.shape[0])} "
+                f"inconsistent with in_features={in_features}."
+            )
+        codes = torch.empty(in_features, n_out, dtype=torch.int64, device=dev)
+        i = 0
+        for blk in range(in_features // 32):
+            w0 = qw[blk * 3 + 0]
+            w1 = qw[blk * 3 + 1]
+            w2 = qw[blk * 3 + 2]
+            for j in range(10):
+                codes[i] = (w0 >> (j * 3)) & mask
+                i += 1
+            codes[i] = ((w0 >> 30) & 0x3) | ((w1 & 0x1) << 2)
+            i += 1
+            for j in range(10):
+                codes[i] = (w1 >> (1 + j * 3)) & mask
+                i += 1
+            codes[i] = ((w1 >> 31) & 0x1) | ((w2 & 0x3) << 1)
+            i += 1
+            for j in range(10):
+                codes[i] = (w2 >> (2 + j * 3)) & mask
+                i += 1
+        if i != in_features:
+            raise ValueError(
+                f"_unpack_gptq_qweight: 3-bit unpacked {i} rows, "
+                f"expected {in_features}."
+            )
+    else:
+        per_word = 32 // bits
+        if in_features % 32 != 0:
+            raise ValueError(
+                f"_unpack_gptq_qweight: in_features {in_features} not a "
+                f"multiple of 32 for {bits}-bit."
+            )
+        words = qw.reshape(in_features // 32, bits, n_out)
+        codes = torch.empty(in_features, n_out, dtype=torch.int64, device=dev)
+        row = 0
+        for g in range(in_features // 32):
+            for b in range(bits):
+                word = words[g, b]
+                for j in range(per_word):
+                    codes[row] = (word >> (j * bits)) & mask
+                    row += 1
+
+    signed = codes - (1 << (bits - 1))  # [K, N]
+
+    s = scales.detach().to(torch.float32)                # [K/group, N]
+    dense = (
+        signed.to(torch.float32).reshape(n_groups, group, n_out)
+        * s[:, None, :]
+    ).reshape(in_features, n_out)
+    return dense.t().to(torch.bfloat16).contiguous()      # [out, in]
+
+
+def _dense_kv_rows(attn: nn.Module) -> torch.Tensor:
+    """Dequantize qkv_proj and return rows [q_size:] as dense bf16 [out, in].
+
+    The fused context-KV precompute slices the QKV projection's K/V rows out of
+    its weight, which only works while the projection is unquantized. Drafters
+    ship quantized (W4A16 and friends), where the packed tensor is not a
+    `weight` at all. Every path below either returns a valid dense tensor or
+    raises, so a new format cannot silently produce garbage K/V.
+
+    Supported: unquantized, FP8 (e4m3/e5m2), W4A16 GPTQ/AWQ (INT32 packed),
+    NVFP4 and MXFP4 (compressed-tensors), and hummming/inc GPTQ layouts.
+    """
+    qkv = attn.qkv_proj
+    w = getattr(qkv, "weight", None)
+    q_size = attn.q_size
+
+    # 0. inc / humming GPTQ layout (`qweight`, not `weight_packed`)
+    # The inc path packs 2/3/5/6/7-bit weights into a GPTQ `qweight` with an
+    # AutoRound-produced packing whose row count is exactly
+    # ceil(in_features * bits / 32). compressed-tensors' `unpack_from_int32`
+    # below cannot read it (different interleave), so unpack it here.
+    qweight = getattr(qkv, "qweight", None)
+    if qweight is not None and qweight.dtype == torch.int32:
+        scale = getattr(qkv, "scales", None)
+        if scale is not None:
+            in_f = int(qkv.input_size)
+            out_f = int(scale.shape[1])
+            bits = 32 * int(qweight.shape[0]) // in_f
+            dense = _unpack_gptq_qweight(qweight, scales=scale, bits=bits,
+                                         in_features=in_f)
+            if dense.shape[0] != out_f:
+                raise ValueError(
+                    f"_dense_kv_rows: humming dense rows {dense.shape[0]} "
+                    f"!= out_features {out_f}."
+                )
+            return dense[q_size:]
+
+    # 1. Unquantized (bf16/fp16/fp32)
+    if w is not None and w.dim() == 2 and w.dtype.is_floating_point:
+        if w.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+            return w[q_size:]
+
+    # 2. FP8 (float8_e4m3fn / float8_e5m2)
+    if w is not None and w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        scale = getattr(qkv, "weight_scale", None)
+        if scale is None:
+            raise ValueError("_dense_kv_rows: FP8 weight has no weight_scale.")
+        w32 = w.to(torch.float32)
+        s = scale.to(torch.float32)
+        if s.numel() == 1:
+            w_dense = w32 * s
+        elif s.dim() == 1 and s.shape[0] == w32.shape[0]:
+            w_dense = w32 * s.unsqueeze(1)
+        elif s.dim() == 1 and s.shape[0] == w32.shape[1]:
+            w_dense = w32 * s.unsqueeze(0)
+        elif s.dim() == 1 and s.shape[0] == 3:
+            # Fused QKV per-shard: [q_scale, k_scale, v_scale]
+            out_size = w32.shape[0]
+            kv_sz = (out_size - q_size) // 2
+            if q_size + 2 * kv_sz != out_size:
+                raise ValueError(
+                    f"_dense_kv_rows: FP8 per-shard scale[3] but "
+                    f"q_size({q_size}) + 2*kv({kv_sz}) != out({out_size})."
+                )
+            per_row = torch.cat(
+                [
+                    torch.full((q_size,), s[0].item(), device=s.device),
+                    torch.full((kv_sz,), s[1].item(), device=s.device),
+                    torch.full((kv_sz,), s[2].item(), device=s.device),
+                ]
+            ).to(w32.dtype)
+            w_dense = w32 * per_row.unsqueeze(1)
+        else:
+            # Block-quantized (scale same shape as weight)
+            w_dense = w32 * s
+        return w_dense.to(torch.bfloat16)[q_size:]
+
+    # 3. W4A16 GPTQ/AWQ (INT32 packed)
+    packed = getattr(qkv, "weight_packed", None)
+    if packed is not None and packed.dtype == torch.int32:
+        if hasattr(qkv, "weight_scale_2"):
+            raise ValueError(
+                "_dense_kv_rows: ModelOpt NVFP4 (weight_scale_2) is not "
+                "validated; use the compressed-tensors NVFP4 layout."
+            )
+        if not hasattr(qkv, "weight_global_scale"):
+            scale = qkv.weight_scale
+            out_f = int(packed.shape[0])
+            in_f = int(qkv.input_size)
+            bits = 32 * packed.shape[1] // in_f
+            if bits <= 0 or bits > 32:
+                raise ValueError(
+                    f"_dense_kv_rows: GPTQ bits={bits} (packed "
+                    f"shape={tuple(packed.shape)}, in_f={in_f})."
+                )
+            from compressed_tensors.compressors.pack_quantized.base import (
+                unpack_from_int32,
+            )
+
+            q = unpack_from_int32(
+                packed.data, bits, torch.Size([out_f, in_f]), packed_dim=1
+            )
+            n_groups = scale.shape[1]
+            if n_groups == 0:
+                raise ValueError(
+                    f"_dense_kv_rows: GPTQ scale has 0 groups "
+                    f"(scale.shape={tuple(scale.shape)})."
+                )
+            group = in_f // n_groups
+            dense = (
+                q.to(torch.float32).reshape(out_f, n_groups, group)
+                * scale.to(torch.float32)[..., None]
+            ).reshape(out_f, in_f)
+            return dense.to(torch.bfloat16)[q_size:]
+
+    # 4. NVFP4 (compressed-tensors, W4A16)
+    # uint8 packed + FP8 group scale + FP32 global scale. The global scale is
+    # stored as a divisor; this runs before process_weights_after_loading, so
+    # reciprocate it here.
+    nvfp4_src = None
+    for attr in ("weight_packed", "weight"):
+        cand = getattr(qkv, attr, None)
+        if (
+            cand is not None
+            and cand.dtype == torch.uint8
+            and getattr(qkv, "weight_scale", None) is not None
+            and getattr(qkv, "weight_global_scale", None) is not None
+        ):
+            nvfp4_src = cand
+            break
+    if nvfp4_src is not None:
+        ws = qkv.weight_scale
+        gs = qkv.weight_global_scale
+        if ws.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                f"_dense_kv_rows: NVFP4 weight_scale dtype={ws.dtype}, "
+                "expected float8_e4m3fn."
+            )
+        from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+            break_fp4_bytes,
+        )
+
+        gs_scalar = 1.0 / (gs.max() if gs.dim() > 0 else gs)
+        out_dim, packed_in = nvfp4_src.shape
+        in_dim = packed_in * 2
+        fp4 = break_fp4_bytes(nvfp4_src, torch.float32)
+        fp4 = fp4.reshape(out_dim, in_dim // 16, 16)
+        sf = ws.view(torch.float8_e4m3fn).to(torch.float32) * gs_scalar
+        w_dense = (fp4 * sf.unsqueeze(-1)).reshape(out_dim, in_dim)
+        return w_dense.to(torch.bfloat16)[q_size:]
+
+    # 5. MXFP4 (compressed-tensors, W4A16)
+    # uint8 packed + uint8 (E8M0) scale, no global scale.
+    mxfp4_src = None
+    for attr in ("weight_packed", "weight"):
+        cand = getattr(qkv, attr, None)
+        ws_cand = getattr(qkv, "weight_scale", None)
+        if (
+            cand is not None
+            and cand.dtype == torch.uint8
+            and ws_cand is not None
+            and ws_cand.dtype == torch.uint8
+            and not hasattr(qkv, "weight_global_scale")
+        ):
+            mxfp4_src = cand
+            break
+    if mxfp4_src is not None:
+        from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
+            break_fp4_bytes,
+        )
+
+        fp4 = break_fp4_bytes(mxfp4_src, torch.float32)
+        out_dim, packed_in = mxfp4_src.shape
+        in_dim = packed_in * 2
+        if in_dim % 32 != 0:
+            raise ValueError(
+                f"_dense_kv_rows: MXFP4 in_dim={in_dim} not divisible by 32."
+            )
+        e8m0 = 2.0 ** (qkv.weight_scale.to(torch.float32) - 127.0)
+        e8m0_exp = e8m0.unsqueeze(-1).expand(-1, -1, 32).reshape(out_dim, in_dim)
+        return (fp4 * e8m0_exp).to(torch.bfloat16)[q_size:]
+
+    w_info = (
+        f"dtype={w.dtype}, shape={tuple(w.shape)}" if w is not None else "None"
+    )
+    p_info = (
+        f"dtype={packed.dtype}, shape={tuple(packed.shape)}"
+        if packed is not None
+        else "None"
+    )
+    attrs = [a for a in dir(qkv) if "weight" in a.lower() or "scale" in a.lower()]
+    raise ValueError(
+        f"_dense_kv_rows: unable to dequantize qkv_proj.\n"
+        f"  quant_method: {getattr(qkv, 'quant_method', None)}\n"
+        f"  weight: {w_info}\n"
+        f"  weight_packed: {p_info}\n"
+        f"  weight/scale attrs: {attrs}\n"
+        f"Supported: bf16/fp16/fp32, FP8, W4A16 GPTQ/AWQ, NVFP4, MXFP4 "
+        f"(compressed-tensors)."
+    )
+
+
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
+
+    # The checkpoint stores q/k/v and gate/up separately while this model fuses
+    # them into QKVParallelLinear / MergedColumnParallelLinear. The quantizer
+    # expands a fused module name through this map before matching the
+    # checkpoint's config targets, so without it a 4-bit target written against
+    # the on-disk names never reaches the fused layers and they silently stay
+    # unquantized (observed as "MergedColumnParallelLinear has no attribute
+    # 'data'" while loading packed weights).
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
@@ -469,7 +771,7 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        kv_weights = [_dense_kv_rows(a) for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
@@ -623,6 +925,12 @@ class DFlashQwen3Model(nn.Module):
         if context_slot_mapping is None:
             return
 
+        # The query path scales V before attention, so the context K/V written
+        # here has to carry the same scale to stay consistent with it.
+        v_scale = getattr(self.layers[0].self_attn, "v_scale", None)
+        if v_scale is not None:
+            all_v.mul_(v_scale)
+
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
         per_layer = isinstance(context_slot_mapping, (list, tuple))
@@ -694,9 +1002,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.config = self.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),

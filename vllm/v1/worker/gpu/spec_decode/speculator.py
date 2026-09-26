@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
+import os
 from typing import Any
 
 import numpy as np
@@ -183,6 +184,12 @@ class DraftModelSpeculator(BaseSpeculator):
         )
 
         self.model = self.load_draft_model(target_model, target_attn_layer_names)
+        if os.environ.get("DFLASH2_CALIB_DIR"):
+            from vllm.model_executor.layers.quantization.inc.calib import (
+                install_calib_hooks,
+            )
+
+            install_calib_hooks(self.model)
         self._validate_local_argmax_reduction()
 
         all_attn_layers = set[str](
