@@ -4,6 +4,20 @@
 
 English: A Windows-native vLLM v0.27.1 build with custom enhancements (DFlash2 speculative decoding, NVFP4 KV cache on SM120, WNA16 int3 quantization), targeting the Qwen3.8-27B-3Bit-GSQ model on consumer Blackwell GPUs. See `docs/` for the migration-to-0.30 campaign records. Upstream README: [README-UPSTREAM.md](README-UPSTREAM.md).
 
+## 迁移战役状态（2026-09-26 更新）
+
+> 把现役 0.27.1 自研栈迁到 SystemPanic vLLM 0.29 底座 + 甄选 0.30 功能。deadline 2026-10-30（新 27B 发布即止损），硬承诺 10-18 前完成生产等价+切换。
+
+| 阶段 | 状态 | 说明 |
+|---|---|---|
+| 阶段 0 锚点+底座 | ✅ 收官 | PPL 主锚/长上下文锚/无草稿基线；cp312 venv；底座 git 化 |
+| 阶段 1 底座冒烟 | ✅ 收官 | S1 GSQ int3 裸加载 + S2 PPL 对锚 \|Δ\|≤0.0025；S3-S6 冒烟全过（A6/A8 锚补采）；两个结构缺口定性（投机解码/图模式在纯底座不可用，分别挂批 4/3b） |
+| 阶段 2 自研迁移 | 🟡 **批 1-3 ✅（5 批中 3）** | 批1 协议/GC/hybrid（`57188ef`）、批2 TQ+KV（`f56c964`，KV 域零搬运）、批3 量化域（`7d4c0e1`，PPL 重锚 8/8 全绿）；批 3b = PIECEWISE 恢复（custom-op 方案已定）；批 4 投机解码、批 5 nvfp4/SM120 待做 |
+| 阶段 3 0.30 甄选 | ⚪ 切换后滚动 | A 组+B7+D 组+C1/C6/C8，砍尾 C8→C1/C6→D |
+| 阶段 4 回归+切换 | ⚪ 目标 10-18 | 旧 venv 冻结只读 |
+
+底座仓（0.29 侧一切代码改动）：`G:\qwen3.8model\vllm-029base-git`（baseline `9948275`，每批一 commit + venv 同步）。运行/验收铁律、环境契约、垫片清单见 `docs/交接文档.md` 与 `tools/shims/SHIMS.md`。
+
 ## 功能特性
 
 - **Windows 构建使能**：MSVC 2022 + CUDA 13 全链路构建修复（CUTLASS/MSVC 适配、CUDA 13 对齐、进程/共享内存 Windows 化）
@@ -77,6 +91,9 @@ set HF_HOME=G:\qwen3.8model\hub
 - `vllm-030win-迁移计划.md` — 0.30 迁移执行计划 v2（deadline 2026-10-30）
 - `vllm-030win-调研-*.md` — 三份调研报告（改动清点 / 0.29 whl 溯源与 0.30 差异面 / 0.30 功能菜单）
 - `实验步骤文档.md` — 逐步实验记录（协议/操作/结果/判定）
+- `实验日志.md` — 项目日志（按日工作记录：做了什么/结论/踩坑/下一步）
+- `进度文档.md` — 阶段总览 + 任务板 + 资产地图
+- `锚点采集协议.md` — 验收对照系（锚点矩阵与复跑规则）
 - `CONTEXT.md` — 项目术语表
 
 ## License
