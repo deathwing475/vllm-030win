@@ -6,13 +6,12 @@ rem (line-B spec e2e PASSED: A2 73.00 / A5 68.59-24.39 / A4 acc 0.72-0.80),
 rem plus the production-only KV feature kept from the 0.27 recipe
 rem run_dflash2_n2.cmd (N=2 PRODUCTION, 2026-09-25 user decision):
 rem   + --enable-prefix-caching
-rem KV offloading (--kv-offloading-*) is DELIBERATELY OFF on the 0.29 stack:
-rem the stage-4 drill (2026-09-26) reproduced an illegal memory access in
-rem the compiled backbone on the first long request whenever offload is
-rem enabled (spec on OR off); without it the full smoke passes and prefix
-rem caching still works (repeat-request TTFT 5.8s -> 3.1s). Capacity is
-rem unaffected (pool 3.4e9 = 121k tokens) -- offload only extends prefix
-rem cache retention into CPU RAM. Bug parked; see docs/切换与回退预案.md.
+rem KV offloading is ON (user priority: multi-turn conversations rely on the
+rem offload tier to keep earlier turns in CPU RAM). It crashed the stage-4
+rem drill (2026-09-26) and was root-caused the same day to a cuMemcpyBatchAsync
+rem driver defect on non-default streams; fixed in base d7cdb91 by routing
+rem swap_blocks_batch to per-copy cuMemcpyAsync on Windows. Verified: 8k x2
+rem needle green with repeat-request TTFT 4.7s -> 1.5s (prefix hit).
 rem KV pool stays MANUAL (iron rule): 3,400,000,000 B (121,058 tokens with draft,
 rem engine self-report on the 0.29 stack).
 rem
@@ -73,6 +72,8 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 29550 -ErrorActi
   --tool-call-parser qwen3_coder ^
   --reasoning-parser qwen3 ^
   --mamba-cache-mode align ^
+  --kv-offloading-backend native ^
+  --kv-offloading-size 8 ^
   --compilation-config {\"cudagraph_mode\":\"PIECEWISE\"} ^
   --cudagraph-capture-sizes 3 ^
   --speculative-config.method dflash ^
