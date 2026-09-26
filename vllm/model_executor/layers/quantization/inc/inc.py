@@ -19,7 +19,10 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 
 from .config_parser import INCConfigParser
 
@@ -36,7 +39,7 @@ class INCConfig(QuantizationConfig):
 
     DEFAULT_INT_PACKING_FORMAT = "auto_round:auto_gptq"
 
-    SUPPORTED_BITS = {2, 3, 4, 8}
+    SUPPORTED_BITS = {2, 3, 4, 5, 6, 7, 8}
     SUPPORTED_DTYPES = {"int", "mx_fp", "fp"}
     SUPPORTED_FORMATS = {
         "auto_round:auto_gptq",
@@ -354,6 +357,28 @@ class INCConfig(QuantizationConfig):
             return scheme.get_linear_method(self, layer, prefix, layer_config)
         if isinstance(layer, RoutedExperts):
             return scheme.get_moe_method(self, layer, prefix, layer_config)
+        if isinstance(layer, VocabParallelEmbedding):
+            # Codebook-style lookup tables (DFlash2 selector codebooks). Must
+            # come after the ParallelLMHead branch above: ParallelLMHead
+            # subclasses VocabParallelEmbedding and has to keep going through
+            # the linear path.
+            from .schemes.inc_embedding import INCEmbeddingWNA16Int
+
+            # Only tables explicitly declared in extra_config are packed.
+            # Legacy checkpoints (inc2fix/inc4bit) store their codebooks bf16
+            # under `<name>.weight`; forcing the packed layout onto those
+            # breaks loading ("no module or parameter named ...codebook.weight").
+            if not (
+                self.config_parser.is_explicitly_configured(prefix)
+                or self.config_parser.is_explicitly_configured(f"model.{prefix}")
+            ):
+                return None
+            if layer_config.group_size is None or layer_config.group_size <= 0:
+                raise NotImplementedError(
+                    "inc embedding lookup requires group-wise quantization, "
+                    f"got group_size={layer_config.group_size} for {prefix}"
+                )
+            return INCEmbeddingWNA16Int(layer_config.bits, layer_config.group_size)
         return None
 
     @classmethod

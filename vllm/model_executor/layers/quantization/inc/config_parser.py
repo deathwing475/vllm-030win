@@ -58,6 +58,53 @@ class INCLayerConfig:
 
 
 class INCConfigParser:
+    def is_explicitly_configured(self, name: str) -> bool:
+        """Return True if *name* has an explicit entry in extra_config,
+        either via exact key match or via a regex pattern key."""
+        regex_special_chars = set(r"*+?^$()[]{}|\\")
+        if not self._config.extra_config:
+            return False
+        if name in self._config.extra_config:
+            return True
+        for pattern in self._config.extra_config:
+            if not isinstance(pattern, str) or not any(
+                c in regex_special_chars for c in pattern
+            ):
+                continue
+            try:
+                if re.search(re.compile(pattern), name) is not None:
+                    return True
+            except re.error:
+                continue
+        return False
+
+    def raw_config_for(self, name: str) -> dict | None:
+        """Return the raw extra_config entry for *name*.
+
+        Matches the exact key, the `model.`-prefixed variant, or a regex key
+        matching either spelling; None when *name* has no explicit entry.
+        Used for per-layer format overrides (e.g. "format": "fp8").
+        """
+        if not self._config.extra_config:
+            return None
+        for key in (name, f"model.{name}"):
+            cfg = self._config.extra_config.get(key)
+            if cfg is not None:
+                return cfg
+        REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
+        for pattern, cfg in self._config.extra_config.items():
+            if not isinstance(pattern, str) or not any(
+                c in REGEX_SPECIAL_CHARS for c in pattern
+            ):
+                continue
+            try:
+                rx = re.compile(pattern)
+            except re.error:
+                continue
+            if rx.search(name) is not None or rx.search(f"model.{name}") is not None:
+                return cfg
+        return None
+
     def __init__(self, config: "INCConfig") -> None:
         self._config = config
 
