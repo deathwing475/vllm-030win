@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import functools
 import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -535,6 +536,76 @@ def get_humming_linear_compute_config() -> str:
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _layer_config_from_str(config_str: str) -> "LayerConfig":
+    # Rebuild a frozen LayerConfig from its to_str() serialization. The JSON
+    # keys follow dataclass field order and every enum/dtype field is stored in
+    # its str form, which LayerConfig.__post_init__ converts back (all of
+    # weight_scale_type / weight_scale_2_type / *_dtype / input_quant_mode /
+    # mma_type have isinstance(str) normalizers). Instances are frozen after
+    # __post_init__ (custom __setattr__ guard), so sharing them via cache is
+    # safe. Rebuilt.to_str() is byte-identical to the input string.
+    from vllm.utils.humming import LayerConfig
+
+    return LayerConfig(**json.loads(config_str))
+
+
+if has_humming():
+
+    @torch.library.custom_op(
+        "vllm::apply_humming_linear",
+        mutates_args=["locks"],
+        device_types="cuda",
+    )
+    def _apply_humming_linear_op(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor | None,
+        zero_point: torch.Tensor | None,
+        bias: torch.Tensor | None,
+        weight_scale_2: torch.Tensor | None,
+        locks: torch.Tensor,
+        layer_config: str,
+        compute_config: str,
+    ) -> torch.Tensor:
+        from vllm.utils.humming import humming_forward
+
+        flatten_inputs = x.reshape(-1, x.size(-1))
+        output = humming_forward(
+            _layer_config_from_str(layer_config),
+            inputs=flatten_inputs,
+            weight=weight,
+            weight_scale=weight_scale,
+            zero_point=zero_point,
+            bias=bias,
+            weight_scale_2=weight_scale_2,
+            locks=locks,
+            compute_config=compute_config,
+        )
+        return output.view(*x.shape[:-1], output.size(-1))
+
+    @_apply_humming_linear_op.register_fake
+    def _(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        weight_scale: torch.Tensor | None,
+        zero_point: torch.Tensor | None,
+        bias: torch.Tensor | None,
+        weight_scale_2: torch.Tensor | None,
+        locks: torch.Tensor,
+        layer_config: str,
+        compute_config: str,
+    ) -> torch.Tensor:
+        # humming's own output meta: real N is shape_n - pad_shape_n and the
+        # output dtype comes from c_dtype (not from x).
+        from humming.ops.gemm import _get_humming_gemm_output_meta
+
+        shape_n, output_dtype, _ = _get_humming_gemm_output_meta(
+            layer_config, compute_config
+        )
+        return x.new_empty((*x.shape[:-1], shape_n), dtype=output_dtype)
+
+
 def apply_humming_linear(
     layer: LinearBase,
     x: torch.Tensor,
@@ -543,21 +614,24 @@ def apply_humming_linear(
     compute_config: str,
     locks: torch.Tensor,
 ) -> torch.Tensor:
-    from vllm.utils.humming import humming_forward
-
-    flatten_inputs = x.reshape(-1, x.size(-1))
-    output = humming_forward(
-        layer_config,
-        inputs=flatten_inputs,
-        weight=layer.weight,
-        weight_scale=getattr(layer, "weight_scale", None),
-        zero_point=getattr(layer, "zero_point", None),
-        bias=getattr(layer, "bias", None),
-        weight_scale_2=getattr(layer, "weight_scale_2", None),
-        locks=locks,
-        compute_config=compute_config,
+    # Custom-op boundary (batch-3b): the humming forward path is not
+    # torch.compile-safe -- under dynamo tracing, humming_forward's Python
+    # pre-processing dies (compute_config stops being a str before
+    # json.loads). Routing the call through an opaque custom op keeps the
+    # eager path byte-identical while letting fullgraph AOT compile treat the
+    # whole GEMM as a single node. LayerConfig cannot cross the op schema, so
+    # it travels as to_str() and is rebuilt inside the op.
+    return torch.ops.vllm.apply_humming_linear(
+        x,
+        layer.weight,
+        getattr(layer, "weight_scale", None),
+        getattr(layer, "zero_point", None),
+        getattr(layer, "bias", None),
+        getattr(layer, "weight_scale_2", None),
+        locks,
+        layer_config.to_str(),
+        compute_config,
     )
-    return output.view(*x.shape[:-1], output.size(-1))
 
 
 def make_humming_moe_quant_config(
