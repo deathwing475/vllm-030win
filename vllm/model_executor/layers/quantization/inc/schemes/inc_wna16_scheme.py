@@ -137,24 +137,17 @@ class INCWna16Scheme(INCScheme):
                     ark_error or "unknown error",
                 )
 
-                # CUDA low-bit (2/3/5/6/7): no Marlin/GPTQ/AWQ kernel, route to humming
-
-                # so a single model can mix 4/8-bit (Marlin) and 2/3/5/6/7-bit (humming)
-
-                # layers.
-
-                if (
-
-                    current_platform.is_cuda()
-
-                    and layer_config.bits in CUDA_HUMMING_SUPPORTED_BITS
-
-                ):
-
-                    return _build_humming_linear_method(layer_config)
-
                 return INCLinearMethod(INCWNA16LinearScheme(layer_config))
             raise NotImplementedError(f"INC on CPU: unsupported config {layer_config}")
+
+        # CUDA low-bit (2/3/5/6/7): no Marlin/GPTQ/AWQ kernel, route to humming
+        # so a single model can mix 4/8-bit (Marlin) and 2/3/5/6/7-bit (humming)
+        # layers.
+        if (
+            current_platform.is_cuda()
+            and layer_config.bits in CUDA_HUMMING_SUPPORTED_BITS
+        ):
+            return _build_humming_linear_method(layer_config)
 
         from .inc_wna16_linear import INCWNA16LinearScheme
 
