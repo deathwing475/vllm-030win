@@ -18,3 +18,12 @@
 **通用教训**：humming-kernels 0.1.15（SystemPanic humming-windows@v0.1.15）**并未真正移植 Windows**——
 csrc 里 dlfcn.h/sys/mman.h 照用、构建器 GNU 旗标、`.so` 命名。凡在 Windows 上重装此包，
 这 8 件都要重放。缓存在 `C:\fi\.humming\cache\`（HOME=C:\fi 是环境契约的一部分）。
+
+**垫片 #9（尝试后撤销，2026-09-26 批 3）**：`humming_forward_dynamo.patched.py` 曾尝试给
+`humming_forward` 加 `torch._dynamo.disable(recursive=True)` 修 PIECEWISE 启动炸（dynamo 追踪
+下 json.loads(compute_config) 炸）——**fullgraph AOT 下 disable 函数是硬错误**
+（`Unsupported: Skip calling torch.compiler.disable()'d function`，gb0098；0.29 的 PIECEWISE
+走 `aot_compile_fullgraph`）。方案撤销，site-packages 已还原。**正确方案（批 3b 挂账）**：
+vllm 侧把 `apply_humming_linear` 注册为 torch custom op（`torch.library.custom_op` +
+`register_fake` 推 shape），LayerConfig 走 `config.to_str()` 字符串化过 op 边界——fullgraph
+下 custom op 是合法节点。eager 路径不受影响（本垫片试错中 eager 始终健康）。
