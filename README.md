@@ -12,7 +12,7 @@ English: A Windows-native vLLM v0.27.1 build with custom enhancements (DFlash2 s
 |---|---|---|
 | 阶段 0 锚点+底座 | ✅ 收官 | PPL 主锚/长上下文锚/无草稿基线；cp312 venv；底座 git 化 |
 | 阶段 1 底座冒烟 | ✅ 收官 | S1 GSQ int3 裸加载 + S2 PPL 对锚 \|Δ\|≤0.0025；S3-S6 冒烟全过（A6/A8 锚补采）；两个结构缺口定性（投机解码挂批 4；图模式已由批 3b custom-op 恢复） |
-| 阶段 2 自研迁移 | 🟡 **批 1-3+3b ✅（5 批中 3.5）** | 批1 协议/GC/hybrid（`57188ef`）、批2 TQ+KV（`f56c964`，KV 域零搬运）、批3 量化域（`7d4c0e1`，PPL 重锚 8/8 全绿）、**批3b PIECEWISE 恢复（`5fe078a`，custom-op 边界 + S5 PASS + PPL 8/8 带内）**；批 4 投机解码、批 5 nvfp4/SM120 待做 |
+| 阶段 2 自研迁移 | 🟡 **批 1-4+3b ✅（5 批中 4.5，剩批 5）** | 批1 协议/GC/hybrid（`57188ef`）、批2 TQ+KV（`f56c964`，KV 域零搬运）、批3 量化域（`7d4c0e1`，PPL 重锚 8/8 全绿）、批3b PIECEWISE 恢复（`5fe078a`，custom-op 边界 + S5 PASS）、**批4 投机解码域（`76bec8b`，覆盖性判定 9/17 零搬运 + PPL 8/8 带内；spec 端到端验收挂批 5 后生产配方）**；剩批 5 nvfp4/SM120 |
 | 阶段 3 0.30 甄选 | ⚪ 切换后滚动 | A 组+B7+D 组+C1/C6/C8，砍尾 C8→C1/C6→D |
 | 阶段 4 回归+切换 | ⚪ 目标 10-18 | 旧 venv 冻结只读 |
 
