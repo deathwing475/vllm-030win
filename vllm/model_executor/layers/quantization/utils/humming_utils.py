@@ -610,7 +610,7 @@ def apply_humming_linear(
     layer: LinearBase,
     x: torch.Tensor,
     *,
-    layer_config: "LayerConfig",
+    layer_config: "LayerConfig | str",
     compute_config: str,
     locks: torch.Tensor,
 ) -> torch.Tensor:
@@ -621,6 +621,9 @@ def apply_humming_linear(
     # eager path byte-identical while letting fullgraph AOT compile treat the
     # whole GEMM as a single node. LayerConfig cannot cross the op schema, so
     # it travels as to_str() and is rebuilt inside the op.
+    cfg_str = (
+        layer_config if isinstance(layer_config, str) else layer_config.to_str()
+    )
     return torch.ops.vllm.apply_humming_linear(
         x,
         layer.weight,
@@ -629,7 +632,7 @@ def apply_humming_linear(
         getattr(layer, "bias", None),
         getattr(layer, "weight_scale_2", None),
         locks,
-        layer_config.to_str(),
+        cfg_str,
         compute_config,
     )
 

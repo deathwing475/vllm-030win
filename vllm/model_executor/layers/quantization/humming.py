@@ -570,6 +570,9 @@ class HummingLinearMethod(LinearMethodBase):
 
         self.compute_config = get_humming_linear_compute_config()
         self.locks = torch.zeros(1024, dtype=torch.int32, device=layer.weight.device)
+        # Cache the op-boundary serialization once per layer: to_str() is a
+        # JSON dump and the decode path crosses this boundary every step.
+        self._layer_config_str = self.layer_config.to_str()
 
     def apply(
         self,
@@ -584,7 +587,7 @@ class HummingLinearMethod(LinearMethodBase):
         return apply_humming_linear(
             layer,
             x,
-            layer_config=self.layer_config,
+            layer_config=self._layer_config_str,
             compute_config=self.compute_config,
             locks=self.locks,
         )

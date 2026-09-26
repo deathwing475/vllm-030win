@@ -634,7 +634,12 @@ def _compute_code_hash_with_content(file_contents: dict[str, str]) -> str:
             # This means the function was dynamically generated, with
             # e.g. exec(). We can't actually check these.
             continue
-        hash_content.append(content)
+        # Canonicalize trailing newlines: inspect.getsource() (used when the
+        # AOT artifact inlines sources) appends a final "\n" to files that
+        # lack one, while open().read() (used to re-hash the disk copy) does
+        # not. Without this, a newline-less source file makes the checksum
+        # differ by one byte on every load and the AOT cache never hits.
+        hash_content.append(content.rstrip("\n") + "\n")
     result: str = safe_hash(
         "\n".join(hash_content).encode(), usedforsecurity=False
     ).hexdigest()
