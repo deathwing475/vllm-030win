@@ -1,0 +1,77 @@
+{
+ "arm": "lineB_spec_n2_cell4_doc4k_base029",
+ "tool": "_run_decode_bench.py --cell 4 (runner v2) --warmup --runs 3",
+ "prompt_file": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ\\_spec_eval_prompts\\doc_4k.json",
+ "created": "2026-09-26",
+ "anchor_a2": {
+  "value": 60.65,
+  "cold_start_band": [
+   59.36,
+   68.74
+  ],
+  "protocol_note": "anchor = median of 3 cold starts x 5 samples (stage2_N2_rollout.md); ours = single boot warmup1 + 3 runs median"
+ },
+ "runs": [
+  {
+   "run": 1,
+   "ttft_s": 2.449,
+   "total_s": 16.2492,
+   "num_tokens": 1024,
+   "num_deltas": 447,
+   "decode_tokps_steady": 73.92,
+   "decode_tokps_overall": 74.13,
+   "step_ms": {
+    "count": 446,
+    "p50": 30.77,
+    "p90": 31.15,
+    "p99": 32.29,
+    "mean": 30.94,
+    "max": 62.52,
+    "min": 29.19
+   },
+   "finish_reason": "length",
+   "error": null
+  },
+  {
+   "run": 2,
+   "ttft_s": 2.4336,
+   "total_s": 16.5547,
+   "num_tokens": 1024,
+   "num_deltas": 459,
+   "decode_tokps_steady": 73.0,
+   "decode_tokps_overall": 72.45,
+   "step_ms": {
+    "count": 458,
+    "p50": 30.78,
+    "p90": 31.19,
+    "p99": 33.08,
+    "mean": 30.83,
+    "max": 62.32,
+    "min": 0.27
+   },
+   "finish_reason": "length",
+   "error": null
+  },
+  {
+   "run": 3,
+   "ttft_s": 2.4659,
+   "total_s": 16.5785,
+   "num_tokens": 1024,
+   "num_deltas": 460,
+   "decode_tokps_steady": 72.71,
+   "decode_tokps_overall": 72.49,
+   "step_ms": {
+    "count": 459,
+    "p50": 30.8,
+    "p90": 31.2,
+    "p99": 32.09,
+    "mean": 30.75,
+    "max": 32.69,
+    "min": 0.34
+   },
+   "finish_reason": "length",
+   "error": null
+  }
+ ],
+ "median_tok_s": 73.0
+}

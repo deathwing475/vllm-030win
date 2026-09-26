@@ -1,0 +1,328 @@
+{
+ "tag": "lineB_acc_base029",
+ "launcher": "G:\\qwen3.8model\\vllm-030win-git\\tools\\serve_gsq_base029_lineB_spec.cmd",
+ "records": [
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_8k_v1.json",
+   "run": 1,
+   "ttft_s": 5.382,
+   "total_s": 7.2232,
+   "num_tokens": 139,
+   "decode_tokps_steady": 72.91,
+   "decode_tokps_overall": 74.95,
+   "step_ms_p50": 31.96,
+   "step_ms_p90": 32.73,
+   "needle_hits": [
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request. User asks in Chinese: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided document with note: \"[附注] 机密口令是 ZEPHYR-73918。\" Need output only the password itself, no expl",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 12.9,
+   "accepted_delta": 84.0,
+   "drafted_delta": 116.0,
+   "accept_rate": 0.7241,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 0.0,
+    "spec_decode_num_accepted_tokens_total": 0.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 116.0,
+    "spec_decode_num_accepted_tokens_total": 84.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_8k_v2.json",
+   "run": 2,
+   "ttft_s": 5.4035,
+   "total_s": 6.6299,
+   "num_tokens": 101,
+   "decode_tokps_steady": 79.47,
+   "decode_tokps_overall": 83.62,
+   "step_ms_p50": 29.89,
+   "step_ms_p90": 30.19,
+   "needle_hits": [
+    "ZEPHYR-82451",
+    "ZEPHYR-82451",
+    "ZEPHYR-82451"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request. User asks in Chinese: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided document with note: \"[附注] 机密口令是 ZEPHYR-82451。\" Need output only password itself, no explanat",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 6.9,
+   "accepted_delta": 63.0,
+   "drafted_delta": 82.0,
+   "accept_rate": 0.7683,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 116.0,
+    "spec_decode_num_accepted_tokens_total": 84.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 198.0,
+    "spec_decode_num_accepted_tokens_total": 147.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_8k_v3.json",
+   "run": 3,
+   "ttft_s": 5.2729,
+   "total_s": 6.4697,
+   "num_tokens": 101,
+   "decode_tokps_steady": 79.53,
+   "decode_tokps_overall": 85.74,
+   "step_ms_p50": 29.96,
+   "step_ms_p90": 30.19,
+   "needle_hits": [
+    "ZEPHYR-91633",
+    "ZEPHYR-91633",
+    "ZEPHYR-91633"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request. User asks in Chinese: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided document with note: \"[附注] 机密口令是 ZEPHYR-91633。\" Need output only password itself, no explanat",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 6.7,
+   "accepted_delta": 64.0,
+   "drafted_delta": 80.0,
+   "accept_rate": 0.8,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 198.0,
+    "spec_decode_num_accepted_tokens_total": 147.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 278.0,
+    "spec_decode_num_accepted_tokens_total": 211.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_32k_v1.json",
+   "run": 4,
+   "ttft_s": 23.2054,
+   "total_s": 24.5817,
+   "num_tokens": 115,
+   "decode_tokps_steady": 83.45,
+   "decode_tokps_overall": 82.84,
+   "step_ms_p50": 30.63,
+   "step_ms_p90": 31.02,
+   "needle_hits": [
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request. User asks in Chinese: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided huge text with repeated wiki articles, and in one place: \"[附注] 机密口令是 ZEPHYR-73918。\" They ask",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 24.9,
+   "accepted_delta": 72.0,
+   "drafted_delta": 90.0,
+   "accept_rate": 0.8,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 278.0,
+    "spec_decode_num_accepted_tokens_total": 211.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 368.0,
+    "spec_decode_num_accepted_tokens_total": 283.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_32k_v2.json",
+   "run": 5,
+   "ttft_s": 23.1003,
+   "total_s": 24.4723,
+   "num_tokens": 114,
+   "decode_tokps_steady": 82.29,
+   "decode_tokps_overall": 82.36,
+   "step_ms_p50": 30.59,
+   "step_ms_p90": 30.8,
+   "needle_hits": [
+    "ZEPHYR-82451",
+    "ZEPHYR-82451",
+    "ZEPHYR-82451"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request. User asks in Chinese: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided huge text with repeated wiki articles, and in one place: \"[附注] 机密口令是 ZEPHYR-82451。\" They ask",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 24.7,
+   "accepted_delta": 71.0,
+   "drafted_delta": 90.0,
+   "accept_rate": 0.7889,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 368.0,
+    "spec_decode_num_accepted_tokens_total": 283.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 458.0,
+    "spec_decode_num_accepted_tokens_total": 354.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_32k_v3.json",
+   "run": 6,
+   "ttft_s": 23.2168,
+   "total_s": 24.6245,
+   "num_tokens": 116,
+   "decode_tokps_steady": 84.53,
+   "decode_tokps_overall": 81.69,
+   "step_ms_p50": 30.69,
+   "step_ms_p90": 31.0,
+   "needle_hits": [
+    "ZEPHYR-91633",
+    "ZEPHYR-91633",
+    "ZEPHYR-91633"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request. User asks in Chinese: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided huge text with repeated wiki articles, and in one place: \"[附注] 机密口令是 ZEPHYR-91633。\" They ask",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 24.9,
+   "accepted_delta": 72.0,
+   "drafted_delta": 92.0,
+   "accept_rate": 0.7826,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 458.0,
+    "spec_decode_num_accepted_tokens_total": 354.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 550.0,
+    "spec_decode_num_accepted_tokens_total": 426.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_100k_v1.json",
+   "run": 7,
+   "ttft_s": 90.3166,
+   "total_s": 94.6158,
+   "num_tokens": 336,
+   "decode_tokps_steady": 79.22,
+   "decode_tokps_overall": 77.92,
+   "step_ms_p50": 32.69,
+   "step_ms_p90": 32.92,
+   "needle_hits": [
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918",
+    "ZEPHYR-73918"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request in Chinese likely. User asks: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided huge repeated docs, includes a line: \"[附注] 机密口令是 ZEPHYR-73918。14\" maybe there is \"ZEP",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 94.9,
+   "accepted_delta": 206.0,
+   "drafted_delta": 264.0,
+   "accept_rate": 0.7803,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 550.0,
+    "spec_decode_num_accepted_tokens_total": 426.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 814.0,
+    "spec_decode_num_accepted_tokens_total": 632.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_100k_v2.json",
+   "run": 8,
+   "ttft_s": 90.2825,
+   "total_s": 92.7514,
+   "num_tokens": 187,
+   "decode_tokps_steady": 74.22,
+   "decode_tokps_overall": 75.34,
+   "step_ms_p50": 32.64,
+   "step_ms_p90": 33.06,
+   "needle_hits": [
+    "ZEPHYR-82451",
+    "ZEPHYR-82451",
+    "ZEPHYR-82451",
+    "ZEPHYR-82451",
+    "ZEPHYR-82451",
+    "ZEPHYR-82451"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request in Chinese likely. User asks: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided huge document with repeated articles and a note: \"[附注] 机密口令是 ZEPHYR-82451。14\" Need ou",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 93.0,
+   "accepted_delta": 114.0,
+   "drafted_delta": 152.0,
+   "accept_rate": 0.75,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 814.0,
+    "spec_decode_num_accepted_tokens_total": 632.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 966.0,
+    "spec_decode_num_accepted_tokens_total": 746.0
+   }
+  },
+  {
+   "tag": "lineB_acc_base029",
+   "prompt": "prompt_100k_v3.json",
+   "run": 9,
+   "ttft_s": 90.2367,
+   "total_s": 92.6152,
+   "num_tokens": 184,
+   "decode_tokps_steady": 79.55,
+   "decode_tokps_overall": 76.94,
+   "step_ms_p50": 32.75,
+   "step_ms_p90": 33.03,
+   "needle_hits": [
+    "ZEPHYR-91633",
+    "ZEPHYR-91633",
+    "ZEPHYR-91633",
+    "ZEPHYR-91633",
+    "ZEPHYR-91633",
+    "ZEPHYR-91633"
+   ],
+   "needle_ok": true,
+   "text_head": "We need answer user's request in Chinese likely. User asks: \"文档中提到的机密口令（ZEPHYR 开头）是什么？只回答口令本身，不要解释。\" They provided huge repeated docs, includes a line: \"[附注] 机密口令是 ZEPHYR-91633。14\" Need output only pa",
+   "finish_reason": "stop",
+   "error": null,
+   "wall_s": 92.9,
+   "accepted_delta": 113.0,
+   "drafted_delta": 146.0,
+   "accept_rate": 0.774,
+   "metrics_before": {
+    "spec_decode_num_draft_tokens_total": 966.0,
+    "spec_decode_num_accepted_tokens_total": 746.0
+   },
+   "metrics_after": {
+    "spec_decode_num_draft_tokens_total": 1112.0,
+    "spec_decode_num_accepted_tokens_total": 859.0
+   }
+  }
+ ],
+ "time": "2026-09-26 13:23:56",
+ "ready_s": 55.38498339999933,
+ "kv_pool_lines": [
+  "(EngineCore pid=26712) INFO 09-26 13:24:47 [interface.py:926] Setting attention block size to 2832 tokens to ensure that attention page size is >= mamba page size.",
+  "(EngineCore pid=26712) INFO 09-26 13:24:47 [interface.py:953] Padding mamba page size by 0.44% to ensure that mamba page size and attention page size are exactly equal.",
+  "(EngineCore pid=26712) WARNING 09-26 13:25:00 [kv_cache_utils.py:1326] Add 2 padding layers, may waste at most 4.17% KV cache memory",
+  "(EngineCore pid=26712) WARNING 09-26 13:25:00 [kv_cache_utils.py:1326] Add 4 padding layers, may waste at most 25.00% KV cache memory",
+  "(EngineCore pid=26712) INFO 09-26 13:25:00 [kv_cache_utils.py:2032] GPU KV cache size: 121,058 tokens, Maximum concurrency for 110,000 tokens per request: 1.10x"
+ ],
+ "verdict": "9/9 条 needle 命中且无错误"
+}
