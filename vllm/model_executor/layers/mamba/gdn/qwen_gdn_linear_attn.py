@@ -1722,9 +1722,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if is_conv_state_dim_first()
             else self.kv_cache[0].transpose(-1, -2)
         )
-        conv_weights = self.conv1d.weight.view(
-            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
-        )
+        conv_weights = self.__dict__.get("_conv_weight_2d")
+        if conv_weights is None:
+            conv_weights = self._conv_weight_2d = self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            )
         mixed_qkv = causal_conv1d_update(
             mixed_qkv[:num_actual_tokens],
             conv_state,
@@ -1744,6 +1746,9 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             output_gate=output_gate[:num_actual_tokens],
             core_attn_out=core_attn_out[:num_actual_tokens],
             attn_metadata=attn_metadata,
+            state_indices=state_indices,
+            cu_seqlens=cu_seqlens,
+            num_accepted_tokens=num_accepted_tokens,
         )
 
     def _forward_core_decode_spec_post_conv_fused_norm(
@@ -1754,13 +1759,17 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
         attn_metadata: GDNAttentionMetadata,
+        state_indices: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
     ) -> None:
-        state_indices = attn_metadata.spec_state_indices_tensor
-        cu_seqlens = attn_metadata.spec_query_start_loc
-        num_accepted_tokens = attn_metadata.num_accepted_tokens
-        assert state_indices is not None
-        assert cu_seqlens is not None
-        assert num_accepted_tokens is not None
+        if state_indices is None:
+            state_indices = attn_metadata.spec_state_indices_tensor
+            cu_seqlens = attn_metadata.spec_query_start_loc
+            num_accepted_tokens = attn_metadata.num_accepted_tokens
+            assert state_indices is not None
+            assert cu_seqlens is not None
+            assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
         ops.fused_gdn_decode_post_conv_mtp(
@@ -1789,18 +1798,22 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         forward_context = get_forward_context()
         attn_metadata_raw = forward_context.attn_metadata
-        qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+        split_sizes = self.__dict__.get("_qkvz_split_sizes")
+        if split_sizes is None:
+            qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+            split_sizes = self._qkvz_split_sizes = [
+                qkv_size,
+                self.value_dim // self.tp_size,
+            ]
         attn_metadata = None
         if isinstance(attn_metadata_raw, dict):
             attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
-            self._warmup_prefill_kernels(mixed_qkvz[:, :qkv_size], 0)
+            self._warmup_prefill_kernels(mixed_qkvz[:, : split_sizes[0]], 0)
             return
 
         assert isinstance(attn_metadata, GDNAttentionMetadata)
-        mixed_qkv, output_gate_flat = mixed_qkvz.split(
-            [qkv_size, self.value_dim // self.tp_size], dim=-1
-        )
+        mixed_qkv, output_gate_flat = mixed_qkvz.split(split_sizes, dim=-1)
         output_gate = output_gate_flat.reshape(
             output_gate_flat.size(0), -1, self.head_v_dim
         )
@@ -1811,23 +1824,32 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             a=a,
             output_gate=output_gate,
             core_attn_out=core_attn_out,
+            attn_metadata=attn_metadata,
         )
 
     def _can_use_fused_gdn_mtp_decode(
         self, attn_metadata: GDNAttentionMetadata
     ) -> bool:
+        # Hot path (48 calls/decode step): the static conjuncts only depend on
+        # weights/layout and never change after load, so evaluate them once.
+        static_ok = self.__dict__.get("_mtp_decode_static_ok")
+        if static_ok is None:
+            static_ok = self._mtp_decode_static_ok = (
+                self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES
+                and self.gdn_decode_kernel == "cuda"
+                and self.num_v_heads % self.num_k_heads == 0
+                and self.num_v_heads // self.num_k_heads in (1, 2, 3, 4, 8)
+                and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
+            )
+        if not static_ok:
+            return False
         state_indices = attn_metadata.spec_state_indices_tensor
         return (
             attn_metadata.spec_sequence_masks is not None
             and attn_metadata.num_decodes == 0
             and attn_metadata.num_spec_decodes > 0
-            and self.kv_cache[1].dtype in FUSED_GDN_STATE_DTYPES
-            and self.gdn_decode_kernel == "cuda"
-            and self.num_v_heads % self.num_k_heads == 0
-            and self.num_v_heads // self.num_k_heads in (1, 2, 3, 4, 8)
             and state_indices is not None
             and state_indices.size(1) <= MAX_FUSED_GDN_MTP_TOKENS
-            and hasattr(torch.ops._C, "fused_gdn_decode_post_conv_mtp")
         )
 
     def _rms_norm_gated_cuda(
@@ -1871,17 +1893,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         a: torch.Tensor,
         output_gate: torch.Tensor,
         core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata | None = None,
     ) -> None:
-        forward_context = get_forward_context()
-        attn_metadata_raw = forward_context.attn_metadata
-        attn_metadata = None
-        if isinstance(attn_metadata_raw, dict):
-            attn_metadata = attn_metadata_raw.get(self.prefix)
         if attn_metadata is None:
-            self._warmup_prefill_kernels(mixed_qkv, 0)
-            return
+            forward_context = get_forward_context()
+            attn_metadata_raw = forward_context.attn_metadata
+            attn_metadata = None
+            if isinstance(attn_metadata_raw, dict):
+                attn_metadata = attn_metadata_raw.get(self.prefix)
+            if attn_metadata is None:
+                self._warmup_prefill_kernels(mixed_qkv, 0)
+                return
 
-        assert isinstance(attn_metadata, GDNAttentionMetadata)
+            assert isinstance(attn_metadata, GDNAttentionMetadata)
         if (
             self._can_use_fused_gdn_mtp_decode(attn_metadata)
             and attn_metadata.num_prefills == 0
