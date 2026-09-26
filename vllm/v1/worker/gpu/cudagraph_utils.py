@@ -31,6 +31,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+from vllm.utils.gc_utils import freeze_gc_for_cudagraph_capture
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -328,7 +329,11 @@ class CudaGraphManager:
                 because attention backends may mutate or lazily initialize
                 metadata during warmup.
         """
-        with graph_capture(device=self.device):
+        # Freeze/disable GC during bulk capture: a GC cycle mid-capture can
+        # invalidate captured graphs (e.g. a finalized Triton kernel unloading
+        # its module) and the collection pauses dominate capture time.
+        # Opt out with VLLM_ENABLE_CUDAGRAPH_GC=1. (Port from 0.30.)
+        with freeze_gc_for_cudagraph_capture(), graph_capture(device=self.device):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
             # buffers in the graph pool.

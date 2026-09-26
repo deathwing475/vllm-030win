@@ -914,19 +914,30 @@ class Platform:
             )
 
         if cache_config.block_size < attn_block_size:
-            cache_config.block_size = attn_block_size
-            logger.info(
-                "Setting attention block size to %d tokens "
-                "to ensure that attention page size is >= mamba page size.",
-                attn_block_size,
-            )
+            if os.getenv("VLLM_EXPERIMENTAL_ALLOW_SMALL_HYBRID_BLOCK", "0") == "1":
+                logger.warning(
+                    "Experimental small hybrid block enabled: keeping attention block "
+                    "%d instead of mamba-aligned %d; GDN cache correctness is unverified.",
+                    cache_config.block_size,
+                    attn_block_size,
+                )
+            else:
+                cache_config.block_size = attn_block_size
+                logger.info(
+                    "Setting attention block size to %d tokens "
+                    "to ensure that attention page size is >= mamba page size.",
+                    attn_block_size,
+                )
 
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
 
-        # Pad mamba page size to exactly match attention page size
+        # Pad mamba page size to exactly match attention page size. The
+        # experimental small-block path intentionally violates this invariant;
+        # it is only for short smoke tests and is not a production GDN layout.
         attn_page_size = cache_config.block_size * attn_page_size_1_token
-        assert attn_page_size >= mamba_page_size
+        if os.getenv("VLLM_EXPERIMENTAL_ALLOW_SMALL_HYBRID_BLOCK", "0") != "1":
+            assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
             return

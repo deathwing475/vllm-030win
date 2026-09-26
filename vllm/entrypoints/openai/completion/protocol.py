@@ -21,6 +21,27 @@ from vllm.entrypoints.generate.base.protocol import (
 )
 from vllm.entrypoints.serve.engine.protocol import OpenAIBaseModel, UsageInfo
 from vllm.exceptions import VLLMValidationError
+
+
+# ZCode budgets prompts against the full window and then also requests its
+# output cap, so the render-time reservation (max_input = max_total -
+# max_output) rejects prompts that actually fit, and the tokenizer truncates
+# below the real limit before the length check. Reserve a single token here so
+# the prompt is tokenized up to the true limit; api_utils.get_max_tokens
+# clamps the real generation length afterwards and still rejects inputs that
+# genuinely exceed max_model_len.
+_LOCAL_LONG_CONTEXT_MIN = 131072
+_LOCAL_LONG_CONTEXT_RESERVATION = 1
+
+
+def _tokenize_output_reservation(
+    model_config: ModelConfig, requested_output: int | None
+) -> int:
+    if model_config.max_model_len >= _LOCAL_LONG_CONTEXT_MIN:
+        return min(requested_output or 0, _LOCAL_LONG_CONTEXT_RESERVATION)
+    return requested_output or 0
+
+
 from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.renderers import TokenizeParams
@@ -263,7 +284,9 @@ class CompletionRequest(OpenAIBaseModel):
     def build_tok_params(self, model_config: ModelConfig) -> TokenizeParams:
         return TokenizeParams(
             max_total_tokens=model_config.max_model_len,
-            max_output_tokens=self.max_tokens or 0,
+            max_output_tokens=_tokenize_output_reservation(
+                model_config, self.max_tokens
+            ),
             truncate_prompt_tokens=self.truncate_prompt_tokens,
             truncation_side=self.truncation_side,
             add_special_tokens=self.add_special_tokens,
