@@ -40,6 +40,11 @@ from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
     triton_reshape_and_cache_flash_per_token_head_quant,
 )
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
+from vllm.v1.attention.ops.multi_turboquant_kv import (
+    is_tq_dtype as _is_tq_dtype,
+    tq_decode_active_blocks,
+    tq_write_kv_cache,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
@@ -301,6 +306,13 @@ class TritonAttentionBackend(AttentionBackend):
         "int4_per_token_head",
         "int8_per_token_head",
         "fp8_per_token_head",
+        # Multi-TurboQuant KV cache compression methods (Windows build)
+        "turboquant25",
+        "turboquant35",
+        "isoquant3",
+        "isoquant4",
+        "planarquant3",
+        "planarquant4",
     ]
 
     @staticmethod
@@ -641,6 +653,18 @@ class TritonAttentionImpl(AttentionImpl):
         max_seqlen_k = attn_metadata.max_seq_len
         block_table = attn_metadata.block_table
 
+        # Multi-TurboQuant: decode the active blocks from the packed
+        # uint8 cache into a compact fp16 cache, remap the block table
+        # to compact indices, then run the standard attention kernel on
+        # the temp cache. This keeps the persistent cache small while
+        # reusing all of vLLM's existing attention machinery.
+        if _is_tq_dtype(self.kv_cache_dtype):
+            block_size = key_cache.shape[1]
+            key_cache, value_cache, block_table = tq_decode_active_blocks(
+                key_cache, value_cache, block_table, seqused_k,
+                self.kv_cache_dtype, query.dtype, block_size,
+            )
+
         seq_threshold_3D = attn_metadata.seq_threshold_3D
         num_par_softmax_segments = attn_metadata.num_par_softmax_segments
         softmax_segm_output = attn_metadata.softmax_segm_output
@@ -761,6 +785,19 @@ class TritonAttentionImpl(AttentionImpl):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
+
+        # Multi-TurboQuant: encode K/V and scatter packed bytes into the
+        # uint8 cache. The cache shape is identical to the standard
+        # layout -- the first ``packed_dim`` bytes per (head, token)
+        # slot hold the encoded data.
+        if _is_tq_dtype(self.kv_cache_dtype):
+            key_cache, value_cache = kv_cache.unbind(1)
+            tq_write_kv_cache(
+                key, value, key_cache, value_cache, slot_mapping,
+                self.kv_cache_dtype,
+            )
+            return
+
         # Reshape the input keys and values and store them in the cache.
         if self._is_per_token_head_quant:
             key_cache, value_cache = self._pth_key_value_caches(kv_cache)
