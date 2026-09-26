@@ -112,20 +112,24 @@ class DFlashSpeculator(DraftModelSpeculator):
         return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
-        wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
         supports_full = (
             self.attn_cg_support.min_cg_support.value
             >= AttentionCGSupport.UNIFORM_BATCH.value
         )
-        if wants_full and not supports_full:
+        if not supports_full:
             logger.warning(
                 "%s draft attention (%s) does not support full CUDA graphs; "
                 "running the draft eagerly.",
                 self._speculator_name,
                 self.attn_cg_support.min_cg_attn_backend,
             )
-        # PIECEWISE cudagraphs are not supported for dflash.
-        if wants_full and supports_full:
+        # PIECEWISE cudagraphs are not supported for dflash, but the draft's
+        # own FULL_DECODE_ONLY graphs are independent of the target's graph
+        # mode: capturing the draft removes its per-step eager dispatch
+        # (previously any non-FULL engine forced the draft to run eagerly).
+        # A wrong draft can only cost acceptance rate -- the target's verify
+        # step keeps the output correct.
+        if supports_full and cudagraph_mode != CUDAGraphMode.NONE:
             cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
         else:
             cudagraph_mode = CUDAGraphMode.NONE
