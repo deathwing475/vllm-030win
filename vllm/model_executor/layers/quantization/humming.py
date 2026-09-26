@@ -29,6 +29,7 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from vllm.model_executor.layers.quantization.utils.humming_utils import (
+    apply_humming_linear,
     convert_to_humming_moe_kernel_format,
     get_humming_linear_compute_config,
     get_humming_moe_quant_config,
@@ -576,20 +577,17 @@ class HummingLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        flatten_inputs = x.reshape(-1, x.size(-1))
-        output = _hm.humming_forward(
-            self.layer_config,
-            inputs=flatten_inputs,
-            weight=layer.weight,
-            weight_scale=getattr(layer, "weight_scale", None),
-            zero_point=getattr(layer, "zero_point", None),
-            bias=getattr(layer, "bias", None),
-            weight_scale_2=getattr(layer, "weight_scale_2", None),
-            locks=self.locks,
+        # Compile-safety boundary: humming_forward is not torch.compile-safe,
+        # so this INC-dispatched path must go through the same opaque custom
+        # op as the kernels/linear call sites (fullgraph AOT hard-errors
+        # otherwise). The wrapper passes the exact layer fields this body did.
+        return apply_humming_linear(
+            layer,
+            x,
+            layer_config=self.layer_config,
             compute_config=self.compute_config,
+            locks=self.locks,
         )
-        output = output.view(*x.shape[:-1], output.size(-1))
-        return output
 
 
 class HummingMoEMethod(FusedMoEMethodBase):
