@@ -4,6 +4,8 @@
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
+import os
+
 import torch
 
 import vllm.envs as envs
@@ -2984,6 +2986,41 @@ def swap_blocks(
     torch.ops._C_cache_ops.swap_blocks(src, dst, block_size_in_bytes, block_mapping)
 
 
+# Windows: cuMemcpyBatchAsync (the 12.8-ABI fast path inside
+# _C_cache_ops.swap_blocks_batch) is unusable on this platform -- it poisons the
+# CUDA context with cudaErrorIllegalAddress whenever the op runs on a non-default
+# stream (2026-09-26, CUDA 13.3 / RTX 50; reproduced standalone with disjoint
+# ranges, fresh and reused descriptors, with and without concurrent compute).
+# The C++ code's own per-copy fallback only engages on the legacy default stream,
+# so we replicate it here for real streams with cuMemcpyAsync.
+_WIN_BATCH_MEMCPY_BROKEN = os.name == "nt"
+_cu_memcpy_async_fn = None
+
+
+def _win_cu_memcpy_async_loop(src_ptrs, dst_ptrs, sizes) -> None:
+    global _cu_memcpy_async_fn
+    import ctypes
+
+    if _cu_memcpy_async_fn is None:
+        lib = ctypes.CDLL("nvcuda.dll")
+        fn = lib.cuMemcpyAsync
+        fn.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                       ctypes.c_void_p]
+        fn.restype = ctypes.c_int
+        _cu_memcpy_async_fn = fn
+    fn = _cu_memcpy_async_fn
+    stream = torch.cuda.current_stream().cuda_stream
+    src = src_ptrs.numpy()
+    dst = dst_ptrs.numpy()
+    sz = sizes.numpy()
+    for i in range(src.shape[0]):
+        rc = fn(int(dst[i]), int(src[i]), int(sz[i]), stream)
+        if rc != 0:
+            raise RuntimeError(
+                f"cuMemcpyAsync failed at index {i} with CUDA error {rc}"
+            )
+
+
 def swap_blocks_batch(
     src_ptrs: torch.Tensor,
     dst_ptrs: torch.Tensor,
@@ -3008,6 +3045,8 @@ def swap_blocks_batch(
     """
     if current_platform.is_xpu():
         torch.ops._C_cache_ops.swap_blocks_batch(src_ptrs, dst_ptrs, sizes)
+    elif _WIN_BATCH_MEMCPY_BROKEN:
+        _win_cu_memcpy_async_loop(src_ptrs, dst_ptrs, sizes)
     else:
         torch.ops._C_cache_ops.swap_blocks_batch(
             src_ptrs, dst_ptrs, sizes, is_src_access_order_any
