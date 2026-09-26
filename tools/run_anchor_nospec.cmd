@@ -43,7 +43,6 @@ call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliar
   --tool-call-parser qwen3_coder ^
   --reasoning-parser qwen3 ^
   --mamba-cache-mode align ^
-  --compilation-config "{\"cudagraph_mode\": \"PIECEWISE\"}" ^
-  --cudagraph-capture-sizes 3 ^
+  --cudagraph-capture-sizes 1 ^
   --dtype auto
 exit /b %errorlevel%
