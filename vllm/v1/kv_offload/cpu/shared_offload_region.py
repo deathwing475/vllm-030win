@@ -203,15 +203,27 @@ class SharedOffloadRegion:
                 barrier()
             except Exception:
                 if self._creator:
-                    os.unlink(self.mmap_path)
+                    try:
+                        os.unlink(self.mmap_path)
+                    except OSError:
+                        logger.warning(
+                            "Failed to unlink mmap file %s (Windows defers to close)",
+                            self.mmap_path,
+                        )
                     self._creator = False
                 self.mmap_obj.close()
                 os.close(self.fd)
                 raise
             if self._creator:
-                os.unlink(self.mmap_path)
-                self._creator = False
-                logger.info("Unlinked mmap file %s", self.mmap_path)
+                if os.name == "nt":
+                    logger.info(
+                        "Windows: deferring mmap unlink to cleanup(): %s",
+                        self.mmap_path,
+                    )
+                else:
+                    os.unlink(self.mmap_path)
+                    self._creator = False
+                    logger.info("Unlinked mmap file %s", self.mmap_path)
 
         populate_write_fn = _get_populate_write_fn(self.mmap_obj)
 
