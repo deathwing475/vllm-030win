@@ -1,0 +1,67 @@
+{
+ "step": 30,
+ "date": "2026-09-27",
+ "goal": "close placement mechanism + pin the fast tier (user: stop analyzing phenomena, read source / call tree, DELIVER stable fast tier)",
+ "correlation_10boot": {
+  "spearman_p50_vs_ded": -0.994,
+  "pearson_p50_vs_ded": -0.996,
+  "ded_range_mb": [
+   15218.5,
+   15543.9
+  ],
+  "free_range_mb": [
+   315.3,
+   640.7
+  ],
+  "shared_range_mb": [
+   8343.8,
+   8669.8
+  ],
+  "three_ledger_hedge": "ded -325.4 / free +325.4 / shr +326 (perfect offset = the segment physically moves to sysmem)",
+  "discrete_tiers": "8 distinct ded values over 10 boots (C02=C07, C08=C09) = block-wise placement",
+  "verdict": "hypothesis A CONFIRMED: fast/slow tier IS the random residency of the ~325MB draft-weight segment"
+ },
+ "pool_probe_39": {
+  "pool_bytes": 3900000000,
+  "boots_ms": [
+   21.76,
+   23.23,
+   20.96,
+   25.21,
+   20.47
+  ],
+  "boot_failures": 0,
+  "verdict": "pool +500MB does NOT pin the slow tier; placement stays random; user's reclaim plan is feasible (5/5 boots fine) but pays the random-tier decode cost"
+ },
+ "call_tree": {
+  "repack_site": "HummingLinearMethod.process_weights_after_loading -> transform_humming_tensors -> ops.repack_weight (output via _prepare_output_arg / torch allocator)",
+  "timing": "target repack -> load_dflash_model (draft) -> dummy run (AOT load or compile) -> graph capture",
+  "key_observation": "31 HummingLinearMethod repacks ALL inside the load_dflash_model window (T=21.5-22.6) = DRAFT layers; window drains free 1995MB -> 0MB (zero-slack pressure)",
+  "repack_mem_flat": "per-layer repack free/alloc delta = 0 -> pool reuse; placement inherited from earlier allocation, not decided at repack"
+ },
+ "pin_intervention": {
+  "mechanism": "after load_dflash_model returns (transients released, free~3.3GB) move each >1MB draft param to fresh cuda tensors, per-layer 2x peak (avoids force-all 12GB double poison)",
+  "full_probe_3boots_ms": [
+   20.45,
+   20.37,
+   20.73
+  ],
+  "min_pin_5boots_ms": [
+   20.31,
+   20.45,
+   20.43,
+   21.55,
+   20.43
+  ],
+  "min_nopin_5boots_ms": [
+   20.45,
+   20.46,
+   21.0,
+   20.61,
+   20.42
+  ],
+  "correctness": "acc 0.66-0.75 in band; needle8k hit=True/True",
+  "observer_effect": "ANY sitecustomize injection 21/21 fast-tier (full 8/8, full+PIN 3/3, MIN+PIN 5/5, MIN-noPIN 5/5) vs clean 20% fast-tier; bias source not attributed (suspect: early torch import / watcher thread / _mem() cudaMemGetInfo call in load_dflash wrap)"
+ },
+ "tooling_note": "cudaPointerGetAttributes census still deadlocks in engine (tool debt from step 029); mem-snapshot probes (cudaMemGetInfo + torch counters) are safe"
+}

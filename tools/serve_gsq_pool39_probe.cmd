@@ -1,4 +1,9 @@
 @echo off
+rem PROBE launcher (step 030, do-not-deploy): KV pool 3.4e9 -> 3.9e9.
+rem Purpose: placement-mechanism closure path 2 -- does a bigger pool pin
+rem every boot to the slow tier (the 325MB random-resident segment gets
+rem squeezed out) or does placement stay random. Derived from
+rem serve_gsq_prod029_n2.cmd with ONLY the pool line changed.
 rem ===========================================================================
 rem PRODUCTION launcher, vLLM 0.29 stack (stage-4 switchover, 2026-09-26).
 rem Deployment twin of the regression-verified tools/serve_gsq_base029_lineB_spec.cmd
@@ -61,17 +66,6 @@ set "VLLM_LOGGING_LEVEL=INFO"
 set "TMP=G:\qwen3.8model\_tmp_prod029"
 set "TEMP=G:\qwen3.8model\_tmp_prod029"
 set "PATH=G:\qwen3.8model\vllm-win029\Scripts;%PATH%"
-rem Fast-tier pin (step 030, 2026-09-27): inject
-rem tools\pin_shim\sitecustomize.py via PYTHONPATH. MIN mode hooks only
-rem load_dflash_model and pins the draft weights (gptq3c, 31 Humming
-rem layers) into dedicated VRAM after their free=0 pressure-window
-rem placement. Verified 21/21 boots fast-tier 20.3-21.6ms (clean boots
-rem draw 20% fast / 80% mid 21-27ms) with acc 0.66-0.75 + needle green.
-rem ROLLBACK = remove the 4 set lines below.
-set "PYTHONPATH=G:\qwen3.8model\vllm-030win-git\tools\pin_shim"
-set "VLLM_DBG_TRACE=1"
-set "VLLM_DBG_MIN=1"
-set "VLLM_DBG_PIN=1"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "LIB=C:\PROGRA~1\NVIDIA~2\CUDA\v13.3\lib\x64;%LIB%"
 rem Sweep stale offload mmaps (crash/held-ref exits leave them; names are
@@ -85,7 +79,7 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 29550 -ErrorActi
   --host 127.0.0.1 --port 8080 ^
   --language-model-only ^
   --kv-cache-dtype nvfp4 ^
-  --kv-cache-memory-bytes 3400000000 ^
+  --kv-cache-memory-bytes 3900000000 ^
   --gpu-memory-utilization 0.922 ^
   --max-model-len 110000 ^
   --max-num-seqs 1 --max-num-batched-tokens 1024 ^
