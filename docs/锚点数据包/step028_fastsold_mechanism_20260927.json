@@ -1,0 +1,81 @@
+{
+ "step": 28,
+ "date": "2026-09-27",
+ "question_1_marlin_bimodal_under_full_graph": {
+  "answer": "bimodal is PIECEWISE-specific; absent under FULL_AND_PIECEWISE",
+  "TA2_load_slow_boot": {
+   "marlin_calls": 621,
+   "hist_all_lt_1ms": true,
+   "p50_ms": 0.75,
+   "max_ms": 0.76,
+   "slow_peaks": 0
+  },
+  "TR2_recompile_fast_boot": {
+   "marlin_calls": 603,
+   "hist_all_lt_1ms": true,
+   "p50_ms": 0.75,
+   "max_ms": 0.76,
+   "slow_peaks": 0
+  },
+  "per_step_pattern": "3 calls = 1 direct launch (draft propose lm_head 0.76ms) + 2 graph replay (target lm_head 0.75ms + small 0.01ms)"
+ },
+ "load_path_conviction_8boot_matrix": {
+  "compile_boots_ms": [
+   19.44,
+   19.47,
+   19.49,
+   20.1,
+   20.35,
+   20.36
+  ],
+  "aot_load_boots_ms": [
+   25.03,
+   25.11,
+   25.21,
+   25.43,
+   25.69,
+   25.73,
+   25.77
+  ],
+  "decisive": "L1 loaded TR2's freshly-saved artifact and was still slow (25.03) => load PATH is guilty, artifact content innocent",
+  "same_artifact_penalty": "+29% step time (19.5 vs 25.1-25.4)"
+ },
+ "carrier_trace_pair_TA2_vs_TR2": {
+  "gpu_kernel_union_ms_per_step": {
+   "slow": 14.91,
+   "fast": 14.89
+  },
+  "inter_step_gap_ms_per_step": {
+   "slow": 10.74,
+   "fast": 3.98
+  },
+  "aten_to_copy_d2h_ms_per_step": {
+   "slow": 5.27,
+   "fast": 1.45
+  },
+  "note": "CPU side broadly 2-3x slower in load boots; same family as step-025 .cpu() sync signature but marlin is all-fast here"
+ },
+ "recursion_tree_probe": {
+  "structure": "isomorphic: 30 piece.init + gen_exec_code x3 + compile_exec_fn x3 on both paths",
+  "diff_1": "submod naming offset varies per artifact (compile 2..60, load 12..70 / 4..62) = re-split layout fingerprint, compute unchanged, judged harmless",
+  "diff_2": "inductor load layer differs: D2 PyCodeCache.load x0 vs D4 x19 (unexplained, parked)"
+ },
+ "tooling_audit": {
+  "bugs_found": 4,
+  "fixed": [
+   "sitecustomize watcher concurrent-import race",
+   "diff_dbgs timestamp parsing"
+  ],
+  "known_gaps": [
+   "piece.init routing fields read before assignment",
+   "artifact code hashes not logged"
+  ],
+  "trust": "boot_e2e numbers match uninstrumented boots; marlin/gap analysis uses raw traces => headline conclusions stand"
+ },
+ "production": {
+  "restored": "yes, FULL_AND_PIECEWISE config",
+  "live_measured_ms": 20.37,
+  "note": "this boot recompiled (artifact cache parked by experiments) = fast state; next AOT-load restart falls back to 25.7",
+  "stopgap_pending_decision": "skip AOT load at every boot => decode 25.7->20.35 (-21%), boot +2-3 min"
+ }
+}
