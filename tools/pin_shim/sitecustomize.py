@@ -265,20 +265,52 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
             ms="%.1f" % ((time.perf_counter() - t) * 1e3), mem=_mem())
         if os.environ.get("VLLM_DBG_PIN") == "1":
             try:
-                n, moved, bytes_ = 0, 0, 0
-                for name, p in r.named_parameters():
-                    n += 1
-                    if p.numel() * p.element_size() < 1 << 20:
-                        continue
-                    # 瞬态已释放（free 回升），此时新分配落专用显存；
-                    # 逐层搬（峰值 2x 单层），绝不满量克隆（force-all 毒）。
-                    new = torch.empty_like(p.data, device="cuda:0")
-                    new.copy_(p.data)
-                    p.data = new
-                    moved += 1
-                    bytes_ += p.numel() * p.element_size()
-                log("PIN_MOVED", moved=moved, params=n, mb=bytes_ // 2**20,
-                    mem=_mem())
+                _verbose = os.environ.get("VLLM_DBG_PIN_VERBOSE") == "1"
+                # 两遍是必需语义（step 033）：第一遍把权重搬成新张量后，旧张量
+                # 只是回到 torch 缓存池，池里的块仍在共享段，于是第二遍的
+                # empty_like 又从池里复用同位置的块 —— 搬移空转。第一遍结束后
+                # empty_cache() 把池还给 WDDM，第二遍才在 free~3.3GB 下真正
+                # 分配到专用显存。实测草稿 qkv_proj 6144x5120 由 223us→18.2us。
+                _passes = int(os.environ.get("VLLM_DBG_PIN_PASSES", "2"))
+                # embed_tokens / lm_head 是 draft 与 target 共享的权重（本就在
+                # 专用显存），搬它们纯属浪费且可能打断共享——默认跳过。
+                _skip_shared = os.environ.get("VLLM_DBG_PIN_SKIP_SHARED", "1") == "1"
+                _SHARED = ("model.embed_tokens.", "lm_head.")
+                for _p in range(_passes):
+                    n, moved, bytes_, skipped = 0, 0, 0, 0
+                    for name, p in r.named_parameters():
+                        n += 1
+                        _nb = p.numel() * p.element_size()
+                        if _nb < 1 << 20:
+                            if _verbose:
+                                log("PIN_SKIP", name=name, nbytes=_nb,
+                                    dtype=str(p.dtype))
+                            continue
+                        if _skip_shared and name.startswith(_SHARED):
+                            skipped += 1
+                            continue
+                        # 瞬态已释放（free 回升），此时新分配落专用显存；
+                        # 逐层搬（峰值 2x 单层），绝不满量克隆（force-all 毒）。
+                        new = torch.empty_like(p.data, device="cuda:0")
+                        new.copy_(p.data)
+                        p.data = new
+                        moved += 1
+                        bytes_ += _nb
+                        if _verbose:
+                            log("PIN_MOVE1", p=("pass%d" % (_p + 1)), name=name,
+                                mb=_nb // 2**20, dtype=str(p.dtype), mem=_mem())
+                    log("PIN_MOVED", p=("pass%d" % (_p + 1)), moved=moved,
+                        params=n, skipped=skipped, mb=bytes_ // 2**20, mem=_mem())
+                    # 关键：把 torch 缓存池还给 WDDM，否则下一遍的
+                    # torch.empty_like 会从池里复用「同样在共享段」的块，
+                    # 搬移变成共享段到共享段的空转（step 033 实测）。
+                    if _p < _passes - 1:
+                        try:
+                            torch.cuda.empty_cache()
+                            log("PIN_EMPTY_CACHE", p=("pass%d" % (_p + 1)),
+                                mem=_mem())
+                        except Exception as _e:
+                            log("PIN_EMPTY_CACHE_FAIL", err=repr(_e)[:120])
             except Exception as e:
                 log("PIN_FAIL", err=repr(e)[:160])
         return r
