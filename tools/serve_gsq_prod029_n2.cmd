@@ -31,6 +31,17 @@ rem ROLLBACK: the frozen 0.27 recipe run_dflash2_n2.cmd + venv
 rem G:\qwen3.8model\vllm-win (read-only) remain untouched -- see
 rem docs/切换与回退预案.md. Never run this from the record-repo directory
 rem (cwd would capture the 0.27.1 tree lying there).
+rem
+rem 2026-09-27 graph-mode swap (step 027): the --compilation-config
+rem {"cudagraph_mode":"PIECEWISE"} line is REMOVED, so the engine default
+rem FULL_AND_PIECEWISE applies (prefill PIECEWISE / decode FULL whole-graph
+rem replay). Explicit PIECEWISE disables FULL graphs and eagerly dispatches
+rem 90+ splitting ops per decode step; the FULL decode graph is verified
+rem safe with DFlash2 spec (three-segment capture passes, step 026) and was
+rem measured 25.86-26.45ms vs 27.0ms over 3 boots (step 026, -4%).
+rem --cudagraph-capture-sizes 3 kept. Long-stability soak + correctness
+rem gates (step 027) precede this file becoming the live production config.
+rem Rollback of this swap = re-add the compilation-config line above.
 rem ===========================================================================
 if not exist C:\fi mkdir C:\fi
 if not exist C:\fw mkdir C:\fw
@@ -74,7 +85,6 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 29550 -ErrorActi
   --mamba-cache-mode align ^
   --kv-offloading-backend native ^
   --kv-offloading-size 8 ^
-  --compilation-config {\"cudagraph_mode\":\"PIECEWISE\"} ^
   --cudagraph-capture-sizes 3 ^
   --speculative-config.method dflash ^
   --speculative-config.model "G:\qwen3.8model\Qwen3.8-27B-3Bit-GSQ\dflash2\gptq3c" ^
