@@ -1,0 +1,49 @@
+{
+ "step": 29,
+ "date": "2026-09-27",
+ "user_hypothesis": "draft weights randomly placed => fast/slow states; reclaim ~500MB for longer context",
+ "verdict": "randomness CONFIRMED and refined: compile path deterministic fast (8/8 19.4-20.4ms); AOT-load path random multi-tier (19.47x2, 21.42, 22.78, 23.39, 25.0-25.4xN, 25.7x3, 36.57)",
+ "step028_correction": "'load=slow 7/7' -> 'load=random draw'",
+ "force_all_negative": "cloning all 1120 params into fresh device tensors (P4) stayed 23.39ms; also 12GB transient doubling caused WDDM thrash and wedged boots (P5/Q1)",
+ "accounting_signal": {
+  "fast_boot_python_ded_mb": 15664.4,
+  "slow_boot_python_ded_mb": 15136.6,
+  "delta_mb": 528,
+  "shared_delta_mb": 108,
+  "unaccounted_mb": 420,
+  "slow_gemm_effective_bw": "~61 GB/s (PCIe5 x16 signature)",
+  "fast_gemm_effective_bw": "~1.06 TB/s (HBM floor)"
+ },
+ "pointer_census_tool_debt": "probe correct standalone (Device=2/Host=1/Unregistered=0) but deadlocks inside engine between param 6 and 7; census/force data NOT trusted; accounting+timing data are",
+ "tooling_bugs_cumulative": 8,
+ "user_memory_reclaim_plan": "real basis (528MB ded delta + continuum) but needs CONTROLLABLE placement; not safe to land before mechanism settled; 3 closure paths listed",
+ "observed_boots_ms": {
+  "compile": [
+   19.44,
+   19.47,
+   19.47,
+   19.49,
+   20.1,
+   20.35,
+   20.36,
+   19.43
+  ],
+  "load": [
+   19.47,
+   19.47,
+   21.42,
+   22.78,
+   23.39,
+   25.03,
+   25.11,
+   25.11,
+   25.21,
+   25.33,
+   25.43,
+   25.69,
+   25.73,
+   25.77,
+   36.57
+  ]
+ }
+}
