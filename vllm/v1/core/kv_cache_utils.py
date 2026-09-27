@@ -1319,6 +1319,37 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    # vllm-030win patch (step 036): optional explicit layers-per-group
+    # override. The heuristic above derives the group size from the SMALLEST
+    # attention-type bucket, so a small speculative-drafter bucket (DFlash2:
+    # 5 sliding-window layers) can pin it to a value that divides the target's
+    # buckets badly. bytes_per_block is the widest group's page and therefore
+    # scales with the layers per group, while the blocks a request claims
+    # depend only on how many groups each bucket splits into, so a bad divisor
+    # both enlarges the block and multiplies the group count. Setting
+    # VLLM_KV_GROUP_SIZE=N forces the group size so capacity can be measured
+    # per candidate; unset keeps upstream behaviour byte-for-byte.
+    _forced_group_size = os.environ.get("VLLM_KV_GROUP_SIZE", "").strip()
+    if _forced_group_size:
+        try:
+            _forced_group_size_n = int(_forced_group_size)
+        except ValueError:
+            raise ValueError(
+                "VLLM_KV_GROUP_SIZE must be a positive integer, got %r"
+                % (_forced_group_size,)
+            ) from None
+        if _forced_group_size_n < 1:
+            raise ValueError(
+                "VLLM_KV_GROUP_SIZE must be >= 1, got %d"
+                % (_forced_group_size_n,)
+            )
+        logger.info(
+            "vllm-030win patch (step 036): layers-per-group %d -> %d "
+            "(VLLM_KV_GROUP_SIZE)",
+            group_size,
+            _forced_group_size_n,
+        )
+        group_size = _forced_group_size_n
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
