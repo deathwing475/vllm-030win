@@ -148,6 +148,16 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
         w._dbg_wrapped = True
         setattr(cls, mname, w)
 
+    # ⚠️普查危柜（步骤 029 死锁记录 + 步骤 052 处置）：引擎进程内对参数做
+    # cudaPointerGetAttributes 普查曾在第 6→7 个参数间死锁（CPU 冻结、栈转储
+    # 不可达；独立环境全对，机制未定罪）。生产无暴露：census_and_force 从未
+    # 被接线；_ptr_type 只被 wrap_launch（非 MIN 调试模式）调用，生产 _MIN=1
+    # 下 JOBS 过滤掉 humming 模块。普查的研究目标（权重放置归因）已由步骤
+    # 044（pin_shim 兑现放置控制）与 049（per-process 专用/共享记账做观测）
+    # 收口，本代码仅作复活配方保留。若复活：①独立线程跑 + 逐调用预算，
+    # 绝不让引擎主线程卡在 ctypes 调用上；②普查走独立进程 + IPC 回传；
+    # ③先试驱动 API cuPointerGetAttributes（nvcuda.dll）替代 cudart；
+    # ④复现优先（先在 boot 期打 PT.before_call/after_call 重现 6→7 死锁）。
     _CUDART = None
     _PT_N = [0]
 
@@ -199,7 +209,10 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
             return "err:%s" % type(e).__name__
 
     def census_and_force(model, tag):
-        """参数/缓冲指针属性普查；VLLM_DBG_FORCE_GPU=1 时把非 Device 的拷回显存。"""
+        """参数/缓冲指针属性普查；VLLM_DBG_FORCE_GPU=1 时把非 Device 的拷回显存。
+
+        ⚠️未接线（死代码，保留作复活配方，见上方 _ptr_type 危柜注释）——
+        步骤 029 在引擎内跑它曾于第 6→7 参数间死锁，勿直接在生产 boot 挂用。"""
         pass  # imports hoisted at module top
         force = os.environ.get("VLLM_DBG_FORCE_GPU") == "1"
         moved, total, nondev = 0, 0, 0

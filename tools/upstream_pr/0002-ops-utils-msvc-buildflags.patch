@@ -1,0 +1,30 @@
+diff --git a/humming/ops/utils.py b/humming/ops/utils.py
+index 0e5befa..528784e 100644
+--- a/humming/ops/utils.py
++++ b/humming/ops/utils.py
+@@ -232,11 +232,24 @@ def init_humming_launcher():
+         if USE_TORCH_STABLE_API:
+             extra_cflags.append("-DTORCH_TARGET_VERSION=0x020B000000000000")
+ 
++        if sys.platform == "win32":
++            # MSVC: GNU-style -l flags never reach link.exe, and torch
++            # rewrites build.ninja on every invocation, so flags patched
++            # in by hand do not survive either. Translate to .lib names
++            # plus /LIBPATH on the toolkit's lib/x64.
++            extra_ldflags = ["cuda.lib", "c10_cuda.lib", "torch_cuda.lib"]
++            lib_dir = os.path.join(cuda_env["path"], "lib", "x64")
++            if os.path.isdir(lib_dir):
++                extra_ldflags.append("/LIBPATH:" + lib_dir)
++            extra_cflags += ["/Zc:__cplusplus", "/Zc:preprocessor"]
++        else:
++            extra_ldflags = ["-lcuda", "-lc10_cuda", "-ltorch_cuda"]
++
+         torch.utils.cpp_extension.load(
+             name="humming_launcher",
+             sources=[filename],
+             extra_include_paths=list(cuda_env["include_paths"]),
+-            extra_ldflags=["-lcuda", "-lc10_cuda", "-ltorch_cuda"],
++            extra_ldflags=extra_ldflags,
+             extra_cflags=extra_cflags,
+             build_directory=build_dir,
+             is_python_module=False,

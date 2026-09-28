@@ -19,6 +19,10 @@
 csrc 里 dlfcn.h/sys/mman.h 照用、构建器 GNU 旗标、`.so` 命名。凡在 Windows 上重装此包，
 这 8 件都要重放。缓存在 `C:\fi\.humming\cache\`（HOME=C:\fi 是环境契约的一部分）。
 
+**上游回馈（步骤 052）**：#1/#2 两件通用修复已整理成可提交补丁包 `../upstream_pr/`
+（pristine 对比经 wheel RECORD 哈希溯源、泛化版旗标经真编译+加载验证；
+**提交 PR 属 outward-facing，等用户发话**）。
+
 **垫片 #9（尝试后撤销，2026-09-26 批 3）**：`humming_forward_dynamo.patched.py` 曾尝试给
 `humming_forward` 加 `torch._dynamo.disable(recursive=True)` 修 PIECEWISE 启动炸（dynamo 追踪
 下 json.loads(compute_config) 炸）——**fullgraph AOT 下 disable 函数是硬错误**
