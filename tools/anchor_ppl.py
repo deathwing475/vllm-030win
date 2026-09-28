@@ -32,17 +32,23 @@ def main() -> int:
     ap.add_argument("--gpu-mem", type=float, default=0.922)
     ap.add_argument("--kv-dtype", default="nvfp4")
     ap.add_argument("--max-num-batched-tokens", type=int, default=1024)
+    ap.add_argument("--mamba-ssm-dtype", default=None,
+                    help="step-045 arm: override mamba ssm cache dtype "
+                         "(e.g. bfloat16); omit = historical behavior")
     args = ap.parse_args()
 
     t0 = time.time()
     from vllm import LLM, SamplingParams
     import vllm, torch
 
+    llm_kwargs = {}
+    if args.mamba_ssm_dtype:
+        llm_kwargs["mamba_ssm_cache_dtype"] = args.mamba_ssm_dtype
     llm = LLM(model=args.model, max_model_len=args.max_model_len,
               gpu_memory_utilization=args.gpu_mem, enforce_eager=True,
               kv_cache_dtype=args.kv_dtype, language_model_only=True,
               max_num_batched_tokens=args.max_num_batched_tokens,
-              disable_log_stats=True)
+              disable_log_stats=True, **llm_kwargs)
     tok = llm.get_tokenizer()
 
     meta = {
@@ -55,6 +61,7 @@ def main() -> int:
         "enforce_eager": True,
         "kv_dtype": args.kv_dtype,
         "max_num_batched_tokens": args.max_num_batched_tokens,
+        "mamba_ssm_dtype": args.mamba_ssm_dtype,
         "language_model_only": True,
         "tokenizer_sha256": sha256(tok.backend_tokenizer.to_str()
                                    if hasattr(tok, "backend_tokenizer") else str(type(tok))),
