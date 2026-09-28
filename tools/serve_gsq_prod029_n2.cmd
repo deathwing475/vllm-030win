@@ -1,4 +1,15 @@
 @echo off
+rem 2026-09-28 step 036 (KV regroup, PRODUCTION): VLLM_KV_GROUP_SIZE=8
+rem forces the KV layers-per-group from the upstream 5 (pinned by the
+rem draft's 5 sliding-window layers) to 8. Measured on this stack: the
+rem 3.4e9 pool goes 114,974 -> 136,190 tokens (+18.5%), decode step
+rem 18.73/18.74 -> 18.30/18.31/18.32 ms, prefill unchanged, needle green
+rem at 8k/32k/64k/100k (max-model-len 110000) and 8k/64k/130k (140000).
+rem max-model-len: 110000 -> 130000 (capacity at 130000 is 142,016).
+rem Pool stays the manual 3,400,000,000 B: KV tensor size and spill are
+rem unchanged; only grouping and the logical ceiling move.
+rem ROLLBACK = delete the VLLM_KV_GROUP_SIZE line, restore 110000, drop
+rem this note (or: python tools\apply_prod_kvgroup_step036.py revert).
 rem ===========================================================================
 rem PRODUCTION launcher, vLLM 0.29 stack (stage-4 switchover, 2026-09-26).
 rem Deployment twin of the regression-verified tools/serve_gsq_base029_lineB_spec.cmd
@@ -72,6 +83,7 @@ set "PYTHONPATH=G:\qwen3.8model\vllm-030win-git\tools\pin_shim"
 set "VLLM_DBG_TRACE=1"
 set "VLLM_DBG_MIN=1"
 set "VLLM_DBG_PIN=1"
+set "VLLM_KV_GROUP_SIZE=8"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "LIB=C:\PROGRA~1\NVIDIA~2\CUDA\v13.3\lib\x64;%LIB%"
 rem Sweep stale offload mmaps (crash/held-ref exits leave them; names are
@@ -87,7 +99,7 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 29550 -ErrorActi
   --kv-cache-dtype nvfp4 ^
   --kv-cache-memory-bytes 3400000000 ^
   --gpu-memory-utilization 0.922 ^
-  --max-model-len 110000 ^
+  --max-model-len 130000 ^
   --max-num-seqs 1 --max-num-batched-tokens 1024 ^
   --enable-prefix-caching ^
   --enable-auto-tool-choice ^
