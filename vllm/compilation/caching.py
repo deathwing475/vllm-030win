@@ -4,7 +4,6 @@
 import contextlib
 import hashlib
 import inspect
-import json
 import os
 import pickle
 from collections.abc import Callable, Sequence
@@ -23,6 +22,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.config.utils import hash_factors
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.utils.hashing import safe_hash
 
 try:
@@ -131,9 +131,16 @@ class StandaloneCompiledArtifacts:
             compilation_counter.num_compiled_artifacts_loaded += 1
             return AOTCompiledArtifact.deserialize(entry)
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            entries = list(self.submodule_bytes_store.values())
-            loaded_entries = list(executor.map(_load_entry, entries))
+        entries = list(self.submodule_bytes_store.values())
+        if current_platform.is_rocm():
+            # Deserializing an artifact loads its compiled Triton kernels, which
+            # on ROCm ends up in hipModuleLoad. Loading modules concurrently
+            # deadlocks on the dynamic linker lock, since rocprofiler-sdk calls
+            # dl_iterate_phdr from inside the load, so load one at a time.
+            loaded_entries = [_load_entry(entry) for entry in entries]
+        else:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                loaded_entries = list(executor.map(_load_entry, entries))
 
         for i, k in enumerate(self.submodule_bytes_store.keys()):
             self.loaded_submodule_store[k] = loaded_entries[i]
@@ -563,38 +570,6 @@ def reconstruct_serializable_fn_from_mega_artifact(
     return fn
 
 
-def _quant_scheme_hash(vllm_config: VllmConfig) -> str:
-    """Digest the quantization scheme, which decides the packed weight shapes.
-
-    VllmConfig.compute_hash() skips quant_config on the assumption that
-    model_config.quantization captures it. That breaks for speculative
-    decoding: the draft model may ship its own quantization_config while
-    model_config.quantization stays identical ("compressed-tensors") whether
-    the draft checkpoint is quantized or stored in BF16. The draft AOT cache
-    key would then collide across those two layouts, and the reused graph
-    asserts BF16 weight shapes against the packed tensors at runtime.
-    """
-    quant_config = getattr(vllm_config, "quant_config", None)
-    if quant_config is None:
-        return "none"
-    payload: dict[str, Any] = {"name": quant_config.get_name()}
-    for attr in (
-        "quant_format",
-        "target_scheme_map",
-        "ignore",
-        "kv_cache_scheme",
-        "config",
-        "transform_config",
-        "total_num_heads",
-        "total_num_kv_heads",
-    ):
-        value = getattr(quant_config, attr, None)
-        if value is not None:
-            payload[attr] = value
-    serialized = json.dumps(payload, sort_keys=True, default=str)
-    return hashlib.sha256(serialized.encode()).hexdigest()
-
-
 def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     factors = []
     # 0. factors come from the env, for example, The values of
@@ -606,9 +581,6 @@ def aot_compile_hash_factors(vllm_config: VllmConfig) -> list[str]:
     #    model is created)
     config_hash = vllm_config.compute_hash()
     factors.append(config_hash)
-
-    # 2. the quantization scheme, which is not part of the config hash above
-    factors.append(_quant_scheme_hash(vllm_config))
 
     # 2. inductor factors if applicable
     if envs.VLLM_USE_MEGA_AOT_ARTIFACT:

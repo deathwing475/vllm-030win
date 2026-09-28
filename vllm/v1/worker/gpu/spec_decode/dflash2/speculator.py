@@ -109,22 +109,12 @@ def _cache_draft_logits_kernel(
 
 
 class DFlash2Speculator(DFlashSpeculator):
-    """DFlash with a learned shortlist: a block-diffusion draft scores edges
-    between candidate tokens instead of sampling the full vocabulary.
-
-    Only the proposal path changes. `propose`, the CUDA graph manager, the KV
-    handling and the input preparation are the DFlash ones; the walk over the
-    candidate shortlist replaces `sample_draft`.
-    """
-
     _speculator_name = "DFlash2"
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
         draft_config = self.draft_model_config.hf_config.dflash_config
         self.selector_top_k = int(draft_config["selector_top_k"])
-        # Row-parallel buffer of the per-request query base, used to read each
-        # request's anchor (bonus) token id out of the shared input buffer.
         self._anchor_indices = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
@@ -223,11 +213,5 @@ class DFlash2Speculator(DFlashSpeculator):
             anchor_token_ids,
         )
         self._sample_path(candidate_ids, scores, num_reqs)
-        if self.enable_adaptive_verification:
-            self._maybe_predict_acceptance(
-                self._selector_scores[:num_reqs].flatten(0, 1),
-                self.sample_idx_mapping[:num_sample],
-                self.sample_col[:num_sample],
-            )
         if self.draft_logits is not None:
             self._cache_draft_logits(candidate_ids, num_sample)

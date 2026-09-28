@@ -1,15 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import copy
 from collections.abc import Mapping
 from typing import Any
-
-import time
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-import vllm.envs as envs
 from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
@@ -17,13 +15,11 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import (
-    KVCacheConfig,
-    get_kv_cache_spec_sliding_window,
-)
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.dp_utils import dispatch_cg_and_sync_dp
+from vllm.v1.worker.gpu.cp_utils import cp_local_slot
+from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.gpu.spec_decode.dflash.cudagraph import DFlashCudaGraphManager
@@ -90,8 +86,11 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.sample_pos = torch.zeros(
             max_num_sampled_tokens, dtype=torch.int64, device=device
         )
-        self.sample_idx_mapping = torch.zeros(
-            max_num_sampled_tokens, dtype=torch.int32, device=device
+        # -1 marks an inert sampling row. CUDA graph capture can execute the
+        # full buffer before a real batch has populated it, so zero would make
+        # every padding row scatter into request slot 0.
+        self.sample_idx_mapping = torch.full(
+            (max_num_sampled_tokens,), -1, dtype=torch.int32, device=device
         )
         # [0, 1, ..., N-1, 0, 1, ..., N-1, ...] -> the per-token column index into
         # draft_logits[req, step, :].
@@ -102,47 +101,15 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.query_cudagraph_manager: DFlashCudaGraphManager | None = None
         self.draft_kv_cache_group_id: int = -1
 
-        # C1 tail-window: defer draft context-KV writes until a request's
-        # prefill completes. During chunked prefill each step's context rows
-        # would be written to the draft sliding-window cache, yet all but the
-        # trailing `sliding_window` rows are evicted before decode ever reads
-        # them. Instead we rotate the rows into two staging slots and compute
-        # + write only the trailing window in one shot when the request is
-        # about to enter decode. See _c1_handle_context.
-        self._c1_window = int(
-            getattr(self.draft_model_config.hf_config, "sliding_window", 0) or 0
-        )
-        self._c1_enabled = bool(
-            envs.VLLM_DFLASH_C1_TAIL_WINDOW and self._c1_window > 0
-        )
-        if self._c1_enabled:
-            n = self.max_num_tokens
-            # Single contiguous staging buffer holding the trailing
-            # `sliding_window` context rows; one chunk per step is appended
-            # after evicting rows that fall outside the window.
-            self._c1_slot_h = torch.zeros(
-                self._c1_window, self.hidden_size, dtype=self.dtype, device=device
-            )
-            self._c1_slot_p = torch.zeros(
-                self._c1_window, dtype=torch.int64, device=device
-            )
-            self._c1_req_id: int | None = None
-            self._c1_total = 0
-            self._c1_step = 0
-            # Group-aware slot staging is allocated in set_attn, where the
-            # draft kv-cache group count is known.
-            self._c1_slot_s: list[torch.Tensor] = []
-
     @property
     def attn_vllm_config(self) -> VllmConfig:
         # The draft's attention differs from the target's in causality.
-        return replace(
-            self.vllm_config,
-            attention_config=replace(
-                self.vllm_config.attention_config,
-                use_non_causal=self.requires_non_causal,
-            ),
+        config = copy.copy(super().attn_vllm_config)
+        config.attention_config = replace(
+            self.vllm_config.attention_config,
+            use_non_causal=self.requires_non_causal,
         )
+        return config
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
@@ -172,11 +139,10 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def capture(self) -> None:
         logger.info("Capturing model for %s speculator...", self._speculator_name)
-        # Reset sampling indices to zero to prevent stale values from prior
-        # dummy runs from being baked into the captured graph.
+        # Padded sample rows must not scatter into a live request during capture.
         self.sample_indices.zero_()
         self.sample_pos.zero_()
-        self.sample_idx_mapping.zero_()
+        self.sample_idx_mapping.fill_(-1)
         assert self.query_cudagraph_manager is not None
         self.query_cudagraph_manager.capture(
             self._generate_draft,
@@ -212,20 +178,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             target_attn_groups,
         )
 
-        # FlashAttention's AOT split schedule is wrong for a windowed drafter,
-        # and `_get_sliding_window_configs` leaves it on or off depending on
-        # whether the target also runs FlashAttention. Decide it here instead.
-        # (Port from 0.30 dflash/speculator.py:189-200.)
-        for groups in self.attn_groups:
-            for group in groups:
-                builder = group.get_metadata_builder(0)
-                if getattr(
-                    builder, "aot_schedule", False
-                ) and get_kv_cache_spec_sliding_window(builder.kv_cache_spec):
-                    # `aot_schedule` belongs to FlashAttention's builder, not
-                    # to the base class this loop is typed against.
-                    builder.aot_schedule = False  # type: ignore[attr-defined]
-
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
         ]
@@ -239,15 +191,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             dtype=torch.int64,
             device=self.device,
         )
-
-        # C1 tail-window: per-group slot staging, mirroring _context_slot_mappings.
-        if self._c1_enabled:
-            self._c1_slot_s = [
-                torch.zeros(
-                    self._c1_window, dtype=torch.int64, device=self.device
-                )
-                for _ in range(len(self.draft_kv_cache_group_ids))
-            ]
 
         # Map each draft decoder layer to the index (within draft_kv_cache_group_ids)
         # of the kv-cache group its cache belongs to. Models that share a single group
@@ -316,14 +259,13 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
-        # sample_pos is the predicted token's position Q; verification keys
-        # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
+        # sample_pos is the predicted token's position P. Sampling keys a draw
+        # by the position before the sampled token, P-1.
         draft_tokens = self.sample_draft(
             sample_hidden_states,
-            self.sample_pos[:num_sample] - 2,
+            self.sample_pos[:num_sample] - 1,
             self.sample_idx_mapping[:num_sample],
             self.temperature,
             self.seeds,
@@ -344,6 +286,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         num_query_per_req: int | None = None,
         causal: bool | Mapping[int, bool] = False,
         query_start_loc_np: np.ndarray | None = None,
+        dcp_local_seq_lens: torch.Tensor | None = None,
     ) -> dict[str, Any] | None:
         if not self.draft_attn_layer_names:
             return None
@@ -357,6 +300,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_query_per_req=self.num_query_per_req,
             causal=causal,
             query_start_loc_np=query_start_loc_np,
+            dcp_local_seq_lens=dcp_local_seq_lens,
         )
 
     @torch.inference_mode()
@@ -381,13 +325,12 @@ class DFlashSpeculator(DraftModelSpeculator):
         temperature: torch.Tensor,
         # [max_num_reqs]
         seeds: torch.Tensor,
-        num_tokens_across_dp: torch.Tensor | None = None,
+        dp_sync: DPSyncState | None = None,
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
         is_profile: bool = False,
     ) -> torch.Tensor:
-        _t_propose_start = time.monotonic()
         num_reqs = input_batch.num_reqs
         num_target_tokens = input_batch.num_tokens
         num_query_tokens = num_reqs * self.num_query_per_req
@@ -424,7 +367,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_query_tokens,
                 attn_metadata=None,
                 slot_mappings=None,
-                num_tokens_across_dp=num_tokens_across_dp,
+                num_tokens_across_dp=(
+                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
+                ),
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             return self.draft_tokens[:num_reqs]
@@ -453,6 +398,9 @@ class DFlashSpeculator(DraftModelSpeculator):
                 seeds,
                 self.block_tables.input_block_tables[gid],
                 self.block_tables.kernel_block_sizes[gid],
+                self.block_tables.cp_rank,
+                self.block_tables.cp_size,
+                self.block_tables.cp_interleave,
                 self.parallel_drafting_token_id,
                 self.num_query_per_req,
                 self.num_speculative_steps,
@@ -466,41 +414,23 @@ class DFlashSpeculator(DraftModelSpeculator):
         # because the context shape varies per step. During dummy runs the block tables
         # are placeholders, so we skip the cache write to avoid clobbering real entries.
         # Each layer uses the context slots of its own kv-cache group.
-        # C1 tail-window path: single-request prefill steps defer the write —
-        # rows rotate into staging and the trailing sliding window is computed
-        # and written once the request's prefill completes. All other shapes
-        # (dummy/profile runs, batched requests, decode steps) keep the eager
-        # write: decode-step rows are what decode will read next. Once the
-        # scheduled sequence length exceeds prefill_len the request is decoding
-        # (host-side test, free); the final prefill step still tests true here
-        # and writes its staged rows via the sampled>0 branch inside.
-        if (
-            self._c1_enabled
-            and not dummy_run
-            and not is_profile
-            and num_reqs == 1
-            and input_batch.seq_lens_cpu_upper_bound[0]
-            <= input_batch.prefill_len_np[0]
-        ):
-            self._c1_handle_context(input_batch, num_target_tokens)
+        if dummy_run:
+            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+        elif self._layer_group_idx is not None:
+            context_slots = [
+                self._context_slot_mappings[gidx][:num_target_tokens]
+                for gidx in self._layer_group_idx
+            ]
         else:
-            if dummy_run:
-                context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
-            elif self._layer_group_idx is not None:
-                context_slots = [
-                    self._context_slot_mappings[gidx][:num_target_tokens]
-                    for gidx in self._layer_group_idx
-                ]
-            else:
-                context_slots = self._context_slot_mappings[0][:num_target_tokens]
-            self.model.precompute_and_store_context_kv(
-                self.hidden_states[:num_target_tokens],
-                self.context_positions[:num_target_tokens],
-                context_slots,
-            )
+            context_slots = self._context_slot_mappings[0][:num_target_tokens]
+        self.model.precompute_and_store_context_kv(
+            self.hidden_states[:num_target_tokens],
+            self.context_positions[:num_target_tokens],
+            context_slots,
+        )
 
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        batch_desc, batch_sync = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
             num_query_tokens,
@@ -512,6 +442,9 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
         num_tokens_padded = batch_desc.num_tokens
+        num_tokens_across_dp = (
+            batch_sync.num_tokens_across_dp if batch_sync is not None else None
+        )
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
@@ -545,114 +478,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 cudagraph_runtime_mode=batch_desc.cg_mode,
             )
 
-        logger.info(
-            "C1 propose total dt=%.3fs rows=%d",
-            time.monotonic() - _t_propose_start,
-            num_target_tokens,
-        )
         return self.draft_tokens[:num_reqs]
-
-    def _c1_handle_context(
-        self,
-        input_batch: InputBatch,
-        num_target_tokens: int,
-    ) -> None:
-        """C1 tail-window staging (single request, prefill steps only).
-
-        Each prefill step's context rows are appended to one contiguous
-        staging buffer; rows that fall outside the trailing sliding window are
-        evicted as new chunks arrive. When the request's prefill completes
-        (num_sampled > 0 — the step that samples the first target token), the
-        staged rows are computed and written to the draft cache in one call,
-        covering everything decode can still read.
-        """
-        # A new request must never inherit the previous request's staged rows:
-        # if a prefill was aborted mid-way (preemption/abort) the buffer holds
-        # rows of a request that no longer exists.
-        req_id = input_batch.req_ids[0]
-        if req_id != self._c1_req_id:
-            self._c1_req_id = req_id
-            self._c1_total = 0
-            self._c1_step = 0
-
-        n = num_target_tokens
-        _now = time.monotonic()
-        logger.info(
-            "C1 step %d: rows=%d computed=%d scheduled=%d prefill_len=%d total=%d "
-            "dt_last_step=%.3fs dt_since_entry=%.3fs",
-            self._c1_step,
-            n,
-            int(input_batch.num_computed_prefill_tokens_np[0]),
-            int(input_batch.num_scheduled_tokens[0]),
-            int(input_batch.prefill_len_np[0]),
-            self._c1_total,
-            _now - getattr(self, "_c1_last_exit", _now),
-            _now - getattr(self, "_c1_last_entry", _now),
-        )
-        self._c1_last_entry = _now
-        if n > 0:
-            # Evict rows that would fall outside the trailing window. A chunk
-            # is never larger than max_num_tokens (< window), so the tail
-            # always fits after eviction.
-            if self._c1_total + n > self._c1_window:
-                keep = max(0, self._c1_window - n)
-                drop = self._c1_total - keep
-                if drop > 0:
-                    # clone() first: source and destination overlap in-place.
-                    self._c1_slot_h[:keep].copy_(
-                        self._c1_slot_h[drop:self._c1_total].clone()
-                    )
-                    self._c1_slot_p[:keep].copy_(
-                        self._c1_slot_p[drop:self._c1_total].clone()
-                    )
-                    for gbuf in self._c1_slot_s:
-                        gbuf[:keep].copy_(gbuf[drop:self._c1_total].clone())
-                self._c1_total = keep
-            t = self._c1_total
-            self._c1_slot_h[t:t + n].copy_(self.hidden_states[:n])
-            self._c1_slot_p[t:t + n].copy_(self.context_positions[:n])
-            for gi, gbuf in enumerate(self._c1_slot_s):
-                gbuf[t:t + n].copy_(self._context_slot_mappings[gi][:n])
-            self._c1_total = t + n
-            self._c1_step += 1
-
-        # Host-side completion test, no GPU sync. num_computed_prefill_tokens
-        # (folded from the scheduler's request state in update_requests) lags
-        # this step's forward by one step, so add this step's scheduled chunk:
-        # the final prefill step satisfies computed+scheduled >= prefill_len.
-        if (
-            input_batch.num_computed_prefill_tokens_np[0]
-            + input_batch.num_scheduled_tokens[0]
-            < input_batch.prefill_len_np[0]
-        ):
-            return  # mid-prefill: decode cannot read anything from this yet
-        logger.info(
-            "C1 FINALIZE: writing %d staged rows (step span %.3fs)",
-            self._c1_total,
-            time.monotonic() - getattr(self, "_c1_last_entry", 0.0),
-        )
-        self._c1_last_exit = time.monotonic()
-        logger.info(
-            "C1 propose exit dt_in_propose=%.3fs",
-            self._c1_last_exit - self._c1_last_entry,
-        )
-
-        rows = self._c1_total
-        self._c1_total = 0
-        if rows == 0:
-            return
-        if self._layer_group_idx is None:
-            self.model.precompute_and_store_context_kv(
-                self._c1_slot_h[:rows],
-                self._c1_slot_p[:rows],
-                self._c1_slot_s[0][:rows],
-            )
-        else:
-            self.model.precompute_and_store_context_kv(
-                self._c1_slot_h[:rows],
-                self._c1_slot_p[:rows],
-                [self._c1_slot_s[gidx][:rows] for gidx in self._layer_group_idx],
-            )
 
 
 @triton.jit
@@ -692,8 +518,11 @@ def _prepare_dflash_inputs_kernel(
     max_num_reqs,
     max_num_tokens,
     max_model_len,
+    cp_rank,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
     PAD_SLOT_ID: tl.constexpr,
+    CP_SIZE: tl.constexpr,
+    CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
@@ -728,7 +557,7 @@ def _prepare_dflash_inputs_kernel(
     # --- Context positions / slots ---
     ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
     ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
-    ctx_block_num = ctx_pos // block_size
+    ctx_block_num = ctx_pos // (block_size * CP_SIZE)
     ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
     ctx_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + ctx_block_num,
@@ -739,14 +568,17 @@ def _prepare_dflash_inputs_kernel(
     # to it after eviction; rejected suffix rows are invalid context as well.
     # Neither kind of row may write draft KV into physical block 0.
     ctx_resident = is_valid_ctx & (ctx_block_id != 0)
+    local_ctx_slot = cp_local_slot(
+        ctx_pos, ctx_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID
+    )
     ctx_slot = tl.where(
         ctx_resident,
-        ctx_block_id * block_size + (ctx_pos % block_size),
+        local_ctx_slot,
         PAD_SLOT_ID,
     )
     # Stored over the full [0, num_ctx) span while the loads above are masked to
     # [0, num_valid_ctx): the rejected suffix rows in between get position 0 and
-    # PAD_SLOT_ID. That is intentional - those rows write no KV and their
+    # PAD_SLOT_ID. That is intentional — those rows write no KV and their
     # positions are never consumed, but the span must stay fully initialized so
     # a replayed graph cannot observe a stale value from an earlier batch.
     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
@@ -758,7 +590,7 @@ def _prepare_dflash_inputs_kernel(
     is_bonus = is_query & (query_off == 0)
     input_id = tl.where(is_bonus, bonus_token, parallel_drafting_token_id)
 
-    q_block_num = query_pos // block_size
+    q_block_num = query_pos // (block_size * CP_SIZE)
     q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
     q_block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + q_block_num,
@@ -768,9 +600,18 @@ def _prepare_dflash_inputs_kernel(
     # A null block is never a writable cache slot. This can occur when a
     # sliding-window block table contains evicted/global padding entries.
     q_resident = is_query & (q_block_id != 0)
+    local_q_slot = cp_local_slot(
+        query_pos,
+        q_block_id,
+        block_size,
+        cp_rank,
+        CP_SIZE,
+        CP_INTERLEAVE,
+        PAD_SLOT_ID,
+    )
     q_slot = tl.where(
         q_resident,
-        q_block_id * block_size + (query_pos % block_size),
+        local_q_slot,
         PAD_SLOT_ID,
     )
 
@@ -866,6 +707,9 @@ def prepare_dflash_inputs(
     # [max_num_reqs, max_num_blocks]
     block_table: torch.Tensor,
     block_size: int,
+    cp_rank: int,
+    cp_size: int,
+    cp_interleave: int,
     parallel_drafting_token_id: int,
     num_query_per_req: int,
     num_speculative_steps: int,
@@ -913,7 +757,10 @@ def prepare_dflash_inputs(
         max_num_reqs,
         max_num_tokens,
         max_model_len,
+        cp_rank,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
         PAD_SLOT_ID=PAD_SLOT_ID,
+        CP_SIZE=cp_size,
+        CP_INTERLEAVE=cp_interleave,
         BLOCK_SIZE=BLOCK_SIZE,
     )

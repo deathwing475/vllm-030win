@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class INCLayerConfig:
     bits: int
-    group_size: int
+    group_size: int | tuple[int, int]
     sym: bool
     packing_format: str
     backend: str
@@ -44,6 +44,18 @@ class INCLayerConfig:
     def is_mxfp8(self) -> bool:
         return "mx_fp" in self.data_type and self.bits == 8
 
+    @property
+    def is_fp8_block(self) -> bool:
+        return (
+            self.data_type == "fp"
+            and self.bits == 8
+            and self.sym
+            and self.quantized
+            and self.packing_format == "auto_round:fp8"
+            and isinstance(self.group_size, tuple)
+            and len(self.group_size) == 2
+        )
+
 
 class INCConfigParser:
     def __init__(self, config: "INCConfig") -> None:
@@ -63,66 +75,37 @@ class INCConfigParser:
 
     def get_layer_config(
         self, layer: "torch.nn.Module", layer_name: str
-    ) -> tuple[int, int, bool]:
+    ) -> tuple[int, int | tuple[int, int], bool]:
         layer_config = self.resolve(layer, layer_name)
         return layer_config.bits, layer_config.group_size, layer_config.sym
 
-    def is_explicitly_configured(self, name: str) -> bool:
-        """Return True if *name* has an explicit entry in extra_config,
-        either via exact key match or via a regex pattern key."""
-        regex_special_chars = set(r"*+?^$()[]{}|\\")
-        if not self._config.extra_config:
-            return False
-        if name in self._config.extra_config:
-            return True
-        for pattern in self._config.extra_config:
-            if not isinstance(pattern, str) or not any(
-                c in regex_special_chars for c in pattern
-            ):
-                continue
-            try:
-                if re.search(re.compile(pattern), name) is not None:
-                    return True
-            except re.error:
-                continue
-        return False
-
-    def raw_config_for(self, name: str) -> dict | None:
-        """Return the raw extra_config entry for *name*.
-
-        Matches the exact key, the `model.`-prefixed variant, or a regex key
-        matching either spelling; None when *name* has no explicit entry.
-        Used for per-layer format overrides (e.g. "format": "fp8").
-        """
-        if not self._config.extra_config:
-            return None
-        for key in (name, f"model.{name}"):
-            cfg = self._config.extra_config.get(key)
-            if cfg is not None:
-                return cfg
-        REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
-        for pattern, cfg in self._config.extra_config.items():
-            if not isinstance(pattern, str) or not any(
-                c in REGEX_SPECIAL_CHARS for c in pattern
-            ):
-                continue
-            try:
-                rx = re.compile(pattern)
-            except re.error:
-                continue
-            if rx.search(name) is not None or rx.search(f"model.{name}") is not None:
-                return cfg
-        return None
-
     def _resolve_raw(
         self, layer: "torch.nn.Module", layer_name: str
-    ) -> tuple[int, int, bool]:
+    ) -> tuple[int, int | tuple[int, int], bool]:
         REGEX_SPECIAL_CHARS = set(r"*+?^$()[]{}|\\")
 
         def is_explicitly_configured(name: str) -> bool:
-            return self.is_explicitly_configured(name)
+            """Return True if *name* has an explicit entry in extra_config,
+            either via exact key match or via a regex pattern key."""
+            if not self._config.extra_config:
+                return False
+            if name in self._config.extra_config:
+                return True
+            for pattern in self._config.extra_config:
+                if not isinstance(pattern, str) or not any(
+                    c in REGEX_SPECIAL_CHARS for c in pattern
+                ):
+                    continue
+                try:
+                    if re.search(re.compile(pattern), name) is not None:
+                        return True
+                except re.error:
+                    continue
+            return False
 
-        def get_config(name: str, quantized: bool = True) -> tuple[int, int, bool]:
+        def get_config(
+            name: str, quantized: bool = True
+        ) -> tuple[int, int | tuple[int, int], bool]:
             if not self._config.extra_config:
                 return (
                     self._config.weight_bits if quantized else 16,
@@ -134,9 +117,11 @@ class INCConfigParser:
                 cfg = self._config.extra_config[name]
                 return (
                     cfg.get("bits", self._config.weight_bits if quantized else 16),
-                    cfg.get(
-                        "group_size",
-                        self._config.group_size if quantized else -1,
+                    self._normalize_group_size(
+                        cfg.get(
+                            "group_size",
+                            self._config.group_size if quantized else -1,
+                        )
                     ),
                     cfg.get("sym", self._config.sym if quantized else True),
                 )
@@ -155,9 +140,11 @@ class INCConfigParser:
                                 "bits",
                                 self._config.weight_bits if quantized else 16,
                             ),
-                            cfg.get(
-                                "group_size",
-                                self._config.group_size if quantized else -1,
+                            self._normalize_group_size(
+                                cfg.get(
+                                    "group_size",
+                                    self._config.group_size if quantized else -1,
+                                )
                             ),
                             cfg.get("sym", self._config.sym if quantized else True),
                         )
@@ -225,3 +212,26 @@ class INCConfigParser:
                     )
 
         return get_config(layer_name, quantized)
+
+    @staticmethod
+    def _normalize_group_size(
+        group_size: int | list[int] | tuple[int, int],
+    ) -> int | tuple[int, int]:
+        """Normalize INC group_size into either an int or a 2-D int tuple."""
+        if isinstance(group_size, (list, tuple)):
+            if len(group_size) != 2 or not all(
+                isinstance(value, int) for value in group_size
+            ):
+                raise ValueError(
+                    "INC block-wise FP8 requires group_size to be a 2-D "
+                    f"integer sequence, but found {group_size!r}."
+                )
+            return (group_size[0], group_size[1])
+
+        if not isinstance(group_size, int):
+            raise ValueError(
+                "INC group_size must be an int or a 2-D integer sequence, "
+                f"but found {type(group_size).__name__}."
+            )
+
+        return group_size

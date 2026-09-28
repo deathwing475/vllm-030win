@@ -25,7 +25,10 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
-from vllm.model_executor.models import supports_multimodal
+from vllm.model_executor.models import (
+    supports_multimodal,
+    supports_multimodal_embeddings,
+)
 from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.model_executor.models.laguna_dflash import DFlashLagunaForCausalLM
@@ -354,6 +357,10 @@ class SpecDecodeBaseProposer:
         dflash_config = getattr(model_hf_config, "dflash_config", None)
         if dflash_config and "mask_token_id" in dflash_config:
             self.parallel_drafting_token_id = dflash_config["mask_token_id"]
+        elif getattr(model_hf_config, "mask_token_id", None) is not None:
+            self.parallel_drafting_token_id = model_hf_config.mask_token_id
+        elif hasattr(model_hf_config, "dspark_noise_token_id"):
+            self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
         elif hasattr(model_hf_config, "pard_token"):
             self.parallel_drafting_token_id = model_hf_config.pard_token
         elif hasattr(model_hf_config, "ptd_token_id"):
@@ -361,8 +368,9 @@ class SpecDecodeBaseProposer:
         else:
             raise ValueError(
                 "For parallel drafting, the draft model config must have "
-                "`pard_token`, `ptd_token_id`, or "
-                "`dflash_config.mask_token_id` specified in its config.json."
+                "`dflash_config.mask_token_id`, `mask_token_id`, "
+                "`dspark_noise_token_id`, `pard_token`, or `ptd_token_id` "
+                "specified in its config.json."
             )
 
         if self.pass_hidden_states_to_model:
@@ -1010,7 +1018,11 @@ class SpecDecodeBaseProposer:
             # feedback into the next draft step.
             architectures = self.draft_model_config.hf_config.architectures or []
             return bool(
-                {"DeepSeekMTPModel", "KimiK3MTPModel"}.intersection(architectures)
+                {
+                    "DeepSeekMTPModel",
+                    "DeepseekV32MTPModel",
+                    "KimiK3MTPModel",
+                }.intersection(architectures)
             )
         return self.method not in ("mtp", "draft_model", "dflash")
 
@@ -1309,30 +1321,6 @@ class SpecDecodeBaseProposer:
                 ),
             )
 
-        # A --spec-model directory may ship its own quantization_config
-        # (quantized MTP weights with an adjusted ignore/group layout).
-        # Rebuild quant_config from the draft model config so MTP layer
-        # creation matches the draft checkpoint format. The baseline case
-        # (draft dir == target dir) keeps the inherited config untouched.
-        draft_mc = spec_cfg.draft_model_config
-        if (
-            draft_mc is not None
-            and spec_cfg.target_model_config is not None
-            and draft_mc.model != spec_cfg.target_model_config.model
-            and draft_mc.quantization
-        ):
-            from vllm.config.vllm import VllmConfig
-
-            # Use VllmConfig._get_quantization_config (not the bare
-            # get_quant_config) so maybe_update_config runs — it applies
-            # kernel/layout decisions the torch.compile path depends on.
-            draft_qc = VllmConfig._get_quantization_config(
-                draft_mc,
-                spec_cfg.draft_load_config or base.load_config,
-            )
-            if draft_qc is not None:
-                base = replace(base, quant_config=draft_qc)
-
         return base
 
     def _get_model(self) -> nn.Module:
@@ -1361,22 +1349,6 @@ class SpecDecodeBaseProposer:
 
         self.model = self._get_model()
 
-        # Share embed_tokens / lm_head from target model when the draft
-        # model's checkpoint stores them in a quantized format that the
-        # unquantized MTP embedding cannot load directly (e.g. compressed-
-        # tensors GSQ with weight_packed/weight_scale/weight_shape).
-        if (
-            hasattr(self.model, "model")
-            and hasattr(self.model.model, "embed_tokens")
-            and hasattr(target_model, "model")
-        ):
-            tgt_emb = getattr(target_model.model, "embed_tokens", None) or \
-                      getattr(getattr(target_model.model, "language_model", None), "embed_tokens", None)
-            if tgt_emb is not None:
-                self.model.model.embed_tokens = tgt_emb
-            if hasattr(target_model, "lm_head") and hasattr(self.model, "lm_head"):
-                self.model.lm_head = target_model.lm_head
-
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
@@ -1389,18 +1361,16 @@ class SpecDecodeBaseProposer:
             if all_attn_layers[name].get_kv_cache_spec(self.vllm_config) is not None
         }
 
-        if self.supports_mm_inputs:
-            # Even if the target model is multimodal, we can also use
-            # text-only draft models
-            try:
-                dummy_input_ids = torch.tensor([[1]], device=self.input_ids.device)
-                self.model.embed_input_ids(dummy_input_ids, multimodal_embeddings=None)
-            except (NotImplementedError, AttributeError, TypeError):
-                logger.warning(
-                    "Draft model does not support multimodal inputs, "
-                    "falling back to text-only mode"
-                )
-                self.supports_mm_inputs = False
+        # Even if the target model is multimodal, we can also use
+        # text-only draft models
+        if self.supports_mm_inputs and not supports_multimodal_embeddings(self.model):
+            logger.warning_once(
+                "Draft model %s does not support external multimodal embeddings. "
+                "Embeddings from the target model will not be passed to the "
+                "drafter; using text-only draft inputs instead.",
+                type(self.model).__name__,
+            )
+            self.supports_mm_inputs = False
 
         if supports_multimodal(target_model):
             # handle multimodality
@@ -1432,6 +1402,10 @@ class SpecDecodeBaseProposer:
             ):
                 self.model.config.image_token_index = (
                     target_model.config.media_placeholder_token_id
+                )
+            elif self.get_model_name(target_model) == "NemotronH_Nano_VL_V2":
+                self.model.config.image_token_index = (
+                    target_model.config.img_context_token_id
                 )
             else:
                 self.model.config.image_token_index = (

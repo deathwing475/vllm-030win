@@ -689,13 +689,15 @@ class Platform:
 
         def per_token_page_bytes(dtype: "torch.dtype", cache_dtype: str) -> int:
             """Bytes one token occupies in one layer, for the given dtype."""
-            return FullAttentionSpec(
+            spec = FullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=dtype,
                 kv_quant_mode=get_kv_quant_mode(cache_dtype),
-            ).page_size_bytes
+            )
+            # The backend owns its packing
+            return backend_cls.customize_spec(spec).page_size_bytes
 
         primary_dtype = (
             STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
@@ -811,23 +813,18 @@ class Platform:
             # when all attention layers are TQ. With mixed skip+TQ the skip
             # layers still use the standard layout — take max so mamba
             # padding covers the largest actual page.
-            from vllm.model_executor.layers.quantization.turboquant.config import (
-                TurboQuantConfig,
+            from vllm.v1.attention.backends.turboquant_attn import (
+                TurboQuantAttentionBackend,
             )
-            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
 
-            tq_cfg = TurboQuantConfig.from_cache_dtype(
-                cache_config.cache_dtype, model_config.get_head_size()
-            )
-            tq_page = TQFullAttentionSpec(
+            tq_spec = FullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
-                head_size_v=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
-                tq_slot_size=tq_cfg.slot_size_aligned,
-            ).page_size_bytes
+            )
+            tq_page = TurboQuantAttentionBackend.customize_spec(tq_spec).page_size_bytes
             if cache_config.kv_cache_dtype_skip_layers:
                 skip_page = FullAttentionSpec(
                     block_size=1,
@@ -842,12 +839,15 @@ class Platform:
             else:
                 attn_page_size_1_token = tq_page
         else:
-            attn_page_size_1_token = FullAttentionSpec(
+            attn_spec = FullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+            )
+            attn_page_size_1_token = backend_cls.customize_spec(
+                attn_spec
             ).page_size_bytes
 
         # Compute mamba page size
@@ -855,11 +855,18 @@ class Platform:
             model_config.architecture,
             model_config=model_config,
         )
-        mamba_page_size = MambaSpec(
-            shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
-            dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
-            block_size=-1,
-        ).page_size_bytes
+        # Qwen4Exp has multiple Mamba state layouts with different sizes.
+        if hasattr(model_cls, "get_mamba_specs_from_config"):
+            mamba_page_size = max(
+                spec.page_size_bytes
+                for spec in model_cls.get_mamba_specs_from_config(vllm_config)
+            )
+        else:
+            mamba_page_size = MambaSpec(
+                shapes=model_cls.get_mamba_state_shape_from_config(vllm_config),
+                dtypes=model_cls.get_mamba_state_dtype_from_config(vllm_config),
+                block_size=-1,
+            ).page_size_bytes
 
         if mamba_page_size == 0:
             return
@@ -907,30 +914,19 @@ class Platform:
             )
 
         if cache_config.block_size < attn_block_size:
-            if os.getenv("VLLM_EXPERIMENTAL_ALLOW_SMALL_HYBRID_BLOCK", "0") == "1":
-                logger.warning(
-                    "Experimental small hybrid block enabled: keeping attention block "
-                    "%d instead of mamba-aligned %d; GDN cache correctness is unverified.",
-                    cache_config.block_size,
-                    attn_block_size,
-                )
-            else:
-                cache_config.block_size = attn_block_size
-                logger.info(
-                    "Setting attention block size to %d tokens "
-                    "to ensure that attention page size is >= mamba page size.",
-                    attn_block_size,
-                )
+            cache_config.block_size = attn_block_size
+            logger.info(
+                "Setting attention block size to %d tokens "
+                "to ensure that attention page size is >= mamba page size.",
+                attn_block_size,
+            )
 
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
 
-        # Pad mamba page size to exactly match attention page size. The
-        # experimental small-block path intentionally violates this invariant;
-        # it is only for short smoke tests and is not a production GDN layout.
+        # Pad mamba page size to exactly match attention page size
         attn_page_size = cache_config.block_size * attn_page_size_1_token
-        if os.getenv("VLLM_EXPERIMENTAL_ALLOW_SMALL_HYBRID_BLOCK", "0") != "1":
-            assert attn_page_size >= mamba_page_size
+        assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
             return
@@ -1210,6 +1206,23 @@ class Platform:
         Returns if the graph mode is supported by the current platform.
         """
         return False
+
+    @classmethod
+    def check_runner_kv_caches_multi_layer(cls) -> None:
+        """
+        Check whether the platform's ModelRunner can handle multiple attention
+        layers that share the same layer index (e.g. cross attention and self
+        attention in the same decoder block of an encoder-decoder model such as
+        BART).
+
+        Platforms that have verified that their ``runner_kv_caches`` is not
+        impacted by this case should override this to a no-op. Otherwise the
+        default implementation raises ``NotImplementedError``.
+        """
+        raise NotImplementedError(
+            "Multiple attention layers with the same layer index are not "
+            "supported on the current platform."
+        )
 
     @classmethod
     def support_deep_gemm(cls) -> bool:

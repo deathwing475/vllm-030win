@@ -536,13 +536,13 @@ class MessageQueue:
                 connect_ip = get_ip()
             self.remote_socket = context.socket(XPUB)
             self.remote_socket.setsockopt(XPUB_VERBOSE, True)
-            remote_subscribe_port = get_open_port()
             if is_valid_ipv6_address(connect_ip):
                 self.remote_socket.setsockopt(IPV6, 1)
                 remote_addr_ipv6 = True
                 connect_ip = f"[{connect_ip}]"
-            socket_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"
-            self.remote_socket.bind(socket_addr)
+            self.remote_socket.bind(f"tcp://{connect_ip}:0")
+            last_endpoint = self.remote_socket.getsockopt(zmq.LAST_ENDPOINT)
+            remote_subscribe_port = last_endpoint.decode().rsplit(":", 1)[1]
             remote_subscribe_addr = f"tcp://{connect_ip}:{remote_subscribe_port}"
         else:
             remote_subscribe_addr = None
