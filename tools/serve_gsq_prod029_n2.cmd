@@ -3,8 +3,8 @@ rem 2026-09-28 step 036 (KV regroup, PRODUCTION): VLLM_KV_GROUP_SIZE=8
 rem forces the KV layers-per-group from the upstream 5 (pinned by the
 rem draft's 5 sliding-window layers) to 8. Measured on this stack: the
 rem 3.4e9 pool goes 114,974 -> 136,190 tokens (+18.5%), decode step
-rem 18.73/18.74 -> 18.30/18.31/18.32 ms, prefill unchanged, needle green
-rem at 8k/32k/64k/100k (max-model-len 110000) and 8k/64k/130k (140000).
+rem 18.73/18.74 -> 18.30/18.31/18.32 ms, prefill unchanged; needle was green
+rem at 8k/32k/64k/100k (max-model-len 110000, step-036 era) and 8k/64k/130k.
 rem max-model-len: 110000 -> 130000 -> 140000 (step 039) -> 144432 (step 040).
 rem The G=8 hard ceiling is 144,432: the engine permanently holds back one
 rem null block before the admission check, so the real constraint is
@@ -16,6 +16,10 @@ rem L=144,432: steady 118-121 at fb 15,538 MiB vs 96-99 at 15,254 MiB;
 rem pin placement byte-identical across 15 boots). Multi-depth needle at
 rem 144,432 matches 140,000 depth for depth (8k 120.2/120.4, 64k 121.0/116.4,
 rem 115k 113.0/108.0, 135k 102.3/103.2). Engine reports 145,551 tokens.
+rem Step 041 re-checked against the user's two gates (decode >=85; >=70 when
+rem using 90% of max-model-len) and confirmed 144,432 is the largest value
+rem that satisfies both: G=1@147,264 breaks 85 on a slow boot, N=1@154,880
+rem breaks 70 at its 86.7% depth, N=0@164,256 breaks both.
 rem CAVEAT: at 144,432 a full-length request claims all 129 usable blocks,
 rem so a max-length request leaves no headroom for prefix-cache growth.
 rem Pool stays the manual 3,400,000,000 B: KV tensor size and spill are
@@ -35,8 +39,9 @@ rem drill (2026-09-26) and was root-caused the same day to a cuMemcpyBatchAsync
 rem driver defect on non-default streams; fixed in base d7cdb91 by routing
 rem swap_blocks_batch to per-copy cuMemcpyAsync on Windows. Verified: 8k x2
 rem needle green with repeat-request TTFT 4.7s -> 1.5s (prefix hit).
-rem KV pool stays MANUAL (iron rule): 3,400,000,000 B (121,058 tokens with draft,
-rem engine self-report on the 0.29 stack).
+rem KV pool stays MANUAL (iron rule): 3,400,000,000 B -> 145,551 tokens with
+rem draft at G=8 / max-model-len 144,432 (the 121,058 figure was the pre-036
+rem mamba-none accounting).
 rem
 rem Delta vs the frozen 0.27 recipe (all intentional):
 rem   1. venv G:\qwen3.8model\vllm-win029 (0.29 base + batch-1..5 + regression
