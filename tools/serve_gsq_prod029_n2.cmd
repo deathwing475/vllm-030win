@@ -5,7 +5,12 @@ rem draft's 5 sliding-window layers) to 8. Measured on this stack: the
 rem 3.4e9 pool goes 114,974 -> 136,190 tokens (+18.5%), decode step
 rem 18.73/18.74 -> 18.30/18.31/18.32 ms, prefill unchanged, needle green
 rem at 8k/32k/64k/100k (max-model-len 110000) and 8k/64k/130k (140000).
-rem max-model-len: 110000 -> 130000 (capacity at 130000 is 142,016).
+rem max-model-len: 110000 -> 130000 -> 140000 (step 039). The G=8 hard
+rem ceiling is 144,432 (blocks_per_req = 2*cdiv(L,2832) + 27 <= 130), but
+rem 144,432 measures ~21% slower decode (2 boots: steady 95-105 vs
+rem 119-128) and 141,600 already costs ~5%, so 140,000 is the largest
+rem value whose performance matches 130,000 (2 boots: steady 118-128).
+rem Engine reports 143,307 tokens (1.02x) vs 142,016 at 130000.
 rem Pool stays the manual 3,400,000,000 B: KV tensor size and spill are
 rem unchanged; only grouping and the logical ceiling move.
 rem ROLLBACK = delete the VLLM_KV_GROUP_SIZE line, restore 110000, drop
@@ -99,7 +104,7 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 29550 -ErrorActi
   --kv-cache-dtype nvfp4 ^
   --kv-cache-memory-bytes 3400000000 ^
   --gpu-memory-utilization 0.922 ^
-  --max-model-len 130000 ^
+  --max-model-len 140000 ^
   --max-num-seqs 1 --max-num-batched-tokens 1024 ^
   --enable-prefix-caching ^
   --enable-auto-tool-choice ^

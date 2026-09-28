@@ -23,7 +23,7 @@ P = r"G:\qwen3.8model\vllm-030win-git\tools\serve_gsq_prod029_n2.cmd"
 ANCHOR_PIN = 'set "VLLM_DBG_PIN=1"'
 LINE_KV = '\r\nset "VLLM_KV_GROUP_SIZE=8"'
 OLD_LEN = "--max-model-len 110000"
-NEW_LEN = "--max-model-len 130000"
+NEW_LEN = "--max-model-len 140000"  # step 039: 130000 -> 140000 (perf-safe)
 
 MARK = "rem 2026-09-28 step 036"
 HEAD_ANCHOR = "@echo off\r\n"
@@ -34,7 +34,12 @@ HEAD_NOTE = (
     "rem 3.4e9 pool goes 114,974 -> 136,190 tokens (+18.5%), decode step\r\n"
     "rem 18.73/18.74 -> 18.30/18.31/18.32 ms, prefill unchanged, needle green\r\n"
     "rem at 8k/32k/64k/100k (max-model-len 110000) and 8k/64k/130k (140000).\r\n"
-    "rem max-model-len: 110000 -> 130000 (capacity at 130000 is 142,016).\r\n"
+    "rem max-model-len: 110000 -> 130000 -> 140000 (step 039). The G=8 hard\r\n"
+    "rem ceiling is 144,432 (blocks_per_req = 2*cdiv(L,2832) + 27 <= 130), but\r\n"
+    "rem 144,432 measures ~21% slower decode (2 boots: steady 95-105 vs\r\n"
+    "rem 119-128) and 141,600 already costs ~5%, so 140,000 is the largest\r\n"
+    "rem value whose performance matches 130,000 (2 boots: steady 118-128).\r\n"
+    "rem Engine reports 143,307 tokens (1.02x) vs 142,016 at 130000.\r\n"
     "rem Pool stays the manual 3,400,000,000 B: KV tensor size and spill are\r\n"
     "rem unchanged; only grouping and the logical ceiling move.\r\n"
     "rem ROLLBACK = delete the VLLM_KV_GROUP_SIZE line, restore 110000, drop\r\n"
