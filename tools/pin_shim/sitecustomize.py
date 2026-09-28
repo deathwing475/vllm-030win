@@ -276,6 +276,23 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
                 # 专用显存），搬它们纯属浪费且可能打断共享——默认跳过。
                 _skip_shared = os.environ.get("VLLM_DBG_PIN_SKIP_SHARED", "1") == "1"
                 _SHARED = ("model.embed_tokens.", "lm_head.")
+                # 步骤 044：PIN 前置清理（gc+empty_cache 组合，同 vLLM
+                # #57440 的修法）。慢 boot 实测：载入完成后池内滞留 ~5.1 GiB
+                # 载入瞬态、驱动 free=0（WDDM 过承诺压力窗）；若不预清，
+                # pass2 前那次 empty_cache 还回池后 free 仍为 0（提交预算被
+                # 吃光）→ pass2 的 545 MiB 新块全部落共享段 → 深低带。
+                # gc.collect() 先斩断瞬态的循环引用，empty_cache 再把池还
+                # 给 WDDM，让 pass1/pass2 全程有余量。
+                try:
+                    import gc
+                    gc.collect()
+                except Exception:
+                    pass
+                try:
+                    torch.cuda.empty_cache()
+                    log("PIN_PRE_EMPTY_CACHE", mem=_mem())
+                except Exception as _e:
+                    log("PIN_PRE_EMPTY_CACHE_FAIL", err=repr(_e)[:120])
                 for _p in range(_passes):
                     n, moved, bytes_, skipped = 0, 0, 0, 0
                     for name, p in r.named_parameters():
@@ -309,6 +326,14 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
                             torch.cuda.empty_cache()
                             log("PIN_EMPTY_CACHE", p=("pass%d" % (_p + 1)),
                                 mem=_mem())
+                            # 步骤 044：free 门——empty_cache 后驱动 free
+                            # 若仍不足一块草稿权重的量，说明 WDDM 提交预算
+                            # 仍被吃光（pass2 必落共享段），记警告供 A/B 判读。
+                            _free, _total = torch.cuda.mem_get_info()
+                            if _free / 2**20 < 600:
+                                log("PIN_LOW_FREE_WARN",
+                                    p=("pass%d" % (_p + 1)),
+                                    free_mib="%.0f" % (_free / 2**20))
                         except Exception as _e:
                             log("PIN_EMPTY_CACHE_FAIL", err=repr(_e)[:120])
             except Exception as e:
