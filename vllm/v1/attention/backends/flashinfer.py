@@ -1438,7 +1438,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # When all attention (both prefill and decode) uses TRTLLM,
         # seq_lens_cpu is not needed since TRTLLM paths use GPU tensors
         # (block_tables, seq_lens) directly.
-        needs_seq_lens_cpu = self.use_dcp or use_cascade or not all_uses_trtllm
+        # vllm-030win patch (step 032): gate on the paths that actually
+        # consume seq_lens_np/num_blocks_np (native paged KV indices,
+        # cascade, DCP) instead of on `all_uses_trtllm`, which is also
+        # False for non-causal batches. A non-causal batch that decodes
+        # through the dedicated XQA/TRTLLM API never builds paged KV
+        # indices, so the old condition forced a per-step D2H sync
+        # (~16 ms, measured on the DFlash2 draft's non-causal layers)
+        # whose result was discarded.
+        needs_native_paged_prefill = (num_prefills > 0
+                                      and not prefill_use_trtllm)
+        needs_native_paged_decode = (
+            num_decodes > 0 and not decode_with_flashinfer_trtllm_api
+        )
+        needs_seq_lens_cpu = (
+            self.use_dcp
+            or use_cascade
+            or needs_native_paged_prefill
+            or needs_native_paged_decode
+        )
         if needs_seq_lens_cpu:
             with gpu_sync_allowed():
                 seq_lens_cpu = common_attn_metadata.seq_lens_cpu
@@ -1480,10 +1498,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # Compute paged_kv_indices if necessary
         # paged_kv_indices is only needed for FlashInfer native paths;
         # XQA/trtllm-gen paths use block_tables directly on GPU.
-        needs_native_paged_prefill = num_prefills > 0 and not prefill_use_trtllm
-        needs_native_paged_decode = (
-            num_decodes > 0 and not decode_with_flashinfer_trtllm_api
-        )
         needs_paged_kv_indices = (
             use_cascade or needs_native_paged_prefill or needs_native_paged_decode
         )
