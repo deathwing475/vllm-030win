@@ -3,7 +3,7 @@
 
 改动三处：
   1. 在 pin_shim 的 `set "VLLM_DBG_PIN=1"` 之后插入 `set "VLLM_KV_GROUP_SIZE=8"`；
-  2. `--max-model-len 110000` → `--max-model-len 130000`；
+  2. `--max-model-len 110000` → `--max-model-len 144432`（036 落 130000、039 落 140000、040 落 144432）；
   3. 文件头插入一段 036 说明注释（含回退方法）。
 
 依据（步骤 036 实测）：
