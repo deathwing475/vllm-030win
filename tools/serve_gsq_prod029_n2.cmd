@@ -1,4 +1,27 @@
 @echo off
+rem 2026-09-28 step 046 (mamba ssm bf16, PRODUCTION): adds
+rem --mamba-ssm-cache-dtype bfloat16 and raises max-model-len 144432 ->
+rem 163072. The GDN ssm state was fp32 (the model config.json declares
+rem mamba_ssm_dtype=float32; step 045 corrected the old "already bf16"
+rem note - only conv was bf16). bfloat16 is in the fused-kernel whitelist
+rem FUSED_GDN_STATE_DTYPES (fp16 is NOT and would fall off the fused path).
+rem Physics: mamba pool 594.75 -> 321.65 MiB (-273.1), which re-derives the
+rem hybrid alignment: attn block 2832 -> 1456, unified page 1,677,312 B,
+rem bytes_per_block(G=8) 26,099,712 -> 13,418,496, num_blocks 130 -> 253.
+rem New G=8 ceiling: 2*cdiv(L,1456) + 28 <= 252 => L = 163,072; the engine
+rem reports 163,719 tokens (+12.5% vs 145,551). Verified in step 045: A/B 6
+rem boots same band (bf16 120.6-125.5 vs fp32 118.6-127.2), needle 18/18,
+rem same-round PPL max|delta| 1.25e-3 (inside the boot-to-boot drift band),
+rem 20-request soak healthy. WARNING (first-compile deep slump, 4/4): after
+rem an L/dtype change the FIRST boot re-runs AOT compile (~145s longer) and
+rem steady reads ~17 tok/s; the second boot (cache hit) recovers to 116-125.
+rem Production switchover must double-boot: let boot #1 finish (it builds
+rem the compile cache), kill it, boot #2 is the production instance;
+rem tools/prod_watchdog.ps1 automates exactly this and its 8k probe
+rem threshold 105 stays valid (8k band 116-125).
+rem ROLLBACK = python tools\apply_prod_ssm_bf16_step046.py revert (deletes
+rem this note + the ssm line, restores 144432). Chain order: revert 046
+rem BEFORE tools\apply_prod_kvgroup_step036.py revert.
 rem 2026-09-28 step 036 (KV regroup, PRODUCTION): VLLM_KV_GROUP_SIZE=8
 rem forces the KV layers-per-group from the upstream 5 (pinned by the
 rem draft's 5 sliding-window layers) to 8. Measured on this stack: the
@@ -116,13 +139,14 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 29550 -ErrorActi
   --kv-cache-dtype nvfp4 ^
   --kv-cache-memory-bytes 3400000000 ^
   --gpu-memory-utilization 0.922 ^
-  --max-model-len 144432 ^
+  --max-model-len 163072 ^
   --max-num-seqs 1 --max-num-batched-tokens 1024 ^
   --enable-prefix-caching ^
   --enable-auto-tool-choice ^
   --tool-call-parser qwen3_coder ^
   --reasoning-parser qwen3 ^
   --mamba-cache-mode align ^
+  --mamba-ssm-cache-dtype bfloat16 ^
   --kv-offloading-backend native ^
   --kv-offloading-size 8 ^
   --cudagraph-capture-sizes 3 ^
