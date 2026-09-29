@@ -47,6 +47,23 @@ UNIT_JSONS = [
 UNIT_TOKENS = 4070
 SLIDING_WINDOW = 163072
 
+# The "focused" query: short enough that the trailing query span is almost all
+# question, so a low rank cannot be blamed on the query being diluted by
+# document text.
+FOCUSED_QUESTION = (
+    "\n\nQuestion: What is the secret access code? "
+    "Answer with the number only.\nAnswer:"
+)
+# A question with nothing to do with the haystack. Step 061 measured the same
+# high-scoring pages (1, 2, 5, 8, 11) for three different nonces but always with
+# the *same* question, which cannot separate "those pages are intrinsically
+# favoured" from "that question matches those pages". Swapping the question is
+# what tells the two apart.
+OFF_TOPIC_QUESTION = (
+    "\n\nQuestion: Explain how a hash table resolves collisions, and what "
+    "load factor means.\nAnswer:"
+)
+
 _TOKENIZER = None
 
 
@@ -60,7 +77,8 @@ def tokenizer():
 
 
 def build(target_tokens: int, depth: float, nonce: str, with_needle: bool,
-          question_style: str = "summary", question_repeat: int = 1):
+          question_style: str = "summary", question_repeat: int = 1,
+          question_text: str | None = None):
     """Haystack of spec-eval units; returns (prompt, needle_char_offset).
 
     ``question_style`` decides what the query span actually contains. The
@@ -69,7 +87,9 @@ def build(target_tokens: int, depth: float, nonce: str, with_needle: bool,
     generic "write a detailed summary" instruction - the question itself is
     ~8% of it. The focused style repeats a short question so the query span is
     dominated by the question, which separates "the query was too diluted"
-    from "the index has no signal".
+    from "the index has no signal". ``question_text`` replaces that short
+    question, which is how the same haystack gets scored under a different
+    query.
     """
     units = [
         json.load(open(path, encoding="utf-8"))["messages"][0]["content"]
@@ -85,10 +105,7 @@ def build(target_tokens: int, depth: float, nonce: str, with_needle: bool,
             needle_char = len("".join(parts))
             parts.append(NEEDLE)
     if question_style == "focused":
-        parts.append(
-            "\n\nQuestion: What is the secret access code? "
-            "Answer with the number only.\nAnswer:" * max(1, question_repeat)
-        )
+        parts.append((question_text or FOCUSED_QUESTION) * max(1, question_repeat))
     else:
         parts.append(QUESTION)
     return "".join(parts), needle_char
@@ -170,6 +187,7 @@ def run(args, with_needle: bool) -> dict:
         with_needle,
         args.question,
         args.question_repeat,
+        args.question_text,
     )
     tokenized = len(tokenizer().encode(prompt, add_special_tokens=False))
     started = time.time()
@@ -178,6 +196,7 @@ def run(args, with_needle: bool) -> dict:
         "with_needle": with_needle,
         "needle_depth": args.needle_depth,
         "question_style": args.question,
+        "question_text": args.question_text,
         "question_repeat": args.question_repeat,
         "nonce": args.nonce,
         "tokenized_prompt_tokens": tokenized,
@@ -276,11 +295,29 @@ def main() -> None:
     )
     ap.add_argument("--question-repeat", type=int, default=8)
     ap.add_argument(
+        "--question-text",
+        default=None,
+        help="replace the focused question with this text (same haystack, "
+        "different query: this is what separates a per-page bias from a "
+        "question/content match)",
+    )
+    ap.add_argument(
+        "--question-preset",
+        choices=["code", "off-topic"],
+        default=None,
+        help="named alternative to --question-text",
+    )
+    ap.add_argument(
         "--dump-dir",
         default=os.environ.get("VLLM_KVMEM_DUMP", ""),
     )
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
+    if args.question_preset and not args.question_text:
+        args.question_text = {
+            "code": FOCUSED_QUESTION,
+            "off-topic": OFF_TOPIC_QUESTION,
+        }[args.question_preset]
     if not args.nonce:
         import uuid
 

@@ -89,7 +89,7 @@ set "VLLM_KVMEM_WORKSPACE=1"
 set "VLLM_KVMEM_WORKSPACE_MB=3072"
 set "VLLM_KVMEM_SELFTEST=1"
 set "VLLM_KVMEM_RAWK=1"
-set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k3"
+set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k3d"
 rem K3 measurement knobs. The index stores at the finest granularity and the
 rem coarser ones are summed from it, so one 200K ingest reports every variant:
 rem granularity 32/64/128 (design risk R1: the paper uses 32-token blocks, the
@@ -98,6 +98,11 @@ rem showed the raw dot product's ranking is carried by per-page magnitude).
 set "VLLM_KVMEM_INDEX_SUBBLOCK=32"
 set "VLLM_KVMEM_SCORE_GRANULARITIES=32,64,128"
 set "VLLM_KVMEM_SCORE_MODES=dot,cosine"
+rem Step 062 diagnostic: also write the vectors behind the ranking to a sidecar
+rem .npz beside each report (page mean-K, the per-head-group query, per-sub-block
+rem and per-page logits). One 200K ingest costs ~4.5 minutes, so the arrays are
+rem dumped once and re-scored offline rather than one engine run per hypothesis.
+set "VLLM_KVMEM_DUMP_KBAR=1"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "LIB=C:\PROGRA~1\NVIDIA~2\CUDA\v13.3\lib\x64;%LIB%"
 del /q "G:\qwen3.8model\_tmp_prod029\vllm_offload_*.mmap" 2>nul

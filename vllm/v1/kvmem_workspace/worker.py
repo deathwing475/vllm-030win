@@ -287,16 +287,23 @@ class KVMemWorkspaceWorker:
 
     def _write_report(self, report: dict) -> None:
         directory = config.dump_dir()
+        diag = report.pop("_diag", None)
         if not directory:
             return
         try:
             os.makedirs(directory, exist_ok=True)
-            path = os.path.join(
-                directory, f"kvmem_retrieval_{len(self._retrieval_reports):03d}.json"
-            )
+            stem = f"kvmem_retrieval_{len(self._retrieval_reports):03d}"
+            path = os.path.join(directory, f"{stem}.json")
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(report, handle)
             report["path"] = path
+            if diag is not None:
+                # The vectors behind the ranking, so the 200K ingest that
+                # produced them can be re-scored offline under another
+                # reduction, mode or centring (config.dump_kbar).
+                diag_path = os.path.join(directory, f"{stem}_kbar.npz")
+                np.savez(diag_path, **diag)
+                report["diag_path"] = diag_path
         except OSError as exc:
             logger.warning(
                 "vllm-030win KVMem retrieval: could not write %s (%s)",

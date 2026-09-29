@@ -67,6 +67,21 @@ def dump_dir() -> str | None:
     return raw or None
 
 
+def dump_kbar() -> bool:
+    """Also dump the vectors behind the ranking, as a sidecar ``.npz``.
+
+    Step 061 left one open question: with no needle in the prompt, pages 1, 2,
+    5, 8 and 11 already score 22.7-26.2, so retrieval slots are spent before the
+    needle is considered. Page-mean norms are nearly constant, so the answer is
+    in the vectors, not in their magnitude - and a 200K prefill costs ~4.5
+    minutes, which makes "one ingest, unlimited offline analysis" worth a
+    sidecar. The JSON report stays the policy-free artifact; the arrays land
+    next to it so the ranking can be re-derived under another reduction, mode or
+    centring without re-running the engine.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_DUMP_KBAR", "0")))
+
+
 def rawk_enabled() -> bool:
     """Capture the pre-RoPE q/k of the full-attention layers (K3 item 1).
 

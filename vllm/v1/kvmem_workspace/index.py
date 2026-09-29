@@ -197,17 +197,39 @@ class KVMemMeanKIndex:
         eligible = self._eligible(num_pages, block_size, sink_tokens, recent_tokens)
 
         variants: dict[str, dict] = {}
+        diag = (
+            self._new_diag(len(layers), num_pages, block_size, span)
+            if config.dump_kbar()
+            else None
+        )
         for granularity in self.granularities:
             for mode in self.modes:
+                # The diagnostic wants the vectors behind the finest dot-product
+                # ranking, and that is exactly one of the variants being
+                # computed anyway, so it rides along instead of being recomputed.
+                diag_out = (
+                    diag
+                    if diag is not None
+                    and granularity == self.subblock
+                    and mode == self.modes[0]
+                    else None
+                )
                 logits, norms = self._page_logits(
-                    state, layers, q_by_layer, num_pages, block_size, granularity, mode
+                    state,
+                    layers,
+                    q_by_layer,
+                    num_pages,
+                    block_size,
+                    granularity,
+                    mode,
+                    diag_out,
                 )
                 variants[f"{mode}@{granularity}"] = self._summarize(
                     logits, norms, eligible, num_pages, topn
                 )
 
         primary = variants[f"{self.modes[0]}@{self.granularities[0]}"]
-        return {
+        report = {
             "trajectory": trajectory.hex()[:12],
             "num_tokens": num_tokens,
             "block_size": block_size,
@@ -225,6 +247,72 @@ class KVMemMeanKIndex:
             "variants": variants,
             **primary,
         }
+        if diag is not None:
+            report["_diag"] = self._finish_diag(diag, layers, span)
+        return report
+
+    def _new_diag(
+        self, num_layers: int, num_pages: int, block_size: int, span: int
+    ) -> dict:
+        """Buffers for the sidecar ``.npz`` (see :func:`config.dump_kbar`)."""
+        sub_keep = -(-(num_pages * block_size) // self.subblock)
+        return {
+            "layers": np.zeros(num_layers, dtype=np.int32),
+            "num_layers": num_layers,
+            "block_size": block_size,
+            "subblock_logits": np.full(
+                (num_layers, sub_keep), np.nan, dtype=np.float32
+            ),
+            "page_mean_logits": np.full(
+                (num_layers, num_pages), np.nan, dtype=np.float32
+            ),
+            "q_group_mean": np.full(
+                (span, num_layers, self.num_kv_heads, self.head_dim),
+                np.nan,
+                dtype=np.float16,
+            ),
+            "page_mean_k": np.full(
+                (num_pages, num_layers, self.num_kv_heads, self.head_dim),
+                np.nan,
+                dtype=np.float16,
+            ),
+            # Sub-block resolution too: the ranking the engine uses takes a max
+            # over a page's sub-blocks, and a needle is 15 tokens in 1424, so it
+            # only shows up at that resolution (page means dilute it by 100x).
+            # Without this the sidecar could not replay the engine's own
+            # reduction, and a de-biasing transform could not be judged on
+            # whether it keeps the needle.
+            "subblock_mean_k": np.full(
+                (sub_keep, num_layers, self.num_kv_heads, self.head_dim),
+                np.nan,
+                dtype=np.float16,
+            ),
+            "subblock_counts": np.zeros(sub_keep, dtype=np.int32),
+            "page_offsets": None,
+            "filled": 0,
+        }
+
+    @staticmethod
+    def _finish_diag(diag: dict, layers: list[int], span: int) -> dict:
+        """Keep the populated buffers and label them, dropping the bookkeeping."""
+        diag["layers"][: diag["filled"]] = np.asarray(layers, dtype=np.int32)
+        out = {
+            key: diag[key]
+            for key in (
+                "layers",
+                "subblock_logits",
+                "page_mean_logits",
+                "q_group_mean",
+                "page_mean_k",
+                "subblock_mean_k",
+                "subblock_counts",
+                "page_offsets",
+            )
+            if diag[key] is not None
+        }
+        out["layers"] = out["layers"][: diag["filled"]]
+        out["query_span"] = np.int32(span)
+        return out
 
     def _page_logits(
         self,
@@ -235,14 +323,19 @@ class KVMemMeanKIndex:
         block_size: int,
         granularity: int,
         mode: str,
+        diag_out: dict | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Per-query-token page logits [span, num_pages] plus the mean-K norms.
 
         Coarser granularities are summed up from the stored ones, so the
         storage cost is paid once at the finest setting.
+
+        ``diag_out`` (see :func:`config.dump_kbar`) additionally receives the
+        vectors the ranking is made of, for the one variant it is passed to.
         """
         divisor = granularity // self.subblock
         keep = num_pages * block_size  # tokens the reported pages cover
+        sub_keep = -(-keep // granularity)  # ceil: sub-blocks inside them
         span = len(q_by_layer[layers[0]])
         logits = np.zeros((span, num_pages), dtype=np.float32)
         norms = np.zeros(num_pages, dtype=np.float32)
@@ -250,8 +343,26 @@ class KVMemMeanKIndex:
         # the raw dot product.
         scale = 1.0 if mode == "cosine" else 1.0 / np.sqrt(self.head_dim)
 
+        # The counts do not depend on the layer, so the page boundaries are
+        # resolved once. A sub-block belongs to the page holding its first
+        # token, which is what keeps the engine's page index equal to
+        # ``token_offset // block_size`` (see _page_reduce).
+        if diag_out is not None:
+            diag_counts = _reduce_counts(
+                state.counts[: sub_keep * divisor], divisor
+            )
+            page_of = (
+                np.arange(diag_counts.size, dtype=np.int64) * granularity
+            ) // block_size
+            page_starts = np.searchsorted(
+                page_of, np.arange(num_pages), side="left"
+            )
+            page_ends = np.searchsorted(
+                page_of, np.arange(1, num_pages + 1), side="left"
+            )
+            page_ends[-1] = np.searchsorted(page_of, num_pages, side="left")
+
         for layer_idx in layers:
-            sub_keep = -(-keep // granularity)  # ceil: sub-blocks inside them
             counts = _reduce_counts(state.counts[: sub_keep * divisor], divisor)
             valid = counts > 0
             if not valid.any():
@@ -279,6 +390,22 @@ class KVMemMeanKIndex:
                     np.linalg.norm(mean_k, axis=-1, keepdims=True) + 1e-6
                 )
                 q = q / (np.linalg.norm(q, axis=-1, keepdims=True) + 1e-6)
+            # The page-level mean K the diagnostic reports, resolved before the
+            # per-sub-block reduction so the sidecar carries both the reduction
+            # input (mean_k) and the page mean the ranking is compared against.
+            diag_row = diag_out["filled"] if diag_out is not None else -1
+            page_mean = (
+                self._layer_page_mean(sums, counts, page_starts, page_ends)
+                if diag_out is not None
+                else None
+            )
+            if page_mean is not None:
+                if mode == "cosine":
+                    page_mean = page_mean / (
+                        np.linalg.norm(page_mean, axis=-1, keepdims=True) + 1e-6
+                    )
+                diag_out["page_mean_k"][:, diag_row] = page_mean.astype(np.float16)
+                per_layer_page = np.zeros((span, page_mean.shape[0]), np.float32)
             # GQA: the `head_group` query heads of a group all read the same KV
             # head, so the mean over heads is the mean query dotted with that
             # head's mean K.
@@ -287,12 +414,81 @@ class KVMemMeanKIndex:
                 q_group = q[:, kv_head * self.head_group : (kv_head + 1) * self.head_group]
                 q_mean = q_group.astype(np.float32).mean(axis=1)  # [span, D]
                 per_layer += q_mean @ mean_k[:, kv_head, :].T  # [span, sub]
+                if page_mean is not None:
+                    per_layer_page += q_mean @ page_mean[:, kv_head, :].T
+                    diag_out["q_group_mean"][:, diag_row, kv_head, :] = (
+                        q_mean.astype(np.float16)
+                    )
             per_layer *= scale
             per_layer[:, ~valid] = -np.inf
             logits += _page_reduce(per_layer, granularity, block_size, num_pages)
 
+            if diag_out is not None:
+                self._fill_layer_diag(
+                    diag_out,
+                    diag_row,
+                    mean_k,
+                    counts,
+                    per_layer,
+                    valid,
+                    per_layer_page * scale,
+                )
+
         logits /= len(layers)
         return logits, norms
+
+    def _layer_page_mean(
+        self,
+        sums: np.ndarray,
+        counts: np.ndarray,
+        page_starts: np.ndarray,
+        page_ends: np.ndarray,
+    ) -> np.ndarray:
+        """Mean K per page, summed exactly from the per-sub-block sums.
+
+        A page mean must not be a mean of means: the sub-blocks hold different
+        token counts (a sub-block can straddle a page boundary, and the tail
+        sub-blocks are partial), so the sums and counts are accumulated
+        separately and divided once.
+        """
+        flat = sums.reshape(sums.shape[0], self.num_kv_heads * self.head_dim)
+        cum_sum = np.concatenate(
+            [
+                np.zeros((1, flat.shape[1]), dtype=np.float64),
+                np.cumsum(flat.astype(np.float64), axis=0),
+            ]
+        )
+        cum_cnt = np.concatenate([[0.0], np.cumsum(counts.astype(np.float64))])
+        page_sum = cum_sum[page_ends] - cum_sum[page_starts]
+        page_cnt = (cum_cnt[page_ends] - cum_cnt[page_starts])[:, None]
+        return (page_sum / np.maximum(page_cnt, 1)).reshape(
+            -1, self.num_kv_heads, self.head_dim
+        )
+
+    def _fill_layer_diag(
+        self,
+        diag_out: dict,
+        row: int,
+        mean_k: np.ndarray,
+        counts: np.ndarray,
+        per_layer: np.ndarray,
+        valid: np.ndarray,
+        per_layer_page: np.ndarray,
+    ) -> None:
+        """Record one layer's per-sub-block and per-page logits."""
+        if diag_out["page_offsets"] is None:
+            diag_out["page_offsets"] = (
+                np.arange(diag_out["page_mean_k"].shape[0], dtype=np.int64)
+                * diag_out["block_size"]
+            )
+        diag_out["filled"] = row + 1
+        diag_out["subblock_mean_k"][:, row] = mean_k.astype(np.float16)
+        if row == 0:
+            diag_out["subblock_counts"] = counts.astype(np.int32)
+        diag_out["subblock_logits"][row, :] = np.where(
+            valid, per_layer, np.nan
+        ).mean(axis=0)
+        diag_out["page_mean_logits"][row, :] = per_layer_page.mean(axis=0)
 
     @staticmethod
     def _summarize(

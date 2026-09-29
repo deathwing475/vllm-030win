@@ -153,6 +153,111 @@ else:
     if again["top_pages"] != report["top_pages"]:
         failures.append("scoring is not deterministic across two calls")
 
+# --- the sidecar dump must carry the vectors the ranking was made of -------
+# The whole point of VLLM_KVMEM_DUMP_KBAR is offline re-scoring, so the dumped
+# page mean-K has to be the mean the engine actually used, on the real page
+# boundaries. Synthetic data makes that checkable against ground truth: the
+# expected page mean is the arithmetic mean of the K rows whose sub-block is
+# attributed to that page.
+os.environ["VLLM_KVMEM_DUMP_KBAR"] = "1"
+os.environ["VLLM_KVMEM_INDEX_SUBBLOCK"] = "32"
+os.environ["VLLM_KVMEM_SCORE_GRANULARITIES"] = "32,64,128"
+os.environ["VLLM_KVMEM_SCORE_MODES"] = "dot,cosine"
+diag_index = KVMemMeanKIndex(NUM_HEADS, NUM_KV_HEADS, HEAD_DIM)
+diag_rng = np.random.default_rng(4242)
+diag_k = {
+    layer: (diag_rng.normal(size=(NUM_TOKENS, NUM_KV_HEADS * HEAD_DIM)) * 0.03).astype(
+        np.float16
+    )
+    for layer in LAYERS
+}
+for cs in range(0, NUM_TOKENS, BLOCK_SIZE):
+    cp = positions[cs : cs + BLOCK_SIZE]
+    diag_index.add(TRAJ, cp, {layer: diag_k[layer][cs : cs + BLOCK_SIZE] for layer in LAYERS})
+diag_report = diag_index.score(
+    TRAJ, q_by_layer, BLOCK_SIZE, NUM_TOKENS, BLOCK_SIZE, 32768, 8
+)
+diag = diag_report.get("_diag")
+if diag is None:
+    failures.append("VLLM_KVMEM_DUMP_KBAR=1 produced no _diag sidecar")
+else:
+    want_keys = {
+        "layers",
+        "subblock_logits",
+        "page_mean_logits",
+        "q_group_mean",
+        "page_mean_k",
+        "page_offsets",
+    }
+    missing = want_keys - set(diag)
+    if missing:
+        failures.append(f"diag sidecar is missing {sorted(missing)}")
+    if list(diag["layers"]) != LAYERS:
+        failures.append(f"diag layers {list(diag['layers'])} != {LAYERS}")
+    if list(diag["page_offsets"]) != [p * BLOCK_SIZE for p in range(NUM_PAGES)]:
+        failures.append("diag page_offsets are not page starts")
+
+    # Ground truth for the page mean: attribute every token to the page of the
+    # sub-block that holds it, then average the K rows in that page.
+    token_page = ((positions // 32) * 32) // BLOCK_SIZE
+    layer0 = LAYERS[0]
+    for page in (1, 19, 70, NUM_PAGES - 1):
+        rows = diag_k[layer0][token_page == page].astype(np.float32)
+        want = rows.mean(axis=0).reshape(NUM_KV_HEADS, HEAD_DIM)
+        got = diag["page_mean_k"][page, 0].astype(np.float32)
+        diff = float(np.abs(got - want).max())
+        if diff > 2e-3:
+            failures.append(
+                f"diag page {page} mean-K differs from the fed rows ({diff:.3e})"
+            )
+    print(
+        "diag page mean-K vs fed rows: checked pages 1/19/70/last, "
+        f"max |diff| = {max(float(np.abs(diag['page_mean_k'][p, 0].astype(np.float32) - diag_k[layer0][token_page == p].astype(np.float32).mean(axis=0).reshape(NUM_KV_HEADS, HEAD_DIM)).max()) for p in (1, 19, 70, NUM_PAGES - 1)):.3e}"
+    )
+
+    # Ground truth for the query: every head of a group carries needle_v[group].
+    q_want = needle_v.astype(np.float16)
+    q_diff = float(
+        np.abs(diag["q_group_mean"][0, 0].astype(np.float32) - q_want.astype(np.float32)).max()
+    )
+    if q_diff > 2e-3:
+        failures.append(f"diag q_group_mean differs from the fed query ({q_diff:.3e})")
+    print(f"diag q_group_mean vs fed query: max |diff| = {q_diff:.3e}")
+
+    # Sub-block resolution: the engine's ranking takes a max over a page's
+    # sub-blocks, so the sidecar has to carry the sub-block means themselves.
+    sb = diag["subblock_mean_k"].astype(np.float32)
+    worst = 0.0
+    for sub in (1, 45, 700, 5000):
+        rows = diag_k[layer0][sub * 32 : (sub + 1) * 32].astype(np.float32)
+        want = rows.mean(axis=0).reshape(NUM_KV_HEADS, HEAD_DIM)
+        worst = max(worst, float(np.abs(sb[sub, 0] - want).max()))
+    if worst > 2e-3:
+        failures.append(f"diag sub-block mean-K differs from the fed rows ({worst:.3e})")
+    print(f"diag sub-block mean-K vs fed rows: max |diff| = {worst:.3e}")
+    if int(diag["subblock_counts"][45]) != 32:
+        failures.append("diag sub-block counts are wrong")
+
+    # Re-derive the page-mean logit from the dumped vectors alone. This is the
+    # anchor that says an offline re-score reads the same numbers the engine
+    # ranked with: any axis order or reshape mistake shows up here.
+    qg = diag["q_group_mean"].astype(np.float32)  # [span, L, KV, D]
+    pmk = diag["page_mean_k"].astype(np.float32)  # [P, L, KV, D]
+    replay = np.zeros((diag_report["num_pages"],), dtype=np.float64)
+    for li in range(len(LAYERS)):
+        replay += np.einsum("skd,pkd->sp", qg[:, li], pmk[:, li]).mean(axis=0)
+    replay *= 1.0 / np.sqrt(HEAD_DIM) / len(LAYERS)
+    engine = diag["page_mean_logits"].astype(np.float64).sum(axis=0) / len(LAYERS)
+    finite = np.isfinite(engine)
+    replay_diff = float(np.abs(replay[finite] - engine[finite]).max())
+    if replay_diff > 1e-2:
+        failures.append(
+            f"offline replay of the page-mean logit differs ({replay_diff:.3e})"
+        )
+    print(f"offline replay of page-mean logit: max |diff| = {replay_diff:.3e}")
+
+os.environ["VLLM_KVMEM_DUMP_KBAR"] = "0"
+
 print()
 if failures:
     for failure in failures:
