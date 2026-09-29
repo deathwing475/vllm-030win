@@ -25,3 +25,22 @@
 - **硬承诺 / 增值**：阶段 0–2（生产等价 + 切换）是硬承诺永不砍；0.30 甄选是增值，做多少赚多少，砍尾不砍底。
 - **止损（kill switch）**：2026-10-30（或新 27B 发布日，以先到者为准）未完成项一律冻结转新模型适配；另一触发条件=砍完特性总分仍低于现役。
 - **B12X**：SM120 专属注意力路径的代号（0.30 起为 `--attention-backend B12X_ATTN`）；与本地 B12X spike 战役同源。注意与 DFlash2 的 extend 实验（曾慢 18% NO-GO）区分——那是 spike 结论，不是 B12X 后端本身的结论。
+
+---
+
+## KVMem 虚拟化 KV 工作区（2026-09-29 立项，步骤 056）
+
+- **工作区（workspace）**：一次 agent 轨迹的逻辑上下文总量（含存放在 host 的部分），上限 **262,144 token**。与"模型一次调用能共同注意多少 token"是两件不同的事。
+- **视窗（execution view / 工作集）**：某一时刻真正驻留 GPU、被注意力读到的 token 集合；上界 = `sink + 检索槽 + recent + query + 生成预留`。
+- **页（page）**：本栈的分页粒度 = **1456 token**（混合模型 mamba/attn 页对齐强制；`bytes_per_block(G=8) = 13,418,496`）。**搬运与分配的最小粒度**。
+- **子块（sub-block）**：检索**索引**粒度 = 128 token（一页 11 个子块）。索引精度与搬运粒度刻意解耦。
+- **检索槽（retrieval slot）**：视窗里专用于放被选中历史页的固定数量槽位（N 个）；槽位的**位置**在请求开始前定死，选择只决定槽里的**内容**。
+- **固定槽位布局（fixed slot layout）**：本方案的位置策略 —— `[sink S | 检索槽 N | recent R | query q | 生成预留 g]`。**关键不变式**：query 位置 `B = S+N+R` 与"最终选了哪些块"无关 ⇒ 不需要重 prefill。
+- **identity 态**：workspace ≤ `budget_max` 时的运行态（整段全驻留、零检索、零重烘焙）。正确性判据 = 与 KVMem-off **逐 token 一致**（**identity canary**）。
+- **Mean-K**：一个 (层, 子块, KV head) 的 **RoPE 前** K 的均值，检索索引的单元。索引与 query 同在"内容帧" ⇒ 打分不需要任何逆旋转。
+- **raw K**：RoPE **前**的 K（post-`k_norm`），位置无关。本方案只对**旋转的 64 维**（`partial_rotary_factor=0.25`）存 fp16 作为重建权威。
+- **重物化（rematerialization）**：把一个 host 页按目标槽位位置**单次**重烘焙 RoPE 后写回 GPU。本方案**禁止 delta re-RoPE**（每次从 raw K 重建 ⇒ 零累积漂移）。
+- **budget_max / 生成预留（gen_reserve）**：视窗内"历史可用"与"本回合输出可用"的二分；生成预留是单次生成的**硬上限**（超出须优雅失败）。
+- **冷启动**：本请求的**新增** token 数超过池容量（无前缀缓存的首轮长 prompt）⇒ 需要 **prefill 期 stage-out**。
+- **轨迹键（trajectory key）**：`hash(root task message) + hash(current query)`；prompt 缩水 > max(1024, 1%) 判为新/被压缩轨迹 ⇒ 冷启动。
+- **被否的两条路线（勿重开）**：(A) 论文/QW3 的"重 prefill query"（要 GDN 状态快照 + 带 #43 同族退化路径）；(B) 参考实现的"原始位置 + 洞 + KQ mask"（vLLM 的 mask 路径只支持 fp16/bf16 KV，而生产 KV 是 nvfp4）。
