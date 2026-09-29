@@ -392,6 +392,58 @@ DFlash2 投机解码（草稿 KV 与视窗的位置一致性）→ 图模式（F
 
 ---
 
+## 12. 阶段 1a 实施机制（步骤 057 落地：引擎侧「超池长 prompt 有界 prefill」）
+
+> 本节记录 §6 阶段 1a 的**实现机制**与实测结论。设计层不变（§5.1 固定槽位布局仍成立），本节只回答"超池长的 prompt 到底怎么 prefill 进来"。
+
+### 12.1 问题与选型
+
+阶段 1a 的要求是：冷 262,144-token prompt（无前缀缓存）能边 prefill 边溢写跑完、不崩不 OOM。**纯 vLLM 路径做不到**：请求自己的 KV 块在 prefill 期间不会被回收（`allocate_slots` 只为 `num_computed_tokens + num_new_tokens` 申请，且长 prompt 必须整段驻留才能算后续 token 的注意力），池 3.4e9 只能装 163,719 token ⇒ 262K prompt 永远申请不到块。`scheduler_reserve_full_isl=True` 会让它**卡在等待队列里不动**（不是崩，是挂——比崩更难发现）。
+
+**选型：给 16 个 `full_attention` 层加一个逐层滑窗（`per_layer_sliding_window`）**，窗口 W。于是：
+
+- 每个请求的注意力组需求从 `cdiv(max_model_len, block)` 降到 `cdiv(min(W, max_model_len), block) + 1`（`SlidingWindowSpec.max_admission_blocks_per_request`），**与 prompt 长度解耦**；
+- `SlidingWindowManager.get_num_skipped_tokens` + `remove_skipped_blocks` 在每次 `allocate_slots` 前把滑出窗口的块**释放**，驻留量稳定在 ~W；
+- 注意力侧由 flashinfer 的 `window_left` 生效（`window_left = W - 1`），**走的是原生 FA2 路径、不是被 §5.1 否掉的 flex mask 路径**，因此 nvfp4 可用（`use_fa2_nvfp4_kv` 在 SM120 上为真）。
+
+**为什么必须逐层传参**：`CacheConfig.sliding_window` 只在模型的 `layer_types` **全部**是 `sliding_attention` 时才被填充（`engine/arg_utils.py:2061-2067`），本模型是 16 `full_attention` + 48 `linear_attention` 的交错混合 ⇒ 全局滑窗会被引擎主动拒绝，只能走 `per_layer_sliding_window`。
+
+**实现**：`model_executor/models/qwen3_next.py` 新增 `_kvmem_per_layer_sliding_window()`，`VLLM_KVMEM_SW_WINDOW=N` 时对 `layer_types[i] == "full_attention"` 的层返回 N，其余层返回 None（**草稿模型自带 `sliding_attention` 层，不受影响**）。**未设环境变量时逐字节等价于上游**（返回 None，行为与改前一致；实测生产 boot 布局数字与改前逐项相同）。
+
+### 12.2 实测（步骤 057，臂 = `_tmp_line_b/serve_kvmem_sw32k.cmd`：W=32768 / `--max-model-len 262144` / 无投机 / `--cudagraph-capture-sizes 1`）
+
+| 项 | 生产（046 配置） | KVMem 臂（W=32,768） | KVMem 臂（W=163,072，阶段 1 主配置） |
+|---|---|---|---|
+| attn block size | 1456 | 1424 | 1424 |
+| mamba 页 padding | 0.12% | 0.38% | 0.38% |
+| `GPU KV cache size` | 163,719 tokens | 1,060,864 tokens | 275,997 tokens |
+| 单请求并发（对 `max_model_len`） | 1.00× @163,072 | **4.05× @262,144** | **1.05× @262,144** |
+| 冷 210K prompt prefill | 不可行（>池） | **152.2 s**（~1,360 tok/s） | **249.1 s** |
+| 冷 256K prompt prefill | 不可行 | **185.2 s**（~1,383 tok/s） | **320.2 s**（~800 tok/s） |
+| needle 窗内（95% 深） | — | **命中** | **命中** |
+| needle 窗外（10% 深） | — | **未命中（预期）** | **未命中（预期）** |
+| 8k needle | 122.58 | 69.4（无投机，capture size 1） | — |
+| 余量悬崖判据（共享 − 8,298） | 0-68 MiB | 0 MiB | 0 MiB |
+| offload 溢写量（200K 请求） | — | **314.7 MB** | — |
+
+**结论**：①超池长 prompt 的**有界 prefill 机制打通**（阶段 1a 的"不崩不 OOM"半边达成）；②**窗外 needle 必失**是这套机制的**正控**——它证明窗口真的在生效，而不是"其实做了全注意力所以碰巧能跑"；③窗口注意力让 prefill **更快**（W=32,768 时 ~1,370 vs 生产 867 tok/s），与参考 #34「prefill 单 token 成本 ∝ 视窗」同向；**但窗口越宽越慢**（W=163,072 时 256K 冷 prefill 320 s ≈ 800 tok/s，已略低于生产 867）⇒ **窗口大小是"检索质量 / prefill 速度"之间的一等旋钮**，也说明 §7.1 的主配置窗口（163,072）是**上限**而不是最优值；④**`W=163,072` 在池 3.4e9 上可行但只剩 1.05× 并发余量**——池值不能动（035 硬上限）⇒ 若要给视窗留更多余量，只能缩窗口（而这恰好是 §5.5 说的"缩池换余量"的同一枚硬币）。
+
+### 12.3 与设计的关系（重要边界，勿误读）
+
+- **滑窗 ≠ 工作区存储**。滑窗把滑出窗口的历史 KV **丢掉**，只保留 ~W；offload 层只把"滑窗可达的那几块"（~300 MB）写进 host mmap，**不是** §5.3 要求的完整工作区（V + 非旋转 K + raw K 权威）。⇒ **阶段 1a 的"溢写"只做到一半**，KVMem 的 host 工作区仍需要**自己的 copy-before-free 钩子**（落点 = `SingleTypeKVCacheManager._remove_blocks_in_range`，`block_pool.free_blocks(freed)` 之前；键从 block hash 改成 `(轨迹, 页序号)`；复用 `v1/kv_offload/` 的 CPU 层与 `OffloadingConnector` 的 pending-job 记账）。
+- **W 必须 ≥ 装配后的视窗**。装配后的视窗位置是压缩后的 `0..B-1`，若 `B ≤ W` 则滑窗对 serve 请求完全不生效（sink 不会被淘汰）。阶段 1 主配置视窗 163,072 ⇒ **KVMem 臂的 W 取 163,072**（**已实测：`275,997 tokens / 1.05x @262,144`，冷 256K 320.2 s 跑通**）；本次另用 32,768 证明"有界"这一性质本身。**注意窗口越宽 prefill 越慢**（256K 冷 prefill：32,768 → 185 s，163,072 → 320 s）⇒ 窗口大小是"检索质量 / prefill 速度 / 池余量"的三向旋钮，阶段 2 标定时应把它当一等参数。
+- **滑窗只用于 ingest 相**。serve 相的位置是压缩后的槽位坐标、视窗稠密连续、**无 mask**（§5.1 不变式），与滑窗互不干扰。
+- **不改 §5.1 的三条收益**：仍然不重 prefill、仍然无 GDN 快照、仍然无 mask（滑窗只出现在 ingest 相，而 ingest 相本来就要重算/丢弃）。
+- **raw K 捕获（§5.2）与滑窗正交**：仍需在 RoPE 前 clone 留档，且只对差量 token 捕获。
+
+### 12.4 下一步（阶段 1a 剩余工作）
+
+1. ~~**W=163,072 复验**（阶段 1 主配置的窗口；判据 = 冷 262K prompt 仍能跑完 + 池不爆）。~~ **✅ 已完成（057 收尾补跑）**：`275,997 tokens / 1.05x @262,144`、冷 256K 320.2 s 跑通、窗外 needle 仍未命中。**只剩 5% 并发余量**是本配置的紧处（池值不能动）。
+2. **1a-2：copy-before-free 钩子**（把滑出窗口的块写进 KVMem 工作区，而非丢弃）——这是"溢写"的另一半。
+3. **准入守卫复核**：`prompt + max_tokens > 工作区上限(262,144)` 时返回 400（现由 `--max-model-len` 的 `_validate_prompt_len` 覆盖；需复核 KVMem 语义下"池"与"视窗"两个上限都要有干净 400，而不是卡在等待队列）。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |

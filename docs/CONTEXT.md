@@ -28,7 +28,7 @@
 
 ---
 
-## KVMem 虚拟化 KV 工作区（2026-09-29 立项，步骤 056）
+## KVMem 虚拟化 KV 工作区（2026-09-29 立项，步骤 056；步骤 057 阶段 1a 开工）
 
 - **工作区（workspace）**：一次 agent 轨迹的逻辑上下文总量（含存放在 host 的部分），上限 **262,144 token**。与"模型一次调用能共同注意多少 token"是两件不同的事。
 - **视窗（execution view / 工作集）**：某一时刻真正驻留 GPU、被注意力读到的 token 集合；上界 = `sink + 检索槽 + recent + query + 生成预留`。
@@ -42,5 +42,6 @@
 - **重物化（rematerialization）**：把一个 host 页按目标槽位位置**单次**重烘焙 RoPE 后写回 GPU。本方案**禁止 delta re-RoPE**（每次从 raw K 重建 ⇒ 零累积漂移）。
 - **budget_max / 生成预留（gen_reserve）**：视窗内"历史可用"与"本回合输出可用"的二分；生成预留是单次生成的**硬上限**（超出须优雅失败）。
 - **冷启动**：本请求的**新增** token 数超过池容量（无前缀缓存的首轮长 prompt）⇒ 需要 **prefill 期 stage-out**。
+- **有界 prefill（步骤 057 落地的机制）**：给 `full_attention` 层一个逐层滑窗 `per_layer_sliding_window`（`VLLM_KVMEM_SW_WINDOW=N` 门控），使单请求 KV 块需求从"∝ prompt 长度"变成"∝ 窗口"，从而让**超池长 prompt 能 prefill 进来**。**⚠️ 它不是工作区存储**——滑出窗口的历史 KV 是被**丢掉**的（offload 只存滑窗可达那几块）⇒ 工作区 store 另需 copy-before-free 钩子。
 - **轨迹键（trajectory key）**：`hash(root task message) + hash(current query)`；prompt 缩水 > max(1024, 1%) 判为新/被压缩轨迹 ⇒ 冷启动。
 - **被否的两条路线（勿重开）**：(A) 论文/QW3 的"重 prefill query"（要 GDN 状态快照 + 带 #43 同族退化路径）；(B) 参考实现的"原始位置 + 洞 + KQ mask"（vLLM 的 mask 路径只支持 fp16/bf16 KV，而生产 KV 是 nvfp4）。

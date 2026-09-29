@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
+import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -43,6 +44,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 from vllm.model_executor.layers.quantization.utils.config_utils import (
     get_quark_ocp_mx_group_size,
 )
@@ -267,6 +271,56 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
+_KVMEM_SW_LOGGED = False
+
+
+def _kvmem_per_layer_sliding_window(
+    config: Qwen3NextConfig, prefix: str
+) -> int | None:
+    """vllm-030win patch (step 057): optional sliding window on the
+    full-attention layers, for the KVMem arm.
+
+    ``CacheConfig.sliding_window`` is only populated for models whose
+    ``layer_types`` are ALL sliding_attention (see ``arg_utils``); it is
+    deliberately left None for interleaved hybrids so it cannot override the
+    per-layer windows of a global/sliding mix. An interleaved model like this
+    one can therefore only obtain a window through ``per_layer_sliding_window``.
+
+    ``VLLM_KVMEM_SW_WINDOW=N`` applies N to every ``full_attention`` layer,
+    which bounds the per-request KV of the attention group to ~N tokens and so
+    lets a prompt longer than the KV pool prefill by rolling the window
+    (step 057 / KVMem stage 1a). Only ``full_attention`` layers are touched:
+    a speculative drafter sharing this class declares its own
+    ``sliding_attention`` layers and keeps its own window. Unset keeps upstream
+    behaviour byte-for-byte.
+    """
+    global _KVMEM_SW_LOGGED
+    raw = os.environ.get("VLLM_KVMEM_SW_WINDOW", "").strip()
+    if not raw:
+        return None
+    layer_types = getattr(config, "layer_types", None)
+    if layer_types is None:
+        return None
+    if layer_types[extract_layer_index(prefix)] != "full_attention":
+        return None
+    try:
+        window = int(raw)
+    except ValueError:
+        raise ValueError(
+            "VLLM_KVMEM_SW_WINDOW must be a positive integer, got %r" % (raw,)
+        ) from None
+    if window < 1:
+        raise ValueError("VLLM_KVMEM_SW_WINDOW must be >= 1, got %d" % window)
+    if not _KVMEM_SW_LOGGED:
+        _KVMEM_SW_LOGGED = True
+        logger.info(
+            "vllm-030win patch (step 057): full_attention layers get a %d-token "
+            "sliding window (VLLM_KVMEM_SW_WINDOW)",
+            window,
+        )
+    return window
+
+
 class Qwen3NextAttention(nn.Module):
     def __init__(
         self,
@@ -345,6 +399,9 @@ class Qwen3NextAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
+            per_layer_sliding_window=_kvmem_per_layer_sliding_window(
+                config, prefix
+            ),
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
             **{
