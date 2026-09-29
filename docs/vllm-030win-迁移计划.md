@@ -161,14 +161,16 @@
 
 ---
 
-## 9. OrcaSAQ2 后续路线登记（计划，不代表已执行）
+## 9. OrcaSAQ2 后续路线登记（KVMem 主线完成后执行，计划不代表已执行）
 
-步骤 059 已跑通 OrcaSAQ-2-27B 的 Windows native CUDA + vLLM 0.29 smoke。后续执行顺序与边界见 `docs/orcasaq2后续推进计划.md`：
+步骤 059 已跑通 OrcaSAQ-2-27B 的 Windows native CUDA + vLLM 0.29 smoke，但这只是兼容基线。**用户重新裁定：下一主线先完成现有 GSQ 栈的完整 KVMem 移植。**KVMem K1-K3 出口后，才按 `docs/orcasaq2后续推进计划.md` 执行 Orca 路线：
 
-1. Orca `--kv-cache-dtype nvfp4` 单变量 smoke，重新测 Orca 自己的 784 attention block / GDN page 对齐，不能套 GSQ 的 1456 页账；
-2. Orca checkpoint 自带的 Qwen3.5 MTP（`qwen3_next_mtp`）正确性与接受率；
-3. **DFlash2 也纳入**：先做 Orca `Qwen3_5ForCausalLM` target adapter、匹配 draft checkpoint 门和单步 logits 对齐，再做真实 speculative service；禁止直接复用 GSQ `dflash2\\gptq3c`；
-4. Orca KVMem 有界 prefill，先复用 `VLLM_KVMEM_SW_WINDOW`，再决定 copy-before-free/workspace store；完整 KVMem 与 NVFP4/MTP/DFlash2 分阶段叠加。
+1. GSQ KVMem K1：copy-before-free、trajectory/page key、pending-job 和 workspace store/load；
+2. GSQ KVMem K2/K3：准入 400、raw-K/Mean-K/检索/固定槽位重物化、identity/needle/冷 262K 正确性出口；
+3. KVMem 阶段 1 出口后再做 Orca `--kv-cache-dtype nvfp4` 单变量 smoke，重新测 Orca 自己的 784 attention block/GDN page；
+4. Orca 自带 Qwen3.5 MTP；
+5. Orca 专用 DFlash2 target adapter + 匹配 draft checkpoint + 单步 logits 对齐，禁止直接复用 GSQ `dflash2\\gptq3c`；
+6. 最后做 Orca/KVMem 有界 prefill 和完整 workspace 兼容。
 
 生产 GSQ、8080 launcher、现有 KVMem 默认配置均不因本登记改变。
 
