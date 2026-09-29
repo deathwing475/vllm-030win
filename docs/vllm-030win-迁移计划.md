@@ -161,4 +161,17 @@
 
 ---
 
+## 9. OrcaSAQ2 后续路线登记（计划，不代表已执行）
+
+步骤 059 已跑通 OrcaSAQ-2-27B 的 Windows native CUDA + vLLM 0.29 smoke。后续执行顺序与边界见 `docs/orcasaq2后续推进计划.md`：
+
+1. Orca `--kv-cache-dtype nvfp4` 单变量 smoke，重新测 Orca 自己的 784 attention block / GDN page 对齐，不能套 GSQ 的 1456 页账；
+2. Orca checkpoint 自带的 Qwen3.5 MTP（`qwen3_next_mtp`）正确性与接受率；
+3. **DFlash2 也纳入**：先做 Orca `Qwen3_5ForCausalLM` target adapter、匹配 draft checkpoint 门和单步 logits 对齐，再做真实 speculative service；禁止直接复用 GSQ `dflash2\\gptq3c`；
+4. Orca KVMem 有界 prefill，先复用 `VLLM_KVMEM_SW_WINDOW`，再决定 copy-before-free/workspace store；完整 KVMem 与 NVFP4/MTP/DFlash2 分阶段叠加。
+
+生产 GSQ、8080 launcher、现有 KVMem 默认配置均不因本登记改变。
+
+---
+
 *v1 的调研细节见三份调研报告；本 v2 为唯一执行依据。执行时按阶段更新交接文档。*
