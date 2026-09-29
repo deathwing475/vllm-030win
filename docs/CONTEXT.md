@@ -45,3 +45,13 @@
 - **有界 prefill（步骤 057 落地的机制）**：给 `full_attention` 层一个逐层滑窗 `per_layer_sliding_window`（`VLLM_KVMEM_SW_WINDOW=N` 门控），使单请求 KV 块需求从"∝ prompt 长度"变成"∝ 窗口"，从而让**超池长 prompt 能 prefill 进来**。**⚠️ 它不是工作区存储**——滑出窗口的历史 KV 是被**丢掉**的（offload 只存滑窗可达那几块）⇒ 工作区 store 另需 copy-before-free 钩子。
 - **轨迹键（trajectory key）**：`hash(root task message) + hash(current query)`；prompt 缩水 > max(1024, 1%) 判为新/被压缩轨迹 ⇒ 冷启动。
 - **被否的两条路线（勿重开）**：(A) 论文/QW3 的"重 prefill query"（要 GDN 状态快照 + 带 #43 同族退化路径）；(B) 参考实现的"原始位置 + 洞 + KQ mask"（vLLM 的 mask 路径只支持 fp16/bf16 KV，而生产 KV 是 nvfp4）。
+
+---
+
+## 外置 EXL3 插件集成（2026-09-29，步骤 058）
+
+- **vllm-exl3**：外置的 `--quantization exl3` 插件，不是本仓 `vllm/` 源码的一部分；本步使用 `G:\vllm-exl3-0.5.0`，许可证为 AGPL-3.0-only，记录仓继续保持 Apache-2.0。
+- **注册层通过**：在 `G:\\qwen3.8model\\vllm-win029` 中 entry point 可发现，`register()` 可重复调用，`Exl3Config` 已注册；这只证明插件能接入当前 vLLM 0.29 API，不证明模型可服务。
+- **原生资格**：`exllamav3`、`exllamav3_ext`、`vllm_exl3_c` 三者均存在才可讨论原生 CUDA；步骤 058 三者均缺失，`runtime_diagnostics()` 报 `native_available=false`，因此原生 GPU/端到端资格未通过。
+- **模型边界**：当前生产 Qwen3.8-27B GSQ 是 compressed-tensors WNA16 int3 + DFlash2，不是 EXL3 routed-MoE checkpoint；不能把插件安装状态写成 GSQ 已启用 EXL3。
+- **回滚**：`tools/revert_vllm_exl3.py` 恢复 Qwen4Exp `.orig/.orig2` 并卸载外置插件；验证必须从 `G:\\qwen3.8model` cwd 执行，避免记录仓源码树遮蔽 venv。

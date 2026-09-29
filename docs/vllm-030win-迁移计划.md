@@ -149,4 +149,16 @@
 
 ---
 
+## 8. 增值登记：外置 vllm-exl3 插件（步骤 058，2026-09-29）
+
+本节不是 0.30 代码迁移，也不改变 KVMem 头名；它记录一个独立的外置插件接入。
+
+- **来源**：本地 `G:\vllm-exl3-0.5.0`，元数据版本 0.5.0；上游 tag `v0.5.0` ref `8e7f6799...`，上游 `main` 当时为 `223e246f...`。许可证 AGPL-3.0-only，插件源码不复制进本仓 Apache-2.0 树。
+- **对象**：安装到 `G:\\qwen3.8model\\vllm-win029`，默认 Python-only；三个 Qwen4Exp 小补丁由插件仓工具应用并留下 `.orig/.orig2`。
+- **结果**：0.29 兼容性硬项通过；插件测试 67 passed / 12 skipped；entry point、重复注册、`Exl3Config`、CLI/import 均通过。
+- **边界**：目标 venv 没有 ExLlamaV3、`exllamav3_ext`、`vllm_exl3_c`，没有 EXL3 checkpoint；故原生 CUDA、真实 EXL3 serving、性能/正确性均未资格化。现役 GSQ、生产 launcher、池值、KVMem 未改。
+- **回滚**：`tools/revert_vllm_exl3.py`；安装/状态工具 = `tools/install_vllm_exl3.py`。
+
+---
+
 *v1 的调研细节见三份调研报告；本 v2 为唯一执行依据。执行时按阶段更新交接文档。*
