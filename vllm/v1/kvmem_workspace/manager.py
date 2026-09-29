@@ -25,6 +25,8 @@ from vllm.v1.kvmem_workspace.groups import workspace_group_ids
 from vllm.v1.kvmem_workspace.metadata import (
     KVMemConnectorMetadata,
     KVMemPageTransfer,
+    KVMemScoreRequest,
+    KVMemStepSpan,
     KVMemStoreJob,
 )
 from vllm.v1.outputs import KVConnectorOutput
@@ -83,9 +85,19 @@ class KVMemWorkspaceScheduler:
         self._retained_by_block_id: dict[int, object] = {}
         # request_id -> trajectory key (the request is still in flight).
         self._req_trajectory: dict[str, bytes] = {}
+        # request_id -> the live request object, for its token accounting.
+        self._req_object: dict[str, object] = {}
+        # request_id -> prompt length, which `request.num_tokens` stops being
+        # once decode starts appending to it.
+        self._req_prompt_len: dict[str, int] = {}
+        self._req_scored: set[str] = set()
         # request_id -> (evicted, stored, dropped) when the request was first
         # seen, so the per-request summary is a delta and not a session total.
         self._req_baseline: dict[str, tuple[int, int, int]] = {}
+
+        self.rawk = config.rawk_enabled()
+        self.recent_tokens = config.recent_tokens()
+        self.scores_emitted = 0
 
         self.pages_evicted = 0
         self.pages_stored = 0
@@ -177,6 +189,10 @@ class KVMemWorkspaceScheduler:
         self._req_trajectory[request.request_id] = self.trajectory_key(
             token_ids, self.trajectory_prefix_tokens
         )
+        self._req_object[request.request_id] = request
+        prompt_len = len(token_ids) if token_ids else None
+        if prompt_len:
+            self._req_prompt_len[request.request_id] = prompt_len
         self._req_baseline[request.request_id] = (
             self.pages_evicted,
             self.pages_stored,
@@ -207,8 +223,57 @@ class KVMemWorkspaceScheduler:
         self.slots_used += 1
         return slot
 
+    def _emit_spans(
+        self, meta: KVMemConnectorMetadata, scheduler_output
+    ) -> None:
+        """Tell the worker which token range of which trajectory this step is.
+
+        Only needed once the raw-K capture is armed; without it the workspace
+        is a write-only store and no position bookkeeping is required.
+        """
+        if not self.rawk or not self.group_ids:
+            return
+        scheduled = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        group_id = self.group_ids[0]
+        block_size = self.block_size[group_id]
+        for req_id, num_tokens in scheduled.items():
+            trajectory = self._req_trajectory.get(req_id)
+            request = self._req_object.get(req_id)
+            if trajectory is None or request is None or num_tokens <= 0:
+                continue
+            start = request.num_computed_tokens
+            meta.spans.append(
+                KVMemStepSpan(
+                    trajectory=trajectory, start=start, num_tokens=num_tokens
+                )
+            )
+            # The step that completes the prompt is the one where retrieval
+            # would run: the layout is fixed from there on and decode only
+            # appends to the generation reserve. `request.num_tokens` grows
+            # during decode, so the fixed prompt length is what decides.
+            prompt_len = self._req_prompt_len.get(req_id)
+            if (
+                prompt_len is not None
+                and req_id not in self._req_scored
+                and start < prompt_len
+                and start + num_tokens >= prompt_len
+            ):
+                self._req_scored.add(req_id)
+                meta.score_requests.append(
+                    KVMemScoreRequest(
+                        trajectory=trajectory,
+                        request_id=req_id,
+                        num_tokens=prompt_len,
+                        block_size=block_size,
+                        sink_tokens=block_size,
+                        recent_tokens=self.recent_tokens,
+                    )
+                )
+                self.scores_emitted += 1
+
     def build_connector_meta(self, scheduler_output) -> KVMemConnectorMetadata:
         meta = KVMemConnectorMetadata()
+        self._emit_spans(meta, scheduler_output)
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         evictions = block_state.workspace_evictions if block_state else None
         if evictions:
@@ -333,6 +398,9 @@ class KVMemWorkspaceScheduler:
     def request_finished(self, request, block_ids):
         del block_ids
         self._req_trajectory.pop(request.request_id, None)
+        self._req_object.pop(request.request_id, None)
+        self._req_prompt_len.pop(request.request_id, None)
+        self._req_scored.discard(request.request_id)
         base = self._req_baseline.pop(request.request_id, None)
         if base is None:
             base = (0, 0, 0)
@@ -376,6 +444,8 @@ class KVMemWorkspaceScheduler:
             "pages_stored": self.pages_stored,
             "pages_dropped": self.pages_dropped,
             "jobs_in_flight": len(self._jobs),
+            "rawk": self.rawk,
+            "scores_emitted": self.scores_emitted,
         }
 
     def reset(self) -> None:
@@ -384,4 +454,7 @@ class KVMemWorkspaceScheduler:
         self._jobs.clear()
         self._retained_by_block_id.clear()
         self._req_trajectory.clear()
+        self._req_object.clear()
+        self._req_prompt_len.clear()
+        self._req_scored.clear()
         self.slots_used = 0

@@ -14,20 +14,22 @@
 - KVMem 步骤 057：`VLLM_KVMEM_SW_WINDOW=N` 已完成“有界 prefill”半边。
 - 057 已证明：冷 210K/256K prompt 可跑，窗内 needle 命中，窗外 needle 必失。
 - **KVMem 步骤 060：K1 copy-before-free + K2 准入守卫 = GO**（见 §3 阶段 K1/K2 的完成记录）。滑出窗口的历史页现在会写进 host 工作区（键 `(轨迹, token 偏移)`），往返逐字节一致，零丢页零泄漏；上限不可被越过，视窗装不下在 boot 期响亮失败。
+- **KVMem 步骤 061：K3 前半（raw-K 捕获 + Mean-K 索引 + 页级检索打分）= 机制 GO、R1 部分消解**（见 §3 阶段 K3）。检索有强信号（针页 logit +5.9/+9.2、rank 8→2 / 28→1），**粒度取 32 而不是 128**；**残余"早期页偏置"是新的头号挂账**；**重物化未做**。
 - OrcaSAQ2 步骤 059：ExLlamaV3 1.5.3 native CUDA + OrcaSAQ2 plugin 已跑通，端口 8001 的 chat smoke 通过。
 
 ### 1.2 未完成的核心工程
 
-**KVMem 的阶段 1 正确性主体（K3）仍未开工。** 当前缺少：
+**KVMem 的阶段 1 正确性主体（K3）只做完了读取侧前三件。** 当前缺少：
 
-- raw-K 捕获（RoPE 前，只对差量 token）；
-- 128-token sub-block Mean-K 索引；
-- page 级 softmax-over-pages 检索；
+- ~~raw-K 捕获（RoPE 前，只对差量 token）；~~ **✅ 061**
+- ~~sub-block Mean-K 索引；~~ **✅ 061（粒度取 32）**
+- ~~page 级 softmax-over-pages 检索；~~ **✅ 061（有强信号）**
+- **残余"早期页偏置"的成因**（无针时页 2/5/1/11/8/3 就占住 top 槽位；已排除范数效应）——**新的头号挂账**；
 - fixed-slot rematerialization（**从 raw K 单次重建**，禁 delta re-RoPE）；
 - identity canary、紧预算 retrieval needle、40/55/70/85% 多深度、串台检测、重物化往返单测；
 - 工作区淘汰策略（LRU/GC/跨会话容量）与多轨迹并发。
 
-因此，步骤 057 + 060 只能写成“阶段 1a 有界 prefill GO + K1/K2 GO”，**不能写成 KVMem 已完成**。
+因此，步骤 057 + 060 + 061 只能写成“阶段 1a 有界 prefill GO + K1/K2 GO + K3 读取侧前三件 GO”，**不能写成 KVMem 已完成**（**重物化未做 ⇒ 窗外 needle 仍答不出**）。
 
 ## 2. 总路线裁定
 
@@ -88,7 +90,7 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 - `prompt + max_tokens`：**上游把 `max_tokens` 夹到 `上限 − prompt`**（实测 `258,854 + 3,290 = 262,144` 恰好等于 `max_model_len`）⇒ 工作区**不可能被越过**；另加 KVMem 守卫兜底（`input_processor.py`，对绕过夹紧的路径生效）；
 - execution viewport 上限：`KVMemWorkspaceScheduler.bind_gpu_block_pool` 在 boot 期按 `max_admission_blocks_per_request` 求和校验，不足则**明确 RuntimeError 拒绝启动**（实测 `needs 234 / pool has 259`）——不再出现 `scheduler_reserve_full_isl=True` 把请求静默留在等待队列。
 
-### 阶段 K3：阶段 1 正确性主体（**当前头名，未开工**）
+### 阶段 K3：阶段 1 正确性主体（**前半已完成（步骤 061）；后半未开工**）
 
 按既定固定槽位布局：
 
@@ -96,12 +98,17 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 [sink S | retrieval N | recent R | query q | generation reserve g]
 ```
 
-实现并验证：
+**已完成（步骤 061，读取侧前三件，机制 GO、R1 部分消解）**：
 
-1. **raw-K 在 RoPE 前捕获**（eager 路径 + 显式 clone，只对差量 token；生产走融合 kernel 抓不到中间量）——**K3 的第一件事**；
-2. 128-token sub-block Mean-K 索引；
-3. page 级 softmax-over-pages 检索；
-4. 固定槽位布局，query 位置不随选页变化；
+1. ✅ **raw-K 在 RoPE 前捕获**（`VLLM_KVMEM_RAWK` 门控；`qwen3_next.py` eager 路径 `k_norm` 之后、`rotary_emb` 之前 clone；只 16 层 `full_attention`、只对差量 token；**必须关掉融合 kernel** 才抓得到中间量 ⇒ 臂内自洽、禁跨臂比 PPL）；
+2. ✅ **Mean-K 子块索引**（按最细粒度存储、粗粒度由求和精确导出 ⇒ 一次 prefill 出全部变体）。**粒度取值改为 32 而不是原定的 128**：实测 `dot@32` 在窗口外针上 rank 2，而 `dot@128` 只有 rank 7（趋势 32 > 64 > 128），**与设计 §5.3 的 128 初值不同**（代价 = 索引 537 MB/轨迹 host 常驻）；
+3. ✅ **page 级 softmax-over-pages 检索**（页内子块取 max、只对 query span 打分、sink/recent mask 成 −inf）。**实测检索有强信号**：针只占一页 1424 token 里的 15 个，却把该页 logit 抬高 **+5.91（窗口外，rank 8→2）/ +9.19（窗内，rank 28→1）**，6 个变体全部进 top-16。**`cosine` 与 `dot` 同排名 ⇒ 归一化不是杠杆**。
+   **新挂账（头号）**：残余"早期页偏置"——无针时页 2/5/1/11/8/3 就有 22.7–26.2 的 logit，占住检索槽位；**已排除"页均值范数"**（范数恒定 ±7% 而 logit 跨 3×）。**不查清它，第 4 项做完也拿不到有效检索槽位。**
+   **两个测量层缺陷已修**：页归属走错边界（`1424 = 16×89`，32/64/128 都不整除 ⇒ 修前"rank 74 阴性"是错的）＋ AOT fullgraph 编译拒绝捕获（⇒ 本臂改 `--enforce-eager`，即设计 §6 的"阶段 1 无图模式"）。
+
+**未开工（K3 后半）**：
+
+4. **固定槽位布局，query 位置不随选页变化**——位置解耦 + 重 RoPE + 块表改写；**已知唯一缝 = `gpu_model_runner.py` 的 `positions`**（每步从头重建、`slot_mapping` 由它派生 ⇒ 必须"先改位置、后算 slot"，且无任何现成 per-request 钩子），而 **`update_block_table` 只在 flash_attn/mamba 后端实现、flashinfer（nvfp4 路径）没有** ⇒ 确实要动模型执行器（本线最重工程）；
 5. 每次从 raw K 单次重建，禁止 delta re-RoPE；
 6. V 与非旋转 K 按整页搬运；
 7. identity canary：预算不收紧时与 KVMem-off 逐 token 一致；

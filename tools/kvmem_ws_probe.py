@@ -83,6 +83,8 @@ def post(base: str, prompt: str, max_tokens: int, ignore_eos: bool = False) -> d
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
     if ignore_eos:
         payload["ignore_eos"] = True

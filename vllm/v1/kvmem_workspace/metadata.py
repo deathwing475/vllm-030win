@@ -35,8 +35,38 @@ class KVMemStoreJob:
 
 
 @dataclass
+class KVMemStepSpan:
+    """The token range one request computes in this step (K3 item 1-2).
+
+    The retrieval index is position-keyed, and the model forward only knows the
+    absolute positions it was handed, not which trajectory they belong to. This
+    span is the bridge: the scheduler knows both, and ``build_connector_meta``
+    runs before ``_update_after_schedule`` bumps ``num_computed_tokens``, so
+    ``start`` here is the true first position of the step.
+    """
+
+    trajectory: bytes
+    start: int
+    num_tokens: int
+
+
+@dataclass
+class KVMemScoreRequest:
+    """A prompt whose prefill just finished: score its workspace pages."""
+
+    trajectory: bytes
+    request_id: str
+    num_tokens: int
+    block_size: int
+    sink_tokens: int
+    recent_tokens: int
+
+
+@dataclass
 class KVMemConnectorMetadata(KVConnectorMetadata):
     store_jobs: list[KVMemStoreJob] = field(default_factory=list)
+    spans: list[KVMemStepSpan] = field(default_factory=list)
+    score_requests: list[KVMemScoreRequest] = field(default_factory=list)
 
 
 @dataclass

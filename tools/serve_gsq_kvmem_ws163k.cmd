@@ -1,15 +1,22 @@
 @echo off
 rem ===========================================================================
-rem KVMem ARM (NOT production) - host KV workspace, stage 1 K1/K2.
+rem KVMem ARM (NOT production) - host KV workspace, stage 1 K1/K2/K3.
 rem
-rem Status: step 060. The bounded-prefill half (step 057) plus copy-before-free:
-rem the pages the sliding window drops are copied into a pinned host workspace
-rem keyed by (trajectory, page_index) and held out of the block pool until the
-rem copy completes. Retrieval / rematerialisation (K3) is NOT implemented yet,
-rem so nothing reads the workspace back into the window.
+rem Status: step 061. The bounded-prefill half (step 057) plus copy-before-free
+rem (step 060: the pages the sliding window drops are copied into a pinned host
+rem workspace keyed by (trajectory, token offset) and held out of the block pool
+rem until the copy completes) plus the retrieval half's index and scoring
+rem (step 061: pre-RoPE q/k capture on the 16 full_attention layers, a
+rem 128-token sub-block Mean-K index on the host, and a softmax-over-pages
+rem ranking dumped to VLLM_KVMEM_DUMP).
+rem
+rem NOT implemented yet: rematerialisation. Nothing the index selects is put
+rem back into the window, so the answer to a needle outside the window is still
+rem not generated - the dump only says whether retrieval WOULD have found it.
 rem
 rem Design authority: docs/vllm-030win-调研-KVMem虚拟化KV工作区.md (§12 = the
-rem implemented mechanism). Acceptance tool: tools\kvmem_ws_probe.py.
+rem implemented mechanism). Acceptance tools: tools\kvmem_ws_probe.py (K1/K2),
+rem tools\kvmem_k3_probe.py (K3 retrieval quality).
 rem
 rem Delta vs tools/serve_gsq_prod029_n2.cmd:
 rem   1. VLLM_KVMEM_SW_WINDOW=163072 -> qwen3_next.py gives per_layer_sliding_window
@@ -32,6 +39,21 @@ rem   5. VLLM_KVMEM_WORKSPACE_MB=3072 -> 122 host slots (25.03 MiB per slot = on
 rem      1424-token page x 16 layers), shared by both attention groups.
 rem   6. VLLM_KVMEM_SELFTEST=1 -> the worker copies each stored page back and
 rem      compares it byte for byte (both directions) and logs the result.
+rem   7. VLLM_KVMEM_RAWK=1 (step 061) -> capture the pre-RoPE q/k of the 16
+rem      full_attention layers and build the Mean-K retrieval index. This also
+rem      forces those 16 layers onto the eager norm+RoPE path (the production
+rem      fused kernel exposes no pre-RoPE K), so the arm's numerics are its own
+rem      and PPL must NOT be compared across arms. UNSET THIS to reproduce the
+rem      step 060 arm, which was measured on the fused kernel.
+rem   8. VLLM_KVMEM_DUMP=<dir> (step 061) -> where the retrieval ranking is
+rem      written (one kvmem_retrieval_NNN.json per scored prompt).
+rem   9. --enforce-eager replaces --cudagraph-capture-sizes 1. Stage 1 is
+rem      specified as "text + no speculative + NO GRAPH MODE" (design §6), and
+rem      the capture has to run in the forward: an AOT fullgraph compile rejects
+rem      it outright (torch._dynamo.exc.Unsupported on the stash's side effects,
+rem      first observed as "logging.Logger method not supported"). Consequence:
+rem      this arm's prefill/decode speeds are NOT comparable with step 057/060,
+rem      which were measured with compilation on.
 rem Everything else (pool 3.4e9, nvfp4, mamba align, ssm bf16, G=8, pin shim,
 rem prefix caching) is byte-for-byte the production recipe.
 rem
@@ -66,6 +88,16 @@ set "VLLM_KVMEM_SW_WINDOW=163072"
 set "VLLM_KVMEM_WORKSPACE=1"
 set "VLLM_KVMEM_WORKSPACE_MB=3072"
 set "VLLM_KVMEM_SELFTEST=1"
+set "VLLM_KVMEM_RAWK=1"
+set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k3"
+rem K3 measurement knobs. The index stores at the finest granularity and the
+rem coarser ones are summed from it, so one 200K ingest reports every variant:
+rem granularity 32/64/128 (design risk R1: the paper uses 32-token blocks, the
+rem design's initial value is 128) x mode dot/cosine (the step 061 control run
+rem showed the raw dot product's ranking is carried by per-page magnitude).
+set "VLLM_KVMEM_INDEX_SUBBLOCK=32"
+set "VLLM_KVMEM_SCORE_GRANULARITIES=32,64,128"
+set "VLLM_KVMEM_SCORE_MODES=dot,cosine"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "LIB=C:\PROGRA~1\NVIDIA~2\CUDA\v13.3\lib\x64;%LIB%"
 del /q "G:\qwen3.8model\_tmp_prod029\vllm_offload_*.mmap" 2>nul
@@ -89,6 +121,6 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 8080 -ErrorActio
   --mamba-ssm-cache-dtype bfloat16 ^
   --kv-offloading-backend native ^
   --kv-offloading-size 8 ^
-  --cudagraph-capture-sizes 1 ^
+  --enforce-eager ^
   --dtype auto
 exit /b %errorlevel%

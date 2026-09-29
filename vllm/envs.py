@@ -2181,6 +2181,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_KVMEM_WORKSPACE": lambda: bool(
         int(os.getenv("VLLM_KVMEM_WORKSPACE", "0"))
     ),
+    # vllm-030win patch (step 061): capture the pre-RoPE q/k of the 16
+    # full_attention layers so the Mean-K retrieval index can be built (K3
+    # items 1-3). Requires VLLM_KVMEM_WORKSPACE; forces those layers onto the
+    # eager norm+RoPE path because the fused kernel exposes no intermediate.
+    "VLLM_KVMEM_RAWK": lambda: bool(int(os.getenv("VLLM_KVMEM_RAWK", "0"))),
 }
 
 

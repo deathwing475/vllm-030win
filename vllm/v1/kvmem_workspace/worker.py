@@ -14,6 +14,8 @@ back to the scheduler through a CUDA event, which is what keeps the source page
 out of the block pool until the bytes are safely on the host.
 """
 
+import json
+import os
 import time
 
 import numpy as np
@@ -22,8 +24,9 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.v1.kv_cache_interface import group_kernel_blocks
-from vllm.v1.kvmem_workspace import config
+from vllm.v1.kvmem_workspace import capture, config
 from vllm.v1.kvmem_workspace.groups import workspace_group_ids
+from vllm.v1.kvmem_workspace.index import KVMemMeanKIndex
 from vllm.v1.kvmem_workspace.metadata import (
     KVMemConnectorMetadata,
     KVMemWorkerMetadata,
@@ -98,6 +101,13 @@ class KVMemWorkspaceWorker:
         self._selftest_max_byte_diff = 0
         self.bytes_stored = 0
         self.store_seconds = 0.0
+
+        # K3: retrieval index (host-resident) and the trailing query span of
+        # the most recent prefill step of each trajectory.
+        self._index: KVMemMeanKIndex | None = None
+        self._last_query: dict[bytes, tuple[np.ndarray, dict[int, np.ndarray]]] = {}
+        self._retrieval_reports: list[dict] = []
+        self._score_seconds = 0.0
 
     # ------------------------------------------------------------------
     # registration
@@ -176,10 +186,137 @@ class KVMemWorkspaceWorker:
         sizes = torch.tensor([e[2] for e in entries], dtype=torch.int64)
         ops.swap_blocks_batch(src, dst, sizes)
 
+    # ------------------------------------------------------------------
+    # K3: retrieval index
+    # ------------------------------------------------------------------
+
+    def _ingest(self, metadata: KVMemConnectorMetadata) -> None:
+        """Fold this step's captured pre-RoPE K into the trajectory's index.
+
+        The step is attributed by absolute position, which is the same key the
+        workspace itself uses, so a prefix-cache hit (a step whose positions do
+        not start where the previous one ended) needs no special case: the rows
+        that fall inside a span are exactly that span's.
+        """
+        step = capture.drain()
+        if not step:
+            return
+        if self._index is None:
+            geometry = capture.stats().get("geometry")
+            if geometry is None:
+                return
+            self._index = KVMemMeanKIndex(*geometry)
+        positions = next(iter(step.values()))[0]
+        for span in metadata.spans:
+            mask = (positions >= span.start) & (
+                positions < span.start + span.num_tokens
+            )
+            if not mask.any():
+                continue
+            span_positions = positions[mask]
+            self._index.add(
+                span.trajectory,
+                span_positions,
+                {layer: k[mask] for layer, (_, _, k) in step.items()},
+            )
+            # The query span is the tail of the step, and the last prefill step
+            # is the one that holds the tail of the prompt, so overwriting here
+            # leaves exactly the right query behind. Rows are ordered, so the
+            # last `width` of the masked positions line up with the last
+            # `width` rows of q.
+            q_by_layer = {
+                layer: q for layer, (_, q, _) in step.items() if q.size
+            }
+            if q_by_layer:
+                width = min(len(q) for q in q_by_layer.values())
+                if len(span_positions) >= width:
+                    self._last_query[span.trajectory] = (
+                        span_positions[-width:],
+                        {layer: q[-width:] for layer, q in q_by_layer.items()},
+                    )
+
+    def _score(self, metadata: KVMemConnectorMetadata) -> None:
+        if self._index is None:
+            return
+        started = time.monotonic()
+        for request in metadata.score_requests:
+            entry = self._last_query.get(request.trajectory)
+            if entry is None:
+                logger.warning(
+                    "vllm-030win KVMem retrieval: no captured query span for "
+                    "trajectory %s (request %s); nothing to score",
+                    request.trajectory.hex()[:12],
+                    request.request_id,
+                )
+                continue
+            _, q_by_layer = entry
+            report = self._index.score(
+                request.trajectory,
+                q_by_layer,
+                block_size=request.block_size,
+                num_tokens=request.num_tokens,
+                sink_tokens=request.sink_tokens,
+                recent_tokens=request.recent_tokens,
+                topn=config.retrieval_topn(),
+            )
+            report["request_id"] = request.request_id
+            self._retrieval_reports.append(report)
+            self._write_report(report)
+            if "error" in report:
+                logger.error(
+                    "vllm-030win KVMem retrieval (req=%s): %s",
+                    request.request_id,
+                    report["error"],
+                )
+                continue
+            logger.info(
+                "vllm-030win KVMem retrieval (req=%s): %d tokens / %d pages "
+                "(block %d, sub-block %d), %d layer(s) scored, eligible %d, "
+                "top-%d = %s",
+                request.request_id,
+                report["num_tokens"],
+                report["num_pages"],
+                report["block_size"],
+                report["subblock"],
+                report["num_layers_scored"],
+                len(report["eligible"]),
+                report["topn"],
+                report["top_pages"],
+            )
+        self._score_seconds += time.monotonic() - started
+
+    def _write_report(self, report: dict) -> None:
+        directory = config.dump_dir()
+        if not directory:
+            return
+        try:
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(
+                directory, f"kvmem_retrieval_{len(self._retrieval_reports):03d}.json"
+            )
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(report, handle)
+            report["path"] = path
+        except OSError as exc:
+            logger.warning(
+                "vllm-030win KVMem retrieval: could not write %s (%s)",
+                directory,
+                exc,
+            )
+
+    def retrieval_reports(self) -> list[dict]:
+        return self._retrieval_reports
+
     def wait_for_save(self) -> None:
         metadata = self._pending
         self._pending = None
-        if metadata is None or not metadata.store_jobs:
+        if metadata is None:
+            return
+        if getattr(metadata, "spans", None):
+            self._ingest(metadata)
+        if getattr(metadata, "score_requests", None):
+            self._score(metadata)
+        if not metadata.store_jobs:
             return
         started = time.monotonic()
         for job in metadata.store_jobs:
@@ -309,4 +446,8 @@ class KVMemWorkspaceWorker:
             "selftest_pages": self._selftest_pages,
             "selftest_mismatch": self._selftest_mismatch,
             "selftest_max_byte_diff": self._selftest_max_byte_diff,
+            "capture": capture.stats(),
+            "index": self._index.stats() if self._index is not None else None,
+            "score_seconds": round(self._score_seconds, 3),
+            "retrieval_reports": len(self._retrieval_reports),
         }

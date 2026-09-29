@@ -272,6 +272,36 @@ class Qwen3NextSparseMoeBlock(nn.Module):
 
 
 _KVMEM_SW_LOGGED = False
+_KVMEM_RAWK_LOGGED = False
+
+
+def _kvmem_rawk_layer(config: Qwen3NextConfig, layer_idx: int) -> bool:
+    """vllm-030win patch (step 061): is this layer captured for the KVMem index?
+
+    Only the ``full_attention`` layers own a KV cache to index; the 48
+    ``linear_attention`` layers carry recurrent state instead. Returns False
+    unless ``VLLM_KVMEM_RAWK`` is armed, so an unarmed boot is unaffected.
+    """
+    global _KVMEM_RAWK_LOGGED
+    from vllm.v1.kvmem_workspace import capture
+
+    if not capture.enabled():
+        return False
+    layer_types = getattr(config, "layer_types", None)
+    if (
+        layer_types is None
+        or layer_idx >= len(layer_types)
+        or layer_types[layer_idx] != "full_attention"
+    ):
+        return False
+    if not _KVMEM_RAWK_LOGGED:
+        _KVMEM_RAWK_LOGGED = True
+        logger.info(
+            "vllm-030win patch (step 061): raw-K capture on the full_attention "
+            "layers (VLLM_KVMEM_RAWK); those layers use the eager norm+RoPE "
+            "path because the fused kernel exposes no pre-RoPE K"
+        )
+    return True
 
 
 def _kvmem_per_layer_sliding_window(
@@ -438,6 +468,16 @@ class Qwen3NextAttention(nn.Module):
             and (text_only or supports_mrope)
         )
 
+        # vllm-030win patch (step 061): the KVMem retrieval index needs the
+        # pre-RoPE K, and the fused kernel computes the norm and RoPE in one
+        # pass with no intermediate to read. Force the eager path on the 16
+        # full_attention layers while the capture is armed; the 48 GDN layers
+        # keep the fused kernel. Unset keeps upstream behaviour byte-for-byte.
+        self._kvmem_layer_idx = extract_layer_index(prefix)
+        self._kvmem_capture = _kvmem_rawk_layer(config, self._kvmem_layer_idx)
+        if self._kvmem_capture:
+            self.use_fused_qk_norm_rope_gate = False
+
     def _project_qkv_gate(
         self,
         qkv: torch.Tensor,
@@ -497,6 +537,21 @@ class Qwen3NextAttention(nn.Module):
         k = self.k_norm(k.view(-1, self.num_kv_heads, self.head_dim)).view(
             -1, self.num_kv_heads * self.head_dim
         )
+        if self._kvmem_capture:
+            # RoPE below rotates in place, so the pre-RoPE value has to be
+            # cloned out here. record() only stashes references; the host copy
+            # happens after the forward, outside any CUDA graph.
+            from vllm.v1.kvmem_workspace import capture
+
+            capture.record(
+                self._kvmem_layer_idx,
+                positions,
+                q,
+                k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 

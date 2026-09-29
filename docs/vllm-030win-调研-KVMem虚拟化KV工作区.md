@@ -516,6 +516,96 @@ DFlash2 投机解码（草稿 KV 与视窗的位置一致性）→ 图模式（F
 
 ---
 
+## 12.7 阶段 1 K3 前半实施机制（步骤 061：raw-K 捕获 + Mean-K 索引 + 页级检索打分）
+
+> 本节记录 §5.2（捕获钩子）与 §5.3（检索流水线）中**读取侧**前三项的落地机制与实测。**重物化（§5.3 的"重烘焙"与 §5.1 的槽位装配）未做**——本步只回答一个问题：**按 1424-token 页粒度、128-token 子块索引，检索到底能不能把含答案的那一页挑出来？**（风险登记册 R1。）
+
+### 12.7.1 为什么先做"打分"而不是先做"重物化"
+
+R1 说得很直白：论文用 32-token 块，我们的块粒度被引擎钉在 1456/1424 token，**检索可能根本无效**。如果检索无效，重物化（位置解耦 + 重 RoPE + 块表改写，本线最重的一块工程）就是白做。所以顺序是**先用一次 prefill 量出检索质量，再决定要不要建重物化**。
+
+因此本步的产物是一个**策略无关的测量工件**：引擎每个 prompt prefill 完成时，把「每一页的页级 logit（+ 每个 (模式, 粒度) 变体）」写进 `VLLM_KVMEM_DUMP`，由客户端探针（`tools/kvmem_k3_probe.py`，它才知道针在哪一页）判排名。
+
+### 12.7.2 落点（七处）
+
+| 层 | 落点 | 做什么 |
+|---|---|---|
+| 模型 | `model_executor/models/qwen3_next.py` | `_kvmem_rawk_layer()` 门控；命中时**关掉融合 kernel**（`use_fused_qk_norm_rope_gate=False`）；`_project_qkv_gate` 的 eager 分支里 `k_norm` 之后、`self.rotary_emb` 之前调 `capture.record(...)` |
+| 捕获 | `v1/kvmem_workspace/capture.py`（新） | 按层暂存（`positions.clone()` + `q[-span:].clone()` + `k.clone()`），`drain()` 在 forward 之后做 host 拷贝 |
+| 调度侧 | `v1/kvmem_workspace/manager.py` | 每步下发 `KVMemStepSpan(trajectory, start, num_tokens)`；prompt 完成的那一步下发 `KVMemScoreRequest`（判据 = `start < prompt_len ≤ start + num_tokens`，`prompt_len` 在 `update_state_after_alloc` 时固定，**不能用会随 decode 增长的 `request.num_tokens`**） |
+| 元数据 | `v1/kvmem_workspace/metadata.py` | `KVMemStepSpan` / `KVMemScoreRequest` 加入 `KVMemConnectorMetadata` |
+| 索引 | `v1/kvmem_workspace/index.py`（新） | 轨迹键 → 每层 fp32 子块和 + 计数；打分时归约到各粒度、各模式 |
+| worker | `v1/kvmem_workspace/worker.py` | `wait_for_save` 里 `capture.drain()` → 按位置区间归属轨迹 → `index.add`；`KVMemScoreRequest` → `index.score` → 写 JSON |
+| 配置 | `v1/kvmem_workspace/config.py` + `envs.py` | `VLLM_KVMEM_RAWK`、`VLLM_KVMEM_INDEX_SUBBLOCK`、`VLLM_KVMEM_SCORE_GRANULARITIES`、`VLLM_KVMEM_SCORE_MODES`、`VLLM_KVMEM_QUERY_SPAN`、`VLLM_KVMEM_RECENT`、`VLLM_KVMEM_TOPN` |
+
+**位置区间是必须的**：捕获只拿到绝对 `positions`，不知道属于哪条轨迹；`build_connector_meta` 在 `_update_after_schedule` **之前**调用（`scheduler.py:1379` vs `:1398`），所以那时 `request.num_computed_tokens` 仍是本步起始位置，能可靠地组成 `[start, start+n)`。
+
+### 12.7.3 捕获的四条限制
+
+1. **只对 16 层 `full_attention`**：48 层 GDN 没有 KV cache 可索引。
+2. **只对 `k.shape[0] > 1` 的步**：decode 步的单 token 不会成为工作区页，且单 token 步正是走图/编译的那一步。
+3. **必须 `clone`**：`ops.rotary_embedding` 是 in-place（`rotary_embedding/base.py:242-252` 注释明写），不 clone 拿到的就是旋转后的值。
+4. **必须关掉融合 kernel**：生产走 `fused_qk_rmsnorm_rope_gate`，norm 与 RoPE 在同一 kernel 里，抓不到中间量。代价 = **臂内数值自成一套，禁止跨臂比 PPL**（设计 §5.2 已认下）。
+
+**且 `record()` 不能出现在任何编译/图区域内**——首 boot 实测 `torch._dynamo.exc.Unsupported: logging.Logger method not supported for non-export cases`（AOT fullgraph 把 `capture.record` 连同一行 `logger.info` 一起吃了）。修法有二：把日志搬出 `record()`（搬到 `drain()`），以及**本臂改用 `--enforce-eager`**——这正是设计 §6 对阶段 1 的要求（"文本 + 无投机 + **无图模式**"）。**副作用：本臂的 prefill/decode 速度不可与 057/060 比较**（那两个臂是带编译跑的）。
+
+### 12.7.4 索引与打分
+
+- **存储粒度 = 最细粒度**（`VLLM_KVMEM_INDEX_SUBBLOCK`）。粗粒度由细粒度**求和**得到（和相加、计数相加 ⇒ 均值精确），所以**一次 prefill 可以报告多个粒度**，不必一轮一个点。单测已证：32-索引导出的 `dot@128` 与 128-索引直接算的 `dot@128` 最大差 **6.99e-10**。
+- 内存：子块 32 时 8192 子块 × 16 层 × 1024 维 × 4 B ≈ **537 MB/轨迹**（host，只增不减）。
+- **打分**：`logit = q·k̄/√d`（`dot`）或先各自归一化（`cosine`）→ 对 query span 取均值 → 页内子块取 **max** → 对候选页 softmax、对 query token 求和。`dot`/`cosine` × 32/64/128 共 6 个变体同时输出。
+- **候选集**：排除 sink（首页）与 recent 尾部（`VLLM_KVMEM_RECENT`，默认 32768 = 23 页）。
+
+### 12.7.5 实测（步骤 061）
+
+**臂** = `tools/serve_gsq_kvmem_ws163k.cmd`（池 3.4e9 / `--max-model-len 262144` / `W=163072` / **`--enforce-eager`** / 无投机 / 无 offload 8 GiB 区），**探针** = `tools/kvmem_k3_probe.py`，**离线复核** = `tools/kvmem_k3_analyze.py`，**单测** = `tools/kvmem_index_test.py`。prompt = 198,3xx token（≈140 页），query = **聚焦问题重复 8 次**（使最后 256 token 几乎全是问题本身）；`recent=32768` ⇒ **候选 116 页**；针 = 15 token。
+
+| 项 | 数据 |
+|---|---|
+| 捕获 | `KVMem raw-K capture armed (num_heads=24, num_kv_heads=4, head_dim=256, query_span=256)`；首次 drain = **16 层 × 1024 token + q tail 256 行**（每步 ≤ `max_num_batched_tokens`） |
+| 索引覆盖 | `stored_subblocks` 1549 ≈ 198231/128 ✓；`num_pages` 140 = ⌈198231/1424⌉ ✓ |
+| 打分耗时 | 6 个变体（dot/cosine × 32/64/128）单次 ≈ 秒级（含在 prefill 收尾里） |
+| 冷 200K prefill | **TTFT ≈ 266 s**（≈745 tok/s；带编译的 057/060 是 ~249 s ⇒ eager 代价约 +7%，**不可直接比较**） |
+
+**检索质量（同页有针 vs 无针，页 0..68 在两次请求里 token 完全相同 ⇒ 可直接对减）**：
+
+| 变体 | d16（针在 **page 19**，**窗口外**，偏移 28,366） | d50（针在 **page 68**，窗内，偏移 97,064） |
+|---|---|---|
+| `dot@32` | 无针 rank 8 / logit 19.66 → **有针 rank 2 / 25.57（Δ+5.91）** | 无针 rank 28 / 17.64 → **有针 rank 1 / 26.83（Δ+9.19）** |
+| `cosine@32` | rank 8 → **rank 2**（Δ+0.26） | rank 24 → **rank 1**（Δ+0.39） |
+| `dot@64` | rank 9 → **rank 2**（Δ+6.76） | rank 40 → rank 2（Δ+7.85） |
+| `dot@128` | rank 10 → **rank 7**（Δ+3.00） | rank 28 → rank 2（Δ+7.64） |
+| `cosine@128` | rank 8 → rank 5（Δ+0.15） | rank 29 → rank 2（Δ+0.36） |
+
+**读数**：
+1. **检索确实有信号，而且不小**：针只占一页 1424 token 里的 15 个，却把该页的页级 logit 抬高 **+5.9（窗口外）/ +9.2（窗内）**，排名从 8→2 与 28→1。**6 个变体全部把针页放进 top-16**。
+2. **粒度是一等旋钮，设计初值 128 偏粗**：d16 上 `dot@32` rank 2 vs `dot@128` rank 7，趋势 **32 > 64 > 128**，与 R1 的预测（论文 32-token 块 vs 我们的页）一致 ⇒ **后续以 32 为准**（代价：索引 537 MB/轨迹 host 常驻）。
+3. **`cosine` 不解决偏置也不提升排名**：它在 d16/d50 给出与 `dot` 相同的名次（2/1），只是把 logit 压到 [0,1]。⇒ **残余偏置不是"页均值范数"效应**。
+4. **残余"早期页偏置"是真实的、且成因未明**：无针控制组的 logit 前列是 **页 2 / 5 / 1 / 11 / 8 / 3（22.7–26.2）**，把 top 槽位占掉了；而页均值范数几乎恒定（19.85–23.73，中位 20.83，Pearson(norm, logit)=0.474，范数只变 ±7% 而 logit 变 3×）⇒ **不是范数**。**这是本步留下的头号挂账**（它直接吃掉检索槽位）。
+
+**两个查出来并修掉的真缺陷（都属测量层，都会给出错误结论）**：
+1. **页内归约走错页边界**。`block_size // granularity` 分组假设粒度整除页长，而 **1424 = 16×89，32/64/128 都不整除**：128 子块时每页偏 **16 token**，到第 19 页引擎的"页 19"已偏离真实页 **304 token**。同一批数据在修前读出来是"rank 74/116 阴性"，修后是"rank 2/116 阳性"——**修前那版结论已作废**。修法 = 按 `token 偏移 // block_size` 归属（`_page_reduce`，`np.maximum.reduceat`），并承认**子块可跨页**（1424/128 = 11.125 ⇒ 每 8 页有一个跨界子块，其尾部内容不计入下一页）。单测已钉死：标记 token 放在页 1/19/70 三处 × 三粒度，top 页必须等于 `offset // block_size`（9/9 通过）。
+2. **AOT fullgraph 编译拒绝捕获**。首 boot 直接 `torch._dynamo.exc.Unsupported: logging.Logger method not supported for non-export cases`（`capture.record` 连同一行 `logger.info` 被吃进编译区）。⇒ 日志搬出 `record()`（搬到 `drain()`）+ **本臂改 `--enforce-eager`**（设计 §6 对阶段 1 本来就要求"无图模式"）。
+
+**单测（`tools/kvmem_index_test.py`，合成数据，先于引擎跑）**：①子块均值 = 喂入行的算术均值（max diff 6.1e-5 = fp16 量化）；②相邻子块计数正确、未触及子块恒零；③sink 页 0 与 recent 尾页**不在候选集**；④打分两次调用逐位一致；⑤**粗粒度 = 细粒度精确求和**（32-索引导出的 `dot@128` vs 128-索引直接算的 `dot@128`，max diff **6.99e-10**）；⑥`cosine` 模式同样把针页排第一；⑦页边界对齐 9/9。
+
+### 12.7.6 本步的边界（勿误读）
+
+- **只做到"存得下、取得回、不泄漏、能排序"**：**没有任何页被放回视窗**，所以窗外 needle 仍然**答不出来**（`needle_hit=false` 是预期）。dump 说的是"检索**会不会**找到"。
+- 本臂**无投机、无图模式**（阶段 1 判据不含性能）。
+- 工作区与索引**只增不减**（无 LRU/GC）；多轨迹未测（`--max-num-seqs 1`）。
+- **臂内自洽**：eager 路径与融合 kernel 数值不逐位一致，禁止跨臂比 PPL（设计 §5.2）。
+- **`dot@32` 是当前最好变体，但"最好"仅指把针页送进 top-2**；残余早期页偏置仍占着 top 槽位（§12.7.5 读数 4），**检索槽位可用性未解决**。
+
+### 12.7.7 本步留下的挂账（按优先级）
+
+1. **残余早期页偏置的成因**（读数 4）：无针时页 1/2/5/8/11 就有 22.7–26.2 的 logit，把检索槽位占掉。已排除"页均值范数"（范数恒定 ±7%、Pearson 0.474）。候选解释：文档是 3 个单元循环 16 次 ⇒ 早期页更"模板化"；或 `k_norm` 的**学习权重**在某些维度上系统性偏置。**下一步应把「页 2 为什么天然高分」查清**，否则重物化做完也拿不到有效检索。
+2. **重物化（§5.1 槽位装配 + §5.3 重烘焙）**：位置解耦 + 重 RoPE + 块表改写。已知的唯一缝 = `gpu_model_runner.py` 的 `positions`（2204-2207 重建、2213 派生 `slot_mapping`、无任何现成钩子），且 `update_block_table` 只在 flash_attn/mamba 后端实现、**flashinfer（nvfp4 路径）没有**。这是本线最重的一块工程。
+3. **查询 span 的自动界定**：本步用"尾部 256 token"当查询；真实 agent 轮的 delta 会更聚焦。设计 §5.4 的 LCP 差量才是正解。
+4. **索引只增不减**：无跨会话淘汰；`num_subblocks` 按 262,144 上限预分配（32 子块时 537 MB/轨迹）。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |
