@@ -372,6 +372,78 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
             ms="%.1f" % ((time.perf_counter() - t) * 1e3), mem=_mem())
         return r
 
+    def wrap_load_model_viscpu(self, orig, *a, **k):
+        """步骤 053：VLLM_DBG_VIS_CPU=1 时视觉塔驻留 CPU（省 0.86 GiB 独显，
+        对冲余量悬崖）；SDPA 注意力 + 原生 pos-embed 插值 + 编码输出回 GPU。
+        未设旗标 = 逐字节走原路径（生产零影响）。
+        挂点 = Worker.determine_available_memory：必然晚于 load_model
+        （load_model 与 watcher patch 存在竞态，0.3s 轮询输过一次）、早于
+        KV 池分配——塔移 CPU + empty_cache 恰好落在池分配之前。"""
+        if os.environ.get("VLLM_DBG_VIS_CPU") != "1":
+            return orig(self, *a, **k)
+        try:
+            import vllm.model_executor.models.qwen3_vl as _q3vl
+            if _q3vl.HAS_TRITON:
+                _q3vl.HAS_TRITON = False
+                log("VIS_CPU", step="has_triton_off")
+        except Exception as e:
+            log("VIS_CPU_ERR", where="pre", err=repr(e)[:160])
+        try:
+            model = self.model_runner.get_model()
+            vis = getattr(model, "visual", None)
+            if vis is not None and next(vis.parameters()).device.type != "cpu":
+                import torch
+                from vllm.model_executor.layers.attention.mm_encoder_attention import (
+                    MMEncoderAttention,
+                )
+                from vllm.model_executor.layers.rotary_embedding.common import (
+                    ApplyRotaryEmb,
+                )
+                from vllm.v1.attention.backends.registry import AttentionBackendEnum
+                vis.to("cpu")
+                torch.cuda.empty_cache()
+                n_rope, n_mm = 0, 0
+                for m in vis.modules():
+                    if isinstance(m, ApplyRotaryEmb):
+                        m._forward_method = m.forward_native
+                        n_rope += 1
+                    elif isinstance(m, MMEncoderAttention):
+                        m.attn_backend = AttentionBackendEnum.TORCH_SDPA
+                        m.is_flash_attn_backend = False
+                        m._fa_version = None
+                        n_mm += 1
+                # vllm::torch_sdpa_wrapper 自定义 op 只注册了 CUDA kernel
+                # （CPU 张量 NotImplementedError）——eager 路径直接换成
+                # 纯 python 实现（F.scaled_dot_product_attention，设备无关），
+                # 绕开 torch.ops 分发；_forward_sdpa 是 by-value 导入，须改
+                # mm_encoder_attention 模块属性。
+                import vllm.model_executor.layers.attention.mm_encoder_attention as _mea
+                import vllm.v1.attention.ops.vit_attn_wrappers as _vitw
+                _mea.vit_torch_sdpa_wrapper = _vitw.torch_sdpa_wrapper
+                _vitw.vit_torch_sdpa_wrapper = _vitw.torch_sdpa_wrapper
+                # 编码输出（CPU）在进 LLM 前必须回 GPU——embed_input_ids 的
+                # 布尔掩码赋值要求两侧同设备。
+                dev = next(model.language_model.parameters()).device
+                orig_em = model.embed_multimodal
+
+                def _em(**kw):
+                    out = orig_em(**kw)
+                    if isinstance(out, tuple):
+                        return tuple(
+                            t.to(dev, non_blocking=True) if t.is_cpu else t
+                            for t in out)
+                    if out is not None and out.is_cpu:
+                        out = out.to(dev, non_blocking=True)
+                    return out
+
+                model.embed_multimodal = _em
+                log("VIS_CPU", step="tower_cpu", rope_native=n_rope,
+                    sdpa=n_mm, dev=str(next(vis.parameters()).device),
+                    out_dev=str(dev), mem=_mem())
+        except Exception as e:
+            log("VIS_CPU_ERR", where="post", err=repr(e)[:200])
+        return orig(self, *a, **k)
+
     _LAUNCH_N = [0]
 
     def _census_args(args, tag):
@@ -444,6 +516,24 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
 
                         w._dbg_wrapped = True
                         setattr(mod, obj_name, w)
+                elif kind == "viscpu":
+                    cls = getattr(mod, obj_name, None)
+                    fn = getattr(cls, m_name, None) if cls is not None else None
+                    if fn is None:
+                        # gpu_worker 是重模块：刚进 sys.modules 时 class 可能
+                        # 还没定义完。撤销计数，watcher 下轮 0.3s 重试。
+                        n -= 1
+                    elif not getattr(fn, "_dbg_wrapped", False):
+                        import functools
+
+                        orig = fn
+
+                        @functools.wraps(orig)
+                        def w(self, *a, **k):
+                            return wrap_load_model_viscpu(self, orig, *a, **k)
+
+                        w._dbg_wrapped = True
+                        setattr(cls, m_name, w)
                 elif kind == "repack":
                     cls = getattr(mod, obj_name, None)
                     fn = getattr(cls, m_name, None) if cls is not None else None
@@ -514,6 +604,9 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
         "vllm.v1.worker.gpu.spec_decode.dflash.speculator": [
             ("custom", "load_dflash_model", "", "load_dflash_model"),
         ],
+        "vllm.v1.worker.gpu_worker": [
+            ("viscpu", "Worker", "determine_available_memory", "vis_mem"),
+        ],
         "humming.ops.launcher": [
             ("custom2", "launch_kernel", "", "humming.launch_kernel"),
         ],
@@ -524,7 +617,12 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
             log("WATCH_START", py=sys.executable, argv=" ".join(sys.argv)[:160])
             jobs_map = JOBS
             if _MIN:
-                jobs_map = {k: v for k, v in JOBS.items() if "dflash" in k}
+                # MIN 只保留 dflash 钉快档链；vis_cpu 的 gpu_worker 作业例外
+                # （其 wrapper 自带 VLLM_DBG_VIS_CPU 门，未设旗标时零行为）。
+                jobs_map = {
+                    k: v for k, v in JOBS.items()
+                    if "dflash" in k or "gpu_worker" in k
+                }
             deadline = time.time() + 1200
             done = set()
             while time.time() < deadline and len(done) < len(jobs_map):
@@ -533,9 +631,12 @@ if os.environ.get("VLLM_DBG_TRACE") == "1":
                         continue
                     if mod_name in sys.modules:
                         try:
-                            _patch_module(mod_name, mod_jobs)
-                            done.add(mod_name)
-                            log("PATCHED", mod=mod_name)
+                            # done 准则 = 计数达标（viscpu 在半导入时撤销计数，
+                            # 自动重试到 class 可用为止；其余作业首轮即达标，
+                            # 行为与旧版 done-on-sight 等价）。
+                            if _patch_module(mod_name, mod_jobs) >= len(mod_jobs):
+                                done.add(mod_name)
+                                log("PATCHED", mod=mod_name)
                         except Exception:
                             log("PATCH_FAIL", mod=mod_name,
                                 tb=traceback.format_exc()[-240:])
