@@ -108,6 +108,33 @@ rem quantized W8A8 11547 ms; bf16 is already the fastest dense GEMM dtype on
 rem Zen4 -- int8 saves RAM only). Remaining bottleneck after this fix = CPU
 rem SDPA (~44 ms/layer; flash-CPU kernel already the torch default, no faster
 rem backend exists; a custom attention kernel is the next lever).
+rem 2026-09-29 step 055 (VERIFIED, the OMP=8 speedup is real): the image
+rem probe (same requests as the 053 baseline) reads img_256px 1.11/1.25 ->
+rem 0.77 s, img_1024px 12.69/13.57 -> 5.14 s, img_2048px 13.25/13.92 ->
+rem 5.35 s (a 512-token image is ~2.5x faster end to end; the 64-token
+rem floor case is decode-dominated and unchanged at 3.1 s). Backing out the
+rem ~2.7 s GPU leg gives encode 10.1 -> ~2.4 s (~4.2x, inside the Amdahl
+rem window of the measured GEMM 4.8x / SDPA 6.2x thread scaling).
+rem OMP=8 is INERT for the GPU decode loop: on a CLEAN boot (evicted 0) it
+rem reads 8k 120.38 / 8.2k 117.20, the same band as no-OMP clean boots
+rem (129.28/123.52, 118.14/114.27, 124.37/108.14); engine logs confirm the
+rem two states ("leaving Torch threads at 8 for serving" vs "Reducing Torch
+rem threads from 8 to 1 for serving").
+rem CAVEAT (step 055 finding, P3 open): this VISION arm boots into the
+rem step-049 headroom cliff far more often than the text-only production
+rem bat -- 10 of 16 arm boots this session evicted 260-434 MiB of target
+rem weight pages (8k steady 92-99 = DEGRADED) while production booted clean
+rem 3/3, including a paired A/B (vis 324/324 MiB vs production 0/0 MiB,
+rem back to back). It is NOT caused by OMP: the no-OMP twin arm evicts too
+rem (306/382/324). Candidate cause (not yet convicted): mm-path GPU
+rem allocations that happen AFTER the KV pool is built (encoder cache with
+rem a 1024-token budget + multi-modal warmup) -- consistent with step 049's
+rem "a new allocation on the discrete GPU triggers the cliff"; both arms
+rem log the same "Initial free memory 14.68 GiB", so the extra footprint
+rem appears after pool creation. OPERATIONAL: tools/prod_watchdog.ps1's 8k
+rem threshold 105 already covers this (an evicted boot is judged SLOW and
+rem restarted, re-rolling to a clean tier). Also note the 053-era reading
+rem of 102-107 tok/s was itself an EVICTED band, not a text regression.
 rem 2026-09-29 step 053 (VISION CPU arm, EXPERIMENT - not production default):
 rem user directive: keep the vision tower in system RAM and run it on CPU,
 rem and bound per-image tokens (min/max) so image turns are not slow.
