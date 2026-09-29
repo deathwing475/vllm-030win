@@ -93,6 +93,21 @@ rem measured 25.86-26.45ms vs 27.0ms over 3 boots (step 026, -4%).
 rem --cudagraph-capture-sizes 3 kept. Long-stability soak + correctness
 rem gates (step 027) precede this file becoming the live production config.
 rem Rollback of this swap = re-add the compilation-config line above.
+rem 2026-09-29 step 054 (vision CPU speed; user directive: image tok speed is
+rem the goal, RAM does not matter): set OMP_NUM_THREADS=8. vLLM's worker pins
+rem torch intra-op threads to 1 after warmup (gpu_worker.py
+rem set_torch_threads_for_runtime; rationale = OMP spin-wait stealing cycles
+rem from the GPU serving loop), which throttled the CPU vision tower to
+rem ~170 GFLOP/s effective. An EXTERNAL OMP_NUM_THREADS is respected by the
+rem engine (it logs a warning and keeps the setting). Measured on 9800X3D
+rem (AVX-512_BF16): GEMM 604 -> 2907 GFLOP/s (4.8x), SDPA 272 -> 44 ms
+rem (6.2x); the 1-thread cost model (375 ms/layer x 27 layers = 10.1 s)
+rem matches the observed ~13 s per 512-token image. int8 measured NO-GO for
+rem speed on this CPU (bf16 F.linear 5.9 ms vs _weight_int8pack_mm 690 ms /
+rem quantized W8A8 11547 ms; bf16 is already the fastest dense GEMM dtype on
+rem Zen4 -- int8 saves RAM only). Remaining bottleneck after this fix = CPU
+rem SDPA (~44 ms/layer; flash-CPU kernel already the torch default, no faster
+rem backend exists; a custom attention kernel is the next lever).
 rem 2026-09-29 step 053 (VISION CPU arm, EXPERIMENT - not production default):
 rem user directive: keep the vision tower in system RAM and run it on CPU,
 rem and bound per-image tokens (min/max) so image turns are not slow.
@@ -150,6 +165,7 @@ set "VLLM_DBG_TRACE=1"
 set "VLLM_DBG_MIN=1"
 set "VLLM_DBG_PIN=1"
 set "VLLM_DBG_VIS_CPU=1"
+set "OMP_NUM_THREADS=8"
 set "VLLM_KV_GROUP_SIZE=8"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "LIB=C:\PROGRA~1\NVIDIA~2\CUDA\v13.3\lib\x64;%LIB%"
