@@ -48,6 +48,16 @@
 
 ---
 
+## OrcaSAQ2 EXL3 集成（2026-09-29，步骤 059）
+
+- **OrcaSAQ2 插件**：`Continuum-AI-Corp/OrcaSAQ2-kernel` 的 vLLM plugin，专门解析 OrcaSAQ2 的 `tensor_storage`、mixed-bit、mul1、int8 embedding 和 EXL3 lm_head；步骤 059 使用 commit `7ddffb1`。
+- **原生扩展**：`G:\\exllamav3-master` 编译出的 ExLlamaV3 1.5.3 Windows CUDA extension；目标 venv 中扩展文件为 `exllamav3_ext.cp312-win_amd64.pyd`。
+- **验证结论**：Qwen3_5ForCausalLM OrcaSAQ2 checkpoint 在 vLLM 0.29、TP1、eager、16K、GPU utilization 0.88 下权重加载 11.46 GiB；8001 服务 ready；chat 请求返回 4 且 finish=stop。
+- **运行约束**：FlashInfer Windows JIT 需要 `FLASHINFER_WORKSPACE_BASE=C:/fw` 和 `FLASHINFER_EXTRA_LDFLAGS=-LG:/qwen3.8model/vllm-win029/Lib/site-packages/tvm_ffi/lib -ltvm_ffi`；checkpoint 原始索引名为 `model.safetensors.index (1).json`，服务目录需有标准别名 `model.safetensors.index.json`。
+- **回滚**：`tools/revert_orcasaq2.py` 卸载 Orca/ExLlamaV3 并安全移除生成的索引别名；不触碰生产 GSQ。
+
+---
+
 ## 外置 EXL3 插件集成（2026-09-29，步骤 058）
 
 - **vllm-exl3**：外置的 `--quantization exl3` 插件，不是本仓 `vllm/` 源码的一部分；本步使用 `G:\vllm-exl3-0.5.0`，许可证为 AGPL-3.0-only，记录仓继续保持 Apache-2.0。
