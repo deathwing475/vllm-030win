@@ -13,25 +13,21 @@
 - 现役 GSQ vLLM 0.29 栈：生产配置稳定，KVMem 默认关闭。
 - KVMem 步骤 057：`VLLM_KVMEM_SW_WINDOW=N` 已完成“有界 prefill”半边。
 - 057 已证明：冷 210K/256K prompt 可跑，窗内 needle 命中，窗外 needle 必失。
-- 但滑出窗口的历史 KV 被丢掉，尚未写入 KVMem workspace。
+- **KVMem 步骤 060：K1 copy-before-free + K2 准入守卫 = GO**（见 §3 阶段 K1/K2 的完成记录）。滑出窗口的历史页现在会写进 host 工作区（键 `(轨迹, token 偏移)`），往返逐字节一致，零丢页零泄漏；上限不可被越过，视窗装不下在 boot 期响亮失败。
 - OrcaSAQ2 步骤 059：ExLlamaV3 1.5.3 native CUDA + OrcaSAQ2 plugin 已跑通，端口 8001 的 chat smoke 通过。
 
 ### 1.2 未完成的核心工程
 
-**KVMem 仍未完整移植。** 当前缺少：
+**KVMem 的阶段 1 正确性主体（K3）仍未开工。** 当前缺少：
 
-- copy-before-free；
-- trajectory/page key；
-- pending-job 生命周期记账；
-- host workspace store/load；
-- raw-K 捕获；
-- Mean-K 索引；
-- softmax-over-pages 检索；
-- fixed-slot rematerialization；
-- workspace/viewport admission 400 守卫；
-- identity canary、紧预算 retrieval needle、冷 262K、串台和往返单测出口。
+- raw-K 捕获（RoPE 前，只对差量 token）；
+- 128-token sub-block Mean-K 索引；
+- page 级 softmax-over-pages 检索；
+- fixed-slot rematerialization（**从 raw K 单次重建**，禁 delta re-RoPE）；
+- identity canary、紧预算 retrieval needle、40/55/70/85% 多深度、串台检测、重物化往返单测；
+- 工作区淘汰策略（LRU/GC/跨会话容量）与多轨迹并发。
 
-因此，步骤 057 只能写成“阶段 1a 有界 prefill GO”，不能写成 KVMem 已完成。
+因此，步骤 057 + 060 只能写成“阶段 1a 有界 prefill GO + K1/K2 GO”，**不能写成 KVMem 已完成**。
 
 ## 2. 总路线裁定
 
@@ -60,41 +56,39 @@ Orca 的步骤 059 smoke 只作为后续兼容基线，不能倒置主线优先�
 
 ### 阶段 K1：copy-before-free（1a-2）
 
-落点：
+**✅ 已完成（步骤 060，GO）。** 落点与实现：
 
 ```text
-v1/core/single_type_kv_cache_manager.py
-_remove_blocks_in_range
+v1/core/single_type_kv_cache_manager.py   _remove_blocks_in_range + _retain_for_workspace
+v1/core/kv_cache_manager.py               take_workspace_evictions
+v1/core/sched/scheduler.py                register_workspace_retained_blocks + block_state 字段
+v1/core/sched/output.py                   KVConnectorBlockState.workspace_evictions
+.../kv_connector/v1/base.py                register_workspace_retained_blocks (默认拒绝)
+v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.py
 ```
 
 在 `block_pool.free_blocks(freed)` 之前：
 
-1. 判断块是否属于 KVMem workspace 轨迹；
-2. 用 `(trajectory_key, page_index)` 而不是 block hash 建立工作区键；
-3. 将页面提交到 host store；
-4. 把 pending job 绑定到页面生命周期；
-5. 拷贝完成前禁止页面回池；
-6. copy 失败必须让请求显式失败，不能静默丢历史。
-
-复用已有 `v1/kv_offload/` 的 CPU/pinned/mmap 层和 connector pending-job 账本，但不把 prefix-cache hash 当成 workspace identity。
+1. ✅ 判断块是否属于 KVMem workspace 轨迹（滑窗组 + `VLLM_KVMEM_WORKSPACE` 门控）；
+2. ✅ 用 `(trajectory, token 偏移)` 而不是 block hash 建立工作区键；
+3. ✅ 将页面提交到 host store（pinned，`swap_blocks_batch`）；
+4. ✅ 把 pending job 绑定到页面生命周期（`torch.cuda.Event` 完成回传）；
+5. ✅ 拷贝完成前禁止页面回池（ref_cnt 不递减，完成时恰好释放一次）；
+6. ✅ copy 失败/工作区满必须显式可见（worker 抛错；满则逐页 WARNING + `pages_dropped` 计数，绝不静默）。
 
 出口：滑出窗口的历史页可被重新加载，且不会出现 use-after-free、重复回池或静默丢页。
 
+**实测**：冷 210K → 66 entries 淘汰 / 66 stored / 0 dropped；冷 258,854 → 94/122 slots / 0 dropped；往返自检 8 页 × 16 层 byte-identical；跨请求同轨迹；每 job "released N block(s)" 恰好一次；0 次 full/stray/unregistered 告警。
+
 ### 阶段 K2：准入守卫
 
-分别验证两个上限：
+**✅ 已完成（步骤 060）。** 两个上限：
 
-- workspace 上限：262,144 token；
-- 当前 execution viewport 上限。
+- workspace 上限 262,144 token：`prompt > 上限` → **HTTP 400**（既有 `_validate_prompt_len`）；
+- `prompt + max_tokens`：**上游把 `max_tokens` 夹到 `上限 − prompt`**（实测 `258,854 + 3,290 = 262,144` 恰好等于 `max_model_len`）⇒ 工作区**不可能被越过**；另加 KVMem 守卫兜底（`input_processor.py`，对绕过夹紧的路径生效）；
+- execution viewport 上限：`KVMemWorkspaceScheduler.bind_gpu_block_pool` 在 boot 期按 `max_admission_blocks_per_request` 求和校验，不足则**明确 RuntimeError 拒绝启动**（实测 `needs 234 / pool has 259`）——不再出现 `scheduler_reserve_full_isl=True` 把请求静默留在等待队列。
 
-要求：
-
-- `prompt > workspace_limit` 返回干净 400；
-- `prompt + max_tokens > workspace_limit` 返回干净 400；
-- viewport 装不下返回干净 400 或明确 admission error；
-- 禁止 `scheduler_reserve_full_isl=True` 把请求静默留在等待队列。
-
-### 阶段 K3：阶段 1 正确性主体
+### 阶段 K3：阶段 1 正确性主体（**当前头名，未开工**）
 
 按既定固定槽位布局：
 
@@ -104,7 +98,7 @@ _remove_blocks_in_range
 
 实现并验证：
 
-1. raw-K 在 RoPE 前捕获；
+1. **raw-K 在 RoPE 前捕获**（eager 路径 + 显式 clone，只对差量 token；生产走融合 kernel 抓不到中间量）——**K3 的第一件事**；
 2. 128-token sub-block Mean-K 索引；
 3. page 级 softmax-over-pages 检索；
 4. 固定槽位布局，query 位置不随选页变化；
@@ -187,10 +181,10 @@ _remove_blocks_in_range
 
 ## 6. 当前结论
 
-- KVMem 阶段 1a 有界 prefill：GO；完整 workspace：未完成。
-- 当前真正下一步：**KVMem K1 copy-before-free**。
+- KVMem 阶段 1a 有界 prefill：GO（057）；**K1 copy-before-free：GO（060）**；**K2 准入守卫：GO（060）**；完整 workspace 的**读取侧（检索/重物化）未开工**。
+- 当前真正下一步：**KVMem K3 —— raw-K 捕获 → Mean-K 索引 → softmax-over-pages 检索 → 固定槽位重物化**。
 - Orca native CUDA + auto KV + eager chat：GO，仅作为兼容基线。
 - Orca NVFP4：未测。
 - Orca MTP：未测。
 - Orca DFlash2：正式纳入，但需要 Orca adapter 和匹配 draft。
-- Orca KVMem：顺延到 GSQ K1-K3 和 Orca O1 之后。
+- Orca KVMem：顺延到 GSQ K3 和 Orca O1 之后。

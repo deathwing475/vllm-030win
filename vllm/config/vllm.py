@@ -982,6 +982,12 @@ class VllmConfig:
                 config_connector = "SimpleCPUOffloadConnector"
             else:
                 config_connector = "OffloadingConnector"
+            # vllm-030win patch (step 060): with the KVMem workspace armed the
+            # workspace store takes over the offloading slot, so the KVMem arm
+            # keeps the production offload flags and differs by one env var
+            # (design §3.4: the workspace replaces the prefix-cache offload).
+            if envs.VLLM_KVMEM_WORKSPACE:
+                config_connector = "KVMemConnector"
             self.kv_transfer_config.kv_connector = config_connector
             self.kv_transfer_config.kv_connector_extra_config.update(
                 {"cpu_bytes_to_use": kv_offloading_size * (1 << 30)}

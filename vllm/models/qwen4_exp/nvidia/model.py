@@ -644,6 +644,7 @@ class Qwen4ExpForCausalLM(
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
+            quant_config=self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -1012,7 +1013,14 @@ class Qwen4ExpForConditionalGeneration(
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = self.hf_to_vllm_mapper | WeightsMapper(
-            orig_to_new_substr={"mtp.": None},
+            orig_to_new_substr={
+                "mtp.": None,
+                # EXL3 packs ship split vision q/k/v trellis tensors next to
+                # the fused bf16 attn.qkv this module holds; drop the split ones.
+                ".attn.q_proj.": None,
+                ".attn.k_proj.": None,
+                ".attn.v_proj.": None,
+            },
             orig_to_new_prefix={"visual.": None} if self.language_model_only else {},
         )
         loader = AutoWeightsLoader(

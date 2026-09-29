@@ -1,9 +1,9 @@
 # 调研 — KVMem 虚拟化 KV 工作区（vLLM 0.29 栈实现方案）
 
-> **状态：设计定稿，未开工（2026-09-29 立项，四轮拷问对齐完成）。**
+> **状态：设计定稿；阶段 1a 已开工——有界 prefill（057）+ copy-before-free 与准入守卫（060）已 GO，检索/重物化（K3）未开工。**
 > 本文是这条新线的**唯一设计权威**：目标、决策记录、架构、接口落点、参数标定、阶段出口、验证台口径、风险登记册。
-> 接手者先读本文，再读《交接提示词.md》顶部收档块。
-> 相关步骤号：**步骤 056（立项与设计调研，未开工）**。
+> 接手者先读本文，再读《交接提示词.md》顶部收档块。**§12.1-12.3 = 阶段 1a 有界 prefill（057）｜§12.5 = K1 copy-before-free（060）｜§12.6 = K2 准入守卫（060）｜§12.4 = 阶段 1a 剩余清单（已全部完成）。**
+> 相关步骤号：**步骤 056（立项与设计调研）**、**057（阶段 1a 有界 prefill，GO）**、**060（K1 copy-before-free + K2 准入守卫，GO）**。
 
 ---
 
@@ -439,8 +439,80 @@ DFlash2 投机解码（草稿 KV 与视窗的位置一致性）→ 图模式（F
 ### 12.4 下一步（阶段 1a 剩余工作）
 
 1. ~~**W=163,072 复验**（阶段 1 主配置的窗口；判据 = 冷 262K prompt 仍能跑完 + 池不爆）。~~ **✅ 已完成（057 收尾补跑）**：`275,997 tokens / 1.05x @262,144`、冷 256K 320.2 s 跑通、窗外 needle 仍未命中。**只剩 5% 并发余量**是本配置的紧处（池值不能动）。
-2. **1a-2：copy-before-free 钩子**（把滑出窗口的块写进 KVMem 工作区，而非丢弃）——这是"溢写"的另一半。
-3. **准入守卫复核**：`prompt + max_tokens > 工作区上限(262,144)` 时返回 400（现由 `--max-model-len` 的 `_validate_prompt_len` 覆盖；需复核 KVMem 语义下"池"与"视窗"两个上限都要有干净 400，而不是卡在等待队列）。
+2. ~~**1a-2：copy-before-free 钩子**（把滑出窗口的块写进 KVMem 工作区，而非丢弃）——这是"溢写"的另一半。~~ **✅ 已完成（060）**：见 §12.5。
+3. ~~**准入守卫复核**：`prompt + max_tokens > 工作区上限(262,144)` 时返回 400。~~ **✅ 已完成（060）**：见 §12.6，**并修正了本条的前提**——上游会把 `max_tokens` 夹到 `上限 − prompt`，所以真正的形态是"夹紧 + 守卫兜底"。
+
+---
+
+## 12.5 阶段 1 K1 实施机制（步骤 060：copy-before-free 落地）
+
+### 12.5.1 为什么需要自己的钩子（而不是复用 offload 连接器）
+
+057 的实测已经把话说清楚了：滑窗确实把历史 KV **丢掉**了，`OffloadingConnector` 只存"滑窗可达的那几块"（200K 请求期间 314.7 MB），**不是**完整工作区。原因在触发口径——那个连接器的 store 触发是"**算完一个 chunk** 就按 **block hash** 存"，而滑出窗口的块在它来得及建 job 之前就已经从请求的块表里被抹掉、还回池子了。
+
+⇒ 需要的是"**淘汰即溢出**"：在块**回池之前**把它交出去。落点只有一个：`SingleTypeKVCacheManager._remove_blocks_in_range`（`v1/core/single_type_kv_cache_manager.py`，滑窗组由基类实现，`SlidingWindowManager` 没有覆写 `remove_skipped_blocks`）。
+
+### 12.5.2 五处改动
+
+| 层 | 落点 | 做什么 |
+|---|---|---|
+| 核心管理器 | `single_type_kv_cache_manager.py` | `_remove_blocks_in_range` 里**把块置 null 之后、`free_blocks` 之前**调 `_retain_for_workspace(req, idx, block)`；返回 True 则**不释放**（ref_cnt 不递减 ⇒ 池子拿不到它），记入 `_pending_workspace_evictions`。门控 `VLLM_KVMEM_WORKSPACE`（转调 `envs`），且只对 `SlidingWindowSpec` 组生效；未设时恒 False |
+| 协调器 | `kv_cache_manager.py` | `take_workspace_evictions()` → `({req_id: [(group_id, block_id, page_index)]}, retained_blocks)` |
+| 调度器 | `sched/scheduler.py` + `sched/output.py` | `KVConnectorBlockState` 加 `workspace_evictions`；drain 后立刻 `connector.register_workspace_retained_blocks(retained)`，**connector 不接受就当场释放**（退化成改前行为，不泄漏） |
+| 连接器基类 | `kv_transfer/kv_connector/v1/base.py` | 新增 `register_workspace_retained_blocks(blocks) -> bool`（默认 False 拒绝） |
+| 新子系统 | `v1/kvmem_workspace/` + `kvmem_connector.py` | `config` / `groups` / `metadata` / `manager`（调度侧）/ `worker`（worker 侧）/ connector；已注册进 `KVConnectorFactory` |
+
+**connector 选型**：不改造 `OffloadingConnector`（触发口径与键都不对，且与生产前缀缓存 offload 共用会互相污染），新写 `KVMemConnector`，**并借 `envs.VLLM_KVMEM_WORKSPACE` 顶掉 `config/vllm.py:_post_init_kv_transfer_config` 里的 offloading 槽位**——于是 KVMem 臂与生产 launcher 的差异只有环境变量，`--kv-offloading-backend native --kv-offloading-size 8` 仍保留（进入该配置路径用），但 `KVMemConnector` 忽略 `cpu_bytes_to_use`，**8 GiB 前缀缓存区不再分配**（设计 §3.4 的"工作区取代 offload 层"）。
+
+### 12.5.3 工作区身份：`(轨迹, token 偏移)`
+
+- **轨迹键** = 前 `VLLM_KVMEM_TRAJ_PREFIX`（默认 512）个 prompt token 的 blake2b-16。客户端照旧全量重发 ⇒ 前导 token 就是"根任务消息"：会话增长时不变、换会话即变，**客户端零改动**。实测两轮同 nonce（210K → 230K）落在**同一条** `a6de2ec47e98`，冷启动那轮是另一条 `b3d7ff46c37`。
+- **页键** = `(轨迹, page_index × block_size)`，即 **token 偏移**而非页序号。这一条是本步修掉的一个真缺陷：首版键里带 `group_id`，而本模型 16 层 full_attention 因 `VLLM_KV_GROUP_SIZE=8` 被分成 **2 组**，于是同一个逻辑页被分到 2 个 slot，**3 GiB 只装得下 61 个逻辑页**（冷 210K 实测 dropped=48）。改成 token 偏移后同 token 段的两个组**共用一个 slot**，容量翻倍（冷 258,854 prompt 只吃 94/122 slots、dropped=0）；块大小不同的组会自然落到不同 slot，不会误共享。
+- **容量口径（重要）**：工作区**只需装"窗口外的部分"**——262,144 − 163,072 = 99,072 token ≈ 70 逻辑页 ≈ **1.83 GiB**，所以 3 GiB 预算有余量。而"整个 262K 工作区整页存"要 **4.4 GiB**（设计 §3.4 的 3.7 GiB 依赖 K3 的**拆分存储**：只存 V + 非旋转 192 维 K，旋转 64 维从 raw K 重建）。
+- **丢页不静默**：工作区满时逐页 `WARNING` + `pages_dropped` 计数，并在每个请求结束时打一行 summary（含**独立期望值** `(num_tokens − W) // block_size`，使"淘汰量 = 窗口外页数"可一行核对）。实测：198,209-token prompt → 50 entries / 25 logical slots，日志 `window expects [25, 25]` ✓；4,144-token prompt → 0 entries、`expects [0, 0]` ✓。
+
+### 12.5.4 搬运与完成回传
+
+- **host 区**：每个（组 × 层）一个 `(num_slots, page_bytes)` int8 张量，`pin_memory=True`（失败则退化成 pageable 并告警——正确性不变，只是慢）。实测每层页 **1,640,448 B**（= 1424×1152，**未 padding**），122 slots，**2.98 GiB pinned 分配成功**。
+- **搬运原语**：`ops.swap_blocks_batch`（本平台走 `_WIN_BATCH_MEMCPY_BROKEN` 的 `cuMemcpyAsync` 循环）。在 **`wait_for_save`（forward 之后、同一条流）** 上发出，因此严格排在写 KV 的 kernel 之后；`page_index` 由 `_remove_blocks_in_range` 给出的是**已提交**的页（`processed_computed_tokens` 口径），所以不存在"拷到正在写的页"。
+- **完成回传**：每个 job 记一个 `torch.cuda.Event`，`get_finished` 里 `query()` 为真才把 job id 放进 `KVMemWorkerMetadata` 交回调度器；调度器在 `update_connector_output` 里**释放该 job 扣住的块**（每块恰好一次）。**这就是"拷贝完成前禁止回池"的实现**——不是"等 N 步"的启发式。
+- **往返自检**（`VLLM_KVMEM_SELFTEST=1`）：对前 8 页 × 16 层做双向比对——①从 GPU 页**重新**拷一份到 host，必须等于 store 写下的内容；②store 的内容经 host→GPU→host 必须逐字节不变。三次 boot 全 **`byte-identical, 0 mismatch`**。这是 K1 出口"历史页可被重新加载"的机制性证明；**把页按新位置重烘焙进视窗是 K3**。
+
+### 12.5.5 实测（步骤 060）
+
+| 项 | 数据 |
+|---|---|
+| connector 选择 | `Creating v1 connector with name: KVMemConnector`；`KVMem workspace stores kv cache group(s) [6, 7] (sliding_window=[163072,163072], block_size=[1424,1424])` |
+| 布局（未变） | attn block 1424 / mamba pad 0.38% / `275,997 tokens / 1.05x @262,144`（与 057 逐字相同） |
+| 工作区 | 122 host slots / 3.00 GiB / 25.03 MiB per slot；pinned 分配成功（每组 1.49 GiB） |
+| 冷 210K | TTFT 249.2 s（057 = 249.1 s）、needle 命中、**66 entries 淘汰 → 66 stored → 0 dropped**、33 个 job 各"released 2 block(s)" |
+| 冷 258,854（≈上限） | 每请求 69 逻辑页、**94/122 slots、0 dropped**（`ignore_eos` 输出跑满 3,290 token） |
+| 冷 198,209 | 50 entries / 25 slots，`window expects [25, 25]` ✓ |
+| 往返自检 | 8 页 × 16 层 **byte-identical，0 mismatch**（三次 boot） |
+| 跨请求轨迹 | 同 nonce 两轮（210K → 230K）**同一条轨迹**；冷启动另一条 |
+| 泄漏/静默丢 | 0 次 "workspace is full"（修缺陷后）、0 次 "was not registered as retained"、0 次 "had no eviction entry" |
+
+### 12.5.6 本步的边界（勿误读）
+
+- **只做到"存得下、取得回、不泄漏"**：重物化到槽位、Mean-K 索引、softmax-over-pages 检索、128-token 子块**全未开工**（K3）。
+- **工作区只增不减**：满则计数丢页，**无 LRU/GC/跨会话淘汰策略**（阶段 1 只判正确性）。
+- **多轨迹未测**：`--max-num-seqs 1` 串行；参考实现有 `--kvmem-conversations N`。
+- **性能不判**（用户指令"阶段二再冲性能"）。本臂无投机，数字不可与生产比。
+- **余量判据要换口径**：`tools/prod_headroom_check.ps1` 的 `共享 − 8,298` 在本臂上**不可直接用**——本臂没有 8 GiB 前缀缓存 mmap，共享基线是 4,198 MiB，会算出 −4,100 的假读数。
+
+---
+
+## 12.6 阶段 1 K2 实施机制（步骤 060：准入守卫）
+
+| 上限 | 实现 | 实测 |
+|---|---|---|
+| 工作区上限 262,144 | `--max-model-len` 的 `_validate_prompt_len`（既有） | `prompt > 262,144` → **HTTP 400**（"maximum context length is 262144 tokens ... total of at least 262145"） |
+| `prompt + max_tokens` | **上游夹紧**：`renderers/params.py` 的 `TokenizeParams` 把 `max_total_tokens − max_length` 当输出上限，`_tokens_len_check` 再按 `max_length` 卡输入 | `prompt 258,854 + 请求 20,000（ignore_eos）` → **completion 3,290，total = 262,144 恰好等于 `max_model_len`** ⇒ 工作区**不可能被越过** |
+| 同上（兜底） | `input_processor.py` 新增守卫：`VLLM_KVMEM_WORKSPACE` 开启且 `prompt + max_tokens > VLLM_KVMEM_WORKSPACE_TOKENS` → `VLLMValidationError`（400） | HTTP 路径被夹紧后不触发；**对绕过夹紧的路径（直接 `SamplingParams`）生效** |
+| 视窗装不下 | `KVMemWorkspaceScheduler.bind_gpu_block_pool` 按 `SlidingWindowSpec.max_admission_blocks_per_request` 求和对比 `len(block_pool.blocks)`，不足则 **boot 期 RuntimeError**（明确 admission error，**不让请求在等待队列里等死**） | `viewport needs 234 block(s) ... pool has 259`（234 = 2×117，117 = `cdiv(163072−1+1024,1424)+1`）⇒ 通过；**234/259 只剩 10% 余量**是紧处 |
+| 控制组 | — | 4,144-token prompt → 200 且 needle 命中（守卫不误杀合法请求） |
+
+**修正计划的一处前提**：计划写"`prompt + max_tokens > 上限` 返回 400"，实测**上游先夹紧**（而不是报错），所以真正的形态是"**夹紧 + 守卫兜底**"；结构目标（工作区不被越过）达成，且不会像参考实现 #56 那样杀服。
 
 ---
 

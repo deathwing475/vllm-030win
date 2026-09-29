@@ -64,6 +64,7 @@ if TYPE_CHECKING:
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.block_pool import BlockPool
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.core.kv_cache_utils import KVCacheBlock
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
@@ -445,6 +446,22 @@ class KVConnectorBase_V1(ABC):
             gpu_block_pool: the GPU block pool.
         """
         return
+
+    def register_workspace_retained_blocks(
+        self, blocks: list["KVCacheBlock"]
+    ) -> bool:
+        """vllm-030win patch (step 060): take ownership of KVMem-evicted pages.
+
+        The scheduler calls this with the pages that scrolled out of a KVMem
+        sliding window. They are held out of the block pool (their ref count was
+        not decremented), so whoever accepts them must free them exactly once,
+        after the workspace store has completed.
+
+        Returns True when the connector accepted ownership. The default refuses,
+        and the scheduler then frees the blocks itself — i.e. the pre-KVMem
+        behaviour of dropping the evicted history.
+        """
+        return False
 
     @abstractmethod
     def get_num_new_matched_tokens(

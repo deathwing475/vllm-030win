@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property
 from typing import TYPE_CHECKING
 
@@ -213,6 +213,13 @@ class KVConnectorBlockState:
     block_ids: dict[str, tuple[list[int], ...]]
     # Exact Mamba "align" boundary-state hand-offs.
     boundary_state_offloads: dict[str, list[tuple[int, int, int]]]
+    # vllm-030win patch (step 060): pages that scrolled out of a KVMem sliding
+    # window this step, as {request_id: [(group_id, block_id, page_index), ...]}.
+    # The referenced blocks stay out of the block pool until the connector
+    # reports the workspace store complete (or frees them as a fallback).
+    workspace_evictions: dict[str, list[tuple[int, int, int]]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass

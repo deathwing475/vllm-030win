@@ -2173,6 +2173,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each op additionally checks its own shape / dtype constraints and falls
     # back to the eager path when they do not hold.
     "VLLM_ENABLE_HPC_OPS": lambda: bool(int(os.getenv("VLLM_ENABLE_HPC_OPS", "0"))),
+    # vllm-030win patch (step 060): KVMem host KV workspace. When set, the
+    # sliding-window attention managers hand the pages they would free to a
+    # connector that copies them into a pinned host workspace before they
+    # return to the block pool, and the offloading slot is taken by
+    # KVMemConnector. Unset keeps upstream behaviour byte-for-byte.
+    "VLLM_KVMEM_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_KVMEM_WORKSPACE", "0"))
+    ),
 }
 
 

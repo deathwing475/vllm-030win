@@ -313,6 +313,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             self.head_dim,
             params_dtype=params_dtype,
             padding_size=divisor,
+            quant_config=quant_config,
             prefix=f"{prefix}.ngram_embedding",
             quant_method=_get_ple_embedding_quant_method(
                 quant_config, f"{prefix}.ngram_embedding"

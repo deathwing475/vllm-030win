@@ -374,6 +374,34 @@ class InputProcessor:
                         prompt_token_ids, prompt_embeds
                     ),
                 )
+
+            # vllm-030win patch (step 060): KVMem workspace admission guard.
+            # With the workspace armed the virtual context ceiling is
+            # VLLM_KVMEM_WORKSPACE_TOKENS (design §7.2), and it is prompt plus
+            # requested output that has to fit inside it — the generation
+            # reserve is a hard limit, not something the engine may quietly
+            # truncate. Reject here, where the caller still gets a clean 400,
+            # instead of letting the request stall in the waiting queue (the
+            # design's issue-#56 lesson: the reference's guard only checked its
+            # context window and killed the server on a full-history resend).
+            if envs.VLLM_KVMEM_WORKSPACE and sampling_params.max_tokens is not None:
+                from vllm.v1.kvmem_workspace.config import max_workspace_tokens
+
+                workspace_tokens = max_workspace_tokens()
+                request_len = (
+                    length_from_prompt_token_ids_or_embeds(
+                        prompt_token_ids, prompt_embeds
+                    )
+                    + sampling_params.max_tokens
+                )
+                if request_len > workspace_tokens:
+                    raise VLLMValidationError(
+                        f"The request needs {request_len} tokens "
+                        f"(prompt + max_tokens) but the KVMem workspace holds "
+                        f"{workspace_tokens}. Lower max_tokens or shorten the "
+                        f"prompt; VLLM_KVMEM_WORKSPACE_TOKENS raises the "
+                        f"ceiling."
+                    )
         else:
             pooling_params = params.clone()
 

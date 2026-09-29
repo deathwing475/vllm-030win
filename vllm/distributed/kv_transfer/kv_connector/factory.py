@@ -240,3 +240,9 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.hf3fs.hf3fs_connector",
     "HF3FSKVConnector",
 )
+# vllm-030win patch (step 060): the KVMem host KV workspace store.
+KVConnectorFactory.register_connector(
+    "KVMemConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.kvmem_connector",
+    "KVMemConnector",
+)

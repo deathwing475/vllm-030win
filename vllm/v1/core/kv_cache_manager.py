@@ -874,6 +874,29 @@ class KVCacheManager:
                 )
         return offloads
 
+    def take_workspace_evictions(
+        self,
+    ) -> tuple[dict[str, list[tuple[int, int, int]]], list[KVCacheBlock]]:
+        """vllm-030win patch (step 060): drain this step's KVMem evictions.
+
+        Returns ``({request_id: [(group_id, block_id, page_index), ...]},
+        retained_blocks)`` for pages that scrolled out of a sliding window
+        while ``VLLM_KVMEM_WORKSPACE`` is armed. The pages are deliberately
+        still held by the block pool (their ref count was not decremented), so
+        the caller owns them: hand them to a connector that will copy them into
+        the host workspace and free them on completion, or free them
+        immediately to fall back to dropping the history. Empty otherwise.
+        """
+        evictions: dict[str, list[tuple[int, int, int]]] = {}
+        retained: list[KVCacheBlock] = []
+        for mgr in self.coordinator.single_type_managers:
+            for req_id, page_index, block in mgr.take_pending_workspace_evictions():
+                evictions.setdefault(req_id, []).append(
+                    (mgr.kv_cache_group_id, block.block_id, page_index)
+                )
+                retained.append(block)
+        return evictions, retained
+
     def new_step_starts(self) -> None:
         """Notify the coordinator that a new step is starting."""
         self.coordinator.new_step_starts()

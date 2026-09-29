@@ -34,6 +34,21 @@ from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 from vllm.v1.request import Request
 
 
+def kvmem_workspace_enabled() -> bool:
+    """vllm-030win patch (step 060): is the KVMem workspace store armed?
+
+    ``VLLM_KVMEM_WORKSPACE=1`` makes the sliding-window attention managers hand
+    the pages they would otherwise free to a connector, which copies them into
+    the host KVMem workspace before they return to the block pool
+    (docs/vllm-030win-调研-KVMem虚拟化KV工作区.md §12.4 item 2). Unset keeps
+    upstream behaviour byte-for-byte. Reads the single source of truth in
+    ``vllm.envs`` so the connector selection cannot drift from this gate.
+    """
+    from vllm import envs
+
+    return envs.VLLM_KVMEM_WORKSPACE
+
+
 class SingleTypeKVCacheManager(ABC):
     """
     An abstract base class for a manager that handle the kv cache management
@@ -118,6 +133,16 @@ class SingleTypeKVCacheManager(ABC):
         # managers (full attention, mamba "align"); harmlessly empty elsewhere.
         self._partial_hit_reqs: dict[str, tuple[int, KVCacheBlock]] = {}
         self._pending_cow_copies: list[tuple[KVCacheBlock, KVCacheBlock]] = []
+
+        # vllm-030win patch (step 060): KVMem workspace eviction hand-off.
+        # Only sliding-window groups carry pages that scroll out of the window
+        # and therefore need spilling; other groups never reach the hook.
+        self._kvmem_workspace = kvmem_workspace_enabled() and isinstance(
+            kv_cache_spec, SlidingWindowSpec
+        )
+        # (request_id, page_index, block) held out of the block pool until the
+        # connector reports the workspace store complete.
+        self._pending_workspace_evictions: list[tuple[str, int, KVCacheBlock]] = []
         # Boundary-state offload hand-off for external KV connectors. A mamba
         # "align" block table is not append-only (interior states are
         # nulled/freed and speculative blocks relocate in place), so a
@@ -624,10 +649,38 @@ class SingleTypeKVCacheManager(ABC):
         for i in range(last_block - 1, first_block - 1, -1):
             if blocks[i] == self._null_block:
                 break
-            freed.append(blocks[i])
+            block = blocks[i]
             blocks[i] = self._null_block
+            if self._retain_for_workspace(request_id, i, block):
+                continue
+            freed.append(block)
         if freed:
             self.block_pool.free_blocks(freed)
+
+    def _retain_for_workspace(
+        self, request_id: str, block_index: int, block: KVCacheBlock
+    ) -> bool:
+        """vllm-030win patch (step 060): keep an evicted page out of the pool.
+
+        Called from ``_remove_blocks_in_range`` after the page has been nulled
+        out of the request's table but *before* it is returned to the block
+        pool. Returning True transfers ownership of ``block`` to
+        ``take_pending_workspace_evictions``: the caller must not free it, and
+        whoever receives it must free it exactly once. Every non-KVMem
+        configuration returns False, i.e. upstream behaviour unchanged.
+        """
+        if not self._kvmem_workspace:
+            return False
+        self._pending_workspace_evictions.append((request_id, block_index, block))
+        return True
+
+    def take_pending_workspace_evictions(
+        self,
+    ) -> list[tuple[str, int, KVCacheBlock]]:
+        """vllm-030win patch (step 060): drain the retained evicted pages."""
+        pending = self._pending_workspace_evictions
+        self._pending_workspace_evictions = []
+        return pending
 
     def remove_skipped_blocks(
         self,

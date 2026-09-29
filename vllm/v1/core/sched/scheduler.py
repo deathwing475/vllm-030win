@@ -1282,6 +1282,20 @@ class Scheduler(SchedulerInterface):
         # table. Drained every step so stale offers cannot accumulate.
         boundary_state_offloads = self.kv_cache_manager.take_boundary_state_offloads()
 
+        # vllm-030win patch (step 060): KVMem workspace evictions. Pages that
+        # scrolled out of a KVMem sliding window are still held by the block
+        # pool; a connector copies them into the host workspace and frees them
+        # on completion. Without a connector that accepts them we free them
+        # here, which is exactly the pre-KVMem behaviour of dropping history.
+        workspace_evictions, workspace_retained = (
+            self.kv_cache_manager.take_workspace_evictions()
+        )
+        if workspace_retained and not (
+            self.connector is not None
+            and self.connector.register_workspace_retained_blocks(workspace_retained)
+        ):
+            self.kv_cache_manager.block_pool.free_blocks(workspace_retained)
+
         kv_connector_block_state = None
         if self.connector is not None:
             snapshot_req_ids = {req.req_id for req in new_reqs_data}
@@ -1303,6 +1317,7 @@ class Scheduler(SchedulerInterface):
                     for req_id in snapshot_req_ids
                 },
                 boundary_state_offloads=boundary_state_offloads,
+                workspace_evictions=workspace_evictions,
             )
 
         kv_cache_block_copies, cow_retained_blocks = (
