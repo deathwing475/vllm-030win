@@ -22,12 +22,31 @@ connector worker calls after the forward has finished. The stash is keyed by
 layer index, so it is bounded by the layer count no matter how many forwards
 run without a drain.
 
-``record`` runs inside the model forward, so it must not do anything a
-``torch.compile`` fullgraph rejects — no logging, no host copies, no
-data-dependent Python control flow. The arm therefore runs with
-``--enforce-eager``, which is what the design asks for at stage 1 anyway
-("文本 + 无投机 + 无图模式", §6); a compiled forward would need the capture to
-be an output of the graph instead.
+``record`` runs inside the model forward. Up to step 066 that forced the arm
+onto ``--enforce-eager``: an AOT ``torch.compile(fullgraph=True)`` of the model
+traced straight into this module and rejected it (first as a ``logging`` call,
+then as ``aten.equal.default`` — the data-dependent M-RoPE check). Step 067
+makes the capture opaque to the compiler instead: :func:`record` is now a
+``torch.library.custom_op`` whose body dynamo never sees, so the arm runs with
+the production graph mode.
+
+Two properties are what make that safe, and both were checked before the arm
+was re-measured:
+
+* A custom op is a single node in the compiled graph, but its *implementation*
+  still runs on every execution of that graph. That is what keeps the stash fed
+  — and it is also why the body must stay cheap and allocation-only.
+* The arm keeps ``--cudagraph-capture-sizes 1``. ``CudagraphDispatcher.dispatch``
+  returns ``CUDAGraphMode.NONE`` for any batch larger than the largest capture
+  size, so a prefill step (up to ``max_num_batched_tokens``) is never recorded
+  into a CUDA graph and the capture always runs on the host side of the stream.
+  Decode (one token) *is* captured, but it returns from the ``num_tokens <= 1``
+  guard without touching the device, so no device work of ours ends up in the
+  graph; replays of that graph do not re-enter Python at all.
+
+The one thing that must stay out of the body is a host synchronisation. The
+device-to-host copies live in :func:`drain`, which the connector worker calls
+after the forward has finished.
 """
 
 from __future__ import annotations
@@ -59,7 +78,7 @@ def _query_span() -> int:
     return config.query_span()
 
 
-def record(
+def _record_impl(
     layer_idx: int,
     positions: torch.Tensor,
     q: torch.Tensor,
@@ -106,6 +125,42 @@ def record(
     )
 
 
+@torch.library.custom_op("vllm_kvmem::record", mutates_args="unknown")
+def record(
+    layer_idx: int,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """The compiler-visible face of :func:`_record_impl` (step 067).
+
+    ``torch.compile`` treats a ``torch.library.custom_op`` as a leaf: it emits
+    one call node and never traces the body, so the stash can keep its Python
+    bookkeeping (the per-layer dict, the M-RoPE check, the counters) without
+    dynamo rejecting any of it. ``mutates_args="unknown"`` says the op may
+    write anything, which is what stops the compiler from reordering it or
+    dropping it as dead code.
+    """
+    _record_impl(layer_idx, positions, q, k, num_heads, num_kv_heads, head_dim)
+
+
+@record.register_fake
+def _record_fake(
+    layer_idx: int,
+    positions: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> None:
+    """Nothing to infer: the op has no outputs."""
+    return None
+
+
 def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     """Move the stashed step to the host and clear it.
 
@@ -114,10 +169,15 @@ def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     forward so that no synchronising copy can land inside a compiled or
     graphed region.
     """
-    global _STASH, _LOGGED
+    global _STASH, _LOGGED, _SKIPPED_DECODE
     if not _STASH:
         return {}
     stash, _STASH = _STASH, {}
+    # Step 067 health check. The op body is not re-entered when its node replays
+    # from a CUDA graph, so the number of single-token calls since the previous
+    # drain is a direct read on whether decode is actually running inside the
+    # FULL graph: 0 means graphed, anything else means it fell back to eager.
+    skipped, _SKIPPED_DECODE = _SKIPPED_DECODE, 0
     out: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     for layer_idx, (positions, q_tail, k) in stash.items():
         out[layer_idx] = (
@@ -140,6 +200,14 @@ def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
             next(iter(out.values()))[2].shape[0] if out else 0,
             next(iter(out.values()))[1].shape[0] if out else 0,
         )
+    logger.info(
+        "vllm-030win patch (step 067): KVMem capture drain: %d layer(s), "
+        "%d token(s), %d single-token call(s) since the last drain "
+        "(0 = decode replayed from a CUDA graph, >0 = decode ran the op body)",
+        len(out),
+        next(iter(out.values()))[2].shape[0] if out else 0,
+        skipped,
+    )
     return out
 
 

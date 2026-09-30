@@ -899,6 +899,63 @@ scale 偏移 = (t//kbs)*chunk_bytes + side*side_bytes + heads*kbs*data_dim
 
 ---
 
+## 12.13 阶段 1 全图捕获兼容（步骤 067：`record` 变不透明算子 → 臂进生产同构图模式，decode 4.0×）
+
+**用户指令（2026-09-30）**：「先把 full cuda graph 兼容修复了，速度起码翻一倍。下一个优化就是这个了，**然后之后的优化全部都要全图捕获的兼容**」⇒ 阶段 1 的"无图模式"约束作废；**"能不能进 FULL 图"升级为一等设计判据**。
+
+### 12.13.1 唯一拦路虎与修法（一个文件，零改动调用点）
+
+061 起臂用 `--enforce-eager` 的唯一原因是 `capture.record` 跑在模型 forward 里，而 AOT `torch.compile(fullgraph=True)` 会追进它的函数体。本步 boot 一次拿到**唯一**剩余报错（`logger.info` 061 已搬走，所以它是第一个）：
+
+```
+torch._dynamo.exc.Unsupported: Data dependent operator
+  Operator `aten.equal.default` has a non-Tensor output whose value is dependent on the data of Tensor inputs.
+  from user code: capture.py:97  if not torch.equal(positions[0], positions[1]):
+```
+
+dynamo 的 Hint 直接给出方向：**"wrap the operator into a PyTorch-understood custom operator"**。修法 = 把 `record` 包成 `torch.library.custom_op("vllm_kvmem::record", mutates_args="unknown")`：
+
+- **dynamo 把它当叶子**，不再追踪函数体 ⇒ dict 记账、M-RoPE 检查、计数器、`clone()` 全部保留原样，**一行逻辑没改**（原 `record` 改名为 `_record_impl`，新 `record` 只转调它）。
+- `mutates_args="unknown"` 声明"可能写任何东西" ⇒ 编译器不会重排、不会当死代码删掉。
+- `register_fake` 返回 `None`（算子无输出）。
+- **`qwen3_next.py` 的调用点一字未改**；`capture.py` 不被模型引用 ⇒ **不改 AOT 缓存键**（062 的同类结论在本步再次被实测确认：第二次 boot 直读缓存、25 s 完成、无退化）。
+
+### 12.13.2 为什么这样是安全的（两条必须先核清的性质）
+
+1. **不透明算子仍是图里的一个节点，但它的实现每次执行都会真正被调用**（离线 `probe_custom_op_067.py` 实测：编译后连续两次执行，实现调用计数 1 → 2）。这正是 stash 能持续被喂饱的原因，也是"函数体必须保持廉价、只做分配"这条纪律的由来。
+2. **prefill 根本不进 CUDA graph**：`CudagraphDispatcher.dispatch` 对 `num_tokens > max_cudagraph_capture_size` 一律返回 `CUDAGraphMode.NONE`（`v1/cudagraph_dispatcher.py:270-276`），而臂的 `--cudagraph-capture-sizes 1` 使上限 = 1 ⇒ prefill（≤ `max_num_batched_tokens` = 1424）走**编译产物逐算子执行**，捕获始终在流的 host 侧。decode（1 token）**进** FULL 图，但它在 `num_tokens <= 1` 守卫处直接返回、**不产生任何 device 工作**，图重放也不重新进入 Python。⇒ 唯一必须留在函数体外的只有 **host 同步**，而 device→host 拷贝本来就在 `drain()` 里（forward 之后由连接器 worker 调用）。
+
+### 12.13.3 新增判据：`drain` 的单 token 调用计数
+
+`drain()` 现在报告"自上次 drain 以来的单 token 调用次数"。**图重放不会重新进入算子实现**，所以这个计数是"decode 是否真的在 FULL 图里"的直接读数：**0 = 走图**，>0 = 回落 eager。实测：首次（编译/预热期）为 `80`，此后**全部为 0**。
+
+### 12.13.4 实测（步骤 067）
+
+**臂** = `tools/serve_gsq_kvmem_ws163k_graph.cmd`（原臂只把 `--enforce-eager` 换成 `--cudagraph-capture-sizes 1`）；**对照** = `tools/serve_gsq_kvmem_ws163k_eager067.cmd`（原臂，仅 dump 目录改名 `kvmem_k5b` 防覆盖 066 证据）。**两者其余字节相同，唯一变量 = 图模式。**
+
+| 项 | eager（原臂） | 带图（本步） | 倍数 |
+|---|---|---|---|
+| 8k decode（3 次中位） | 17.28 tok/s | **69.16 tok/s** | **4.00×** |
+| 200K 装配 serve TTFT | 229.76 / 230.13 s（066） | **223.94 s** | 0.973× |
+| needle 命中 / 错误 | 命中 / 零 | 命中 / **零** | — |
+| 编译 + 图 | `CompilationMode.NONE` + `CUDAGraphMode.NONE` | `VLLM_COMPILE` + `FULL_AND_PIECEWISE`（PIECEWISE 1/1、FULL 1/1） | — |
+
+**⭐eager 臂日志坐实机理**：`Enforce eager set, disabling torch.compile and CUDAGraphs. This is equivalent to setting -cc.mode=none -cc.cudagraph_mode=none` ⇒ **`--enforce-eager` 是"编译 + 图"双重禁用**，臂此前跑的是**完全未编译的朴素路径**。decode 每步只 1 token、kernel 计算量小、launch 开销占绝对主导，所以收益集中在 decode（4×）；prefill 每块 1424 token、计算密集，收益只有 2.7%（与 §12.2 的"eager 代价约 +7%"同向）。
+
+### 12.13.5 ⭐推翻既有记录：臂的 eager 基线是 17.3，不是 69
+
+此前 memory 与文档记的"臂 8k 约 69 vs 生产 122"把 **69 当成了 eager 基线**——**实测 eager 只有 17.28**，69 实为**带编译/带图**态的数字。生产的 122.58 是**编译 + 图 + DFlash2 N=2 投机**（接受率 62.82% ⇒ 每步约 2.26 token）；臂每步 14.45 ms 已**快于**生产每步 18.4 ms ⇒ **69 vs 122 的差额来自投机，不是图模式**。
+
+### 12.13.6 本步的边界（勿误读）
+
+- **臂仍无投机**（阶段 1 设计排除该变量）⇒ **69.16 与生产 122.58 不可直接比较**。要到生产的 90-120 需给臂加投机，**属用户拍板项**（用户 2026-09-30 已指出"生产下配置草稿模型解码能到 90-120"）。
+- 本步只验"**能进图 + 不回归**"，**未做** decode 侧进一步优化。
+- **09-25 的"FULL 图挂死 = flashinfer BatchPrefill nvfp4 reader"（WONTFIX_WITH_ROOT_CAUSE）本步未复现**，生产 `FULL_AND_PIECEWISE` 亦长期正常 ⇒ 该结论应视为**已过时**。
+- 未跑：多轨迹串行、长稳、`VLLM_KVMEM_LOAD=0` 对照、位精确闸门（`VLLM_BATCH_INVARIANT=1`）。
+- **下一半 = 固定槽位重烘焙**（设计 §5.1 的压缩视窗，需要重 RoPE）——那才是**窗外 needle 能答出来**的一半。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |
