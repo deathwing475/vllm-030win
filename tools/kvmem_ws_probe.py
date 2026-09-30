@@ -144,6 +144,10 @@ def post(base: str, prompt: str, max_tokens: int, ignore_eos: bool = False) -> d
             else round(usage.get("prompt_tokens", 0) / ttft, 1)
         ),
         "sample": out[:200],
+        # Full completion text (step 066 needs it: prefix assembly is judged by
+        # whether the assembled run reproduces the full-prefill run token for
+        # token, and 200 characters is too short a window for that).
+        "text": out,
     }
 
 

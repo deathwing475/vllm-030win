@@ -118,6 +118,66 @@ def authority_enabled() -> bool:
     return bool(int(os.environ.get("VLLM_KVMEM_AUTHORITY", "0")))
 
 
+def load_enabled() -> bool:
+    """Assemble stored pages back into a later request's prefix (step 066).
+
+    When armed, a request whose leading tokens match a trajectory that already
+    has a contiguous run of stored pages *and* a mamba snapshot at the run's
+    end gets ``num_computed_tokens`` jumped to that run's token boundary: the
+    worker copies the pages (and the snapshot) into the request's freshly
+    allocated blocks, and only the remainder is prefilled. The pages go back at
+    their *original* positions, so no re-RoPE is involved here -- this is the
+    connector-level assembly half of the design's step 5.1 flow; compressing
+    the window to fixed slots (which does need re-RoPE) is the step after it.
+
+    Requires ``VLLM_KVMEM_WORKSPACE`` (the store must exist to load from it)
+    and the ``MambaManager`` external-allocation patch, without which the
+    mamba groups would allocate one state slot per assembled page.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_LOAD", "0")))
+
+
+def snapshot_keep() -> int:
+    """How many page-aligned mamba snapshots to keep per trajectory (066).
+
+    One snapshot is one full state of every mamba group (80.4 MiB here: 48
+    layers x (conv 102,400 B + bf16 ssm 1,572,864 B)). A snapshot can only be
+    taken while its block is inside the CoW window (two blocks), so captures
+    ride the prefill steps: each step that ends on a page boundary grabs the
+    state of the running slot. The ring must hold a boundary until the
+    workspace's page prefix reaches it, which takes ``sliding window /
+    max_num_batched_tokens`` steps -- with a sparse capture interval (see
+    :func:`snapshot_every_pages`) that turns into ``interval_pages x block
+    size / max_num_batched_tokens + 2`` rows.
+    """
+    return _env_int("VLLM_KVMEM_SNAPSHOT_KEEP", 20)
+
+
+def snapshot_trajectories() -> int:
+    """How many trajectories may hold a snapshot ring at once (step 066).
+
+    The rings are per-trajectory (a global FIFO lets one trajectory's prefill
+    evict another's snapshots and silently disable its assembly -- measured in
+    the step 066 second boot). Each ring is ``snapshot_keep`` rows of the full
+    mamba state, so this is a host-memory bound: past it the least recently
+    started ring is dropped whole and reported.
+    """
+    return _env_int("VLLM_KVMEM_SNAPSHOT_TRAJ", 2)
+
+
+def snapshot_every_pages() -> int:
+    """Capture one snapshot every N page boundaries (step 066).
+
+    The assembled boundary must carry an exact recurrent state, so it can only
+    sit on a *captured* boundary; a sparser capture simply caps the assemblable
+    prefix at the newest sparse boundary below the page run (at most N-1 pages
+    of the run go unassembled). Each row costs ``snapshot_keep``-independent
+    80.4 MiB of host, and the ring row count scales with the interval, so
+    denser is not free.
+    """
+    return _env_int("VLLM_KVMEM_SNAPSHOT_EVERY_PAGES", 8)
+
+
 def authority_tokens() -> int:
     """Token capacity of one trajectory's authority region."""
     return _env_int("VLLM_KVMEM_AUTHORITY_TOKENS", max_workspace_tokens())

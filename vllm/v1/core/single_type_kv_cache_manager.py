@@ -1609,6 +1609,44 @@ class MambaManager(SingleTypeKVCacheManager):
                     self.block_pool.free_blocks([blocks[last_state_block_idx]])
                     blocks[last_state_block_idx] = self._null_block
 
+    def allocate_external_computed_blocks(
+        self,
+        request_id: str,
+        num_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> None:
+        # vllm-030win patch (step 066): a mamba external load needs ONE state
+        # block, at the boundary position. The base class allocates
+        # cdiv(total_computed, block_size) real state slots for the loaded
+        # prefix; for a recurrent cache that is both wasteful and unread --
+        # only the boundary block (position E-1) is ever anchored on
+        # (``preprocess_mamba`` uses (num_computed_tokens - 1) // block_size),
+        # and at one ~13.4 MiB slot per block per group the base behaviour
+        # burns the whole pool before the assembly step runs. This mirrors the
+        # shape ``find_longest_cache_hit`` returns for a local mamba hit:
+        # null placeholders up to the boundary, then the one real block whose
+        # slot the KVMem load fills with the state snapshot.
+        assert isinstance(self.kv_cache_spec, MambaSpec)
+        num_total = num_local_computed_tokens + num_external_computed_tokens
+        num_skipped_tokens = self.get_num_skipped_tokens(num_total)
+        if num_skipped_tokens > 0:
+            num_external_computed_tokens = min(
+                num_total - num_skipped_tokens, num_external_computed_tokens
+            )
+        if num_external_computed_tokens <= 0:
+            return
+        req_blocks = self.req_to_blocks[request_id]
+        num_boundary_blocks = max(
+            0, cdiv(num_total, self.block_size) - len(req_blocks)
+        )
+        if num_boundary_blocks == 0:
+            return
+        req_blocks.extend([self._null_block] * (num_boundary_blocks - 1))
+        allocated = self.block_pool.get_new_blocks(1)
+        req_blocks.extend(allocated)
+        if self._record_new_block_ids:
+            self.new_block_ids.extend(b.block_id for b in allocated)
+
     def get_num_common_prefix_blocks(self, running_request_id: str) -> int:
         """
         cascade attention is not supported by mamba

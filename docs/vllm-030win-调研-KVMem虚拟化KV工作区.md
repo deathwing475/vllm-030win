@@ -827,6 +827,78 @@ scale 偏移 = (t//kbs)*chunk_bytes + side*side_bytes + heads*kbs*data_dim
 
 ---
 
+## 12.12 阶段 1 K3 后半接线第三半（步骤 066：连接器级前缀装配 —— matched/异步装载/前跳 + mamba 边界快照）
+
+> 本节记录把工作区里已有的页**放回后续请求的视窗**的第一半（也是唯一不需要动模型执行器的一半）：按**原始位置**装回，让调度器把 `num_computed_tokens` 前跳、只 prefill 差量。**结论先行**：机制全链打通（匹配 → 异步装载 → 前跳 → 差量 prefill → mamba 状态恢复），同一 200K prompt 的 serve 请求 **TTFT 256.63 s → 229.76/230.13 s（−10.4%）**、needle 命中、输出连贯。**但窗外 needle 仍答不出**——原位装配装回的页在最终注意力窗口之外（见 §12.12.5）。
+
+### 12.12.1 ⭐ 为什么不需要动模型执行器（推翻 063/064 的接线判断）
+
+063 §12.9.7 与 064 判定都写"下一步 = 位置解耦（`gpu_model_runner.py` 的 `positions`）+ 块表改写，且 flashinfer 没有 `update_block_table` ⇒ 确实要动模型执行器"。**这个判断对"压缩到固定槽位"成立，对"原始位置装配"不成立**：
+
+- `positions` 与 `slot_mapping` 本来就是从 `request.num_computed_tokens` 派生的（`gpu_model_runner.py:2204-2217`：`positions = num_computed_tokens + query_pos`，`slot_mapping = block_table.compute_slot_mapping(...)`）。**`num_computed_tokens` 一旦被前跳，二者自动只覆盖差量**，块表也不用改写——请求块表的 0..E-1 行本来就是本步新分配的空块，装载把页写进去即可。
+- 前跳的唯一入口 = `KVConnectorBase_V1.get_num_new_matched_tokens` 返回 matched ⇒ 调度器 `num_computed_tokens = local + ext`（`scheduler.py:908-910`）；返回 `load_async=True` 则请求停在 `WAITING_FOR_REMOTE_KVS`、本步不 forward，等 worker 通过 `finished_recving` 放行（`:1127-1157`、`:2910-2937`）。
+- `update_block_table` 与 KV 连接器**无关**（它是混合模型多组共用 attention 元数据的优化，`gpu_model_runner.py:2507-2582`）；flashinfer 缺它只是"多组时不能复用元数据"，**不影响装载路径**。
+
+⇒ **零改动 `gpu_model_runner.py` / `block_table.py` / 任何 attention backend**。改动全在连接器（调度侧 + worker 侧）+ 一处 mamba 分配覆写。
+
+### 12.12.2 ⭐ mamba：装配路径上真正的硬问题
+
+注意力页可以按 token 偏移原样搬回，**mamba（GDN）不行**：它没有可回装的"历史 KV"，只有一份**递推状态**，而递推状态只在**块边界**上被引擎锚定。装配请求前跳到 E 后，`preprocess_mamba` 会算 `prev_state_idx = (num_computed_tokens - 1) // block_size = E/block_size - 1`（`mamba_utils.py:1483`）并从那里续算 ⇒ **块表第 `E/block_size - 1` 行的槽里必须已经是"算完 E 个 token 的精确状态"**，否则整个续算从错的状态出发（比 KV 糊更严重：是**静默的错误生成**）。
+
+| # | 子问题 | 本步答案 |
+|---|---|---|
+| 1 | 状态从哪来 | **在 ingest 的 prefill 过程中逐边界抓**。滑窗把工作区的连续页前缀压在活序列后约 W token（114.5 页）处，等页被淘汰时它的状态槽早已被 CoW 复用（align 模式只有 2 个状态块）⇒ **不能事后取，只能在块边界那一刻取**。引擎自己的不变式背书："slot p holds the state after exactly (p + 1) * block_size tokens. State is written at chunk ends, so chunk ends must be block aligned"（`scheduler._mamba_block_aligned_split`）⇒ 抓取条件 = **步尾恰好落在页边界**（`end % block_size == 0`）。 |
+| 2 | 抓多少 / 存多久 | 每个边界要活到"页前缀追上它"（W/block_size = 114.5 步）。抓取间隔 8 页 ⇒ 需 14.3 份 ⇒ 环形保留 **20 份**（每份 80.4 MiB = 48 层 ×（conv 102,400 B + bf16 ssm 1,572,864 B））。**环形区按轨迹分槽**（`SNAPSHOT_TRAJ=2`）——全局 FIFO 会让第二条轨迹的 prefill 把第一条的快照挤空（本步实测，见 §12.12.4 的"两个真缺陷"）。 |
+| 3 | 装配边界取哪 | `min(连续页前缀终点, 最新的已捕获边界)`。抓取是稀疏的（每 8 页）⇒ 装配边界最多比页前缀低 7 页；这是 `SNAPSHOT_EVERY_PAGES` 这个旋钮的全部含义。 |
+
+**必须同时动的引擎点**：基类 `allocate_external_computed_blocks` 会给**每个组**分配 `cdiv(E, block_size)` 个真实块；对 mamba 组（每块 13.4 MiB × 6 组）这会在装配时**一次性吃掉约 2 GiB 池**，而中间位**根本没人读**。覆写 `MambaManager.allocate_external_computed_blocks` = `[null × (E-1), 1 个真实块]`（形状与 `find_longest_cache_hit` 给本地命中返回的 `[null × i, cached]` 完全一致；null 不进 hash、不占池）。
+
+### 12.12.3 落点
+
+| 文件 | 改动 |
+|---|---|
+| `v1/kvmem_workspace/config.py` | `load_enabled()`（`VLLM_KVMEM_LOAD`，默认关）/ `snapshot_keep()`（20）/ `snapshot_every_pages()`（8）/ `snapshot_trajectories()`（2） |
+| `v1/kvmem_workspace/metadata.py` | `KVMemPageLoad` / `KVMemLoadJob` / `KVMemSnapshotRequest`；`KVMemConnectorMetadata.load_jobs`、`.snapshot_requests`；`KVMemWorkerMetadata.completed_snapshots` / `.removed_snapshots` / `.finished_load_reqs` |
+| `v1/kvmem_workspace/manager.py` | `_assembly_match`（连续页前缀 ∩ 已捕获快照边界 ∩ **页 token 哈希一致**）/ `get_num_new_matched_tokens`（返回 `(boundary, True)`）/ `_emit_load_jobs` / `_emit_snapshots` / 页哈希记录 / 完成回报处理 |
+| `v1/kvmem_workspace/worker.py` | mamba 组注册（状态槽视图 + 按轨迹分槽的快照区）/ `start_load_kv`（发装配拷贝）/ `_run_loads` / `_take_snapshots` / `get_finished` 回填 `finished_recving` |
+| `kv_connector/v1/kvmem_connector.py` | `start_load_kv` 转调 worker（**关键**：装配请求的步调度 0 token，零前向路径**只**调 `start_load_kv`，不调 `wait_for_save`） |
+| `v1/core/single_type_kv_cache_manager.py` | `MambaManager.allocate_external_computed_blocks` 覆写（+ `tools/apply_kvmem_mamba_ext_step066.py` apply/revert） |
+| `tools/kvmem_assembly_probe.py`（新） | 三请求探针：ingest → **flush**（换 nonce 的 200K 请求，用来打掉原生前缀缓存）→ serve；`compare` 判 TTFT 比 + 输出一致 |
+
+**为什么探针需要 flush 请求**：引擎**原生的前缀缓存**在块还没被复用时就能救回同一 transcript 的约 97%（本步第一次 boot 实测：serve prefill 塌到 ~8 s，连接器什么都没做）。flush 用一条不同 nonce 的 200K 请求把池块覆写掉，留下的才是"只有 KVMem 工作区还持有这段前缀"的残余场景。
+
+### 12.12.4 实测（步骤 066）
+
+臂 = `tools/serve_gsq_kvmem_ws163k.cmd`（池 3.4e9 / `--max-model-len 262144` / W=163072 / **`--enforce-eager`** / 无投机 / 无 offload 8 GiB 区 / `VLLM_KVMEM_LOAD=1`）；prompt = 198,205 token（serve 加 787 token 尾巴 = 198,992）。
+
+| 项 | 数据 |
+|---|---|
+| boot | `snapshot region 2 x 20 row(s) (2.93 GiB host)`、`GPU KV cache size: 273,771 tokens`、`viewport needs 236 / pool has 259` |
+| 装配匹配 | `matches at 34176 tokens (24 stored page(s)); async load` —— 与结构预期 `⌊(198992−163072)/1424⌋×1424 = 34176` **逐字吻合** |
+| 装载作业 | `issued (48 page(s) + 6 mamba state block(s), boundary 34176)` → `prefix landed; cumulative requested=1 completed=1`，**零 error** |
+| **TTFT** | 装配 **229.762 / 230.133 s**（两次）vs 全量 **256.627 s** ⇒ **−10.4%**（比值 0.896/0.897，两次复现 ±0.4 s） |
+| 跳过的 token 占比 | 34176/198992 = **17.2%**（上界）；实测省 10.4% —— **亚线性**，因为 prefill 单 token 成本随视窗增长，而被跳过的是**最便宜的最早期 token**（与 §12.2 的"窗口越宽 prefill 越慢"同向） |
+| needle | 两臂**均命中**（`77349`，depth 0.50，在窗内） |
+| 输出 | 同 prompt 跨臂共同前缀 285 字符；**但同臂两次不同 prompt 的共同前缀只有 99 字符** ⇒ 分歧由 prompt 差异主导，装配未引入额外分歧 |
+| 代价（host） | 工作区 3.00 GiB + 权威区 2.0 GiB + **快照区 2.93 GiB** |
+
+**两个真缺陷（本步实测暴露并修掉）**：
+1. **快照环全局 FIFO ⇒ 多轨迹互相挤空**。第一次实测（boot3）：flush 请求（第二条轨迹）的快照把 ingest 轨迹的快照全挤出去，serve 请求匹配不到任何边界 ⇒ 回落到全量 prefill（TTFT 257.1 s）。修法 = **环形区按轨迹分槽**（`SNAPSHOT_TRAJ=2`，每轨迹各 20 行）。
+2. **装载必须发在 `start_load_kv` 而不是 `wait_for_save`**。装配请求在 `WAITING_FOR_REMOTE_KVS` 时其步调度 0 token，worker 走**零前向路径**（`kv_connector_no_forward`）——它**只调 `start_load_kv`**（`kv_connector_model_runner_mixin.py:86-95` 的 `wait_for_save=False`）。首版把拷贝放在 `wait_for_save` ⇒ 永不发出 ⇒ 请求**永久挂在等待队列**（本步 boot4 实测）。
+
+**一次判据口径修正**：`--max-num-batched-tokens` 必须**钉在页长 1424**。①快照只在"步尾恰为页边界"时精确（引擎不变式），9968（7 页）也可行；②但滑窗组的 admission 项 `cdiv(W−1+max_in_flight, 页)+1` 在 9968 下从 117 涨到 123 块/组 ⇒ 启动检查报"需要 3.32 GiB > 可用 3.15 GiB"（**实测 boot 失败**）；1424 时 `cdiv` 与 1024 同为 117 ⇒ **需求零增长**。
+
+### 12.12.5 本步的边界（勿误读）
+
+- **窗外 needle 仍答不出**：原位装配把页装回**原始位置**，而问题在序列末尾 ⇒ 最终注意力窗口（`[L−W, L]`）**看不到**装回的页。本步证明的是**投递机制**（匹配/装载/前跳/状态恢复），不是召回能力。要窗外召回必须做**固定槽位重烘焙**（设计 §5.1 的压缩视窗，需要重 RoPE）——那是下一半。
+- **"逐 token 一致"在本臂上不可测**：引擎自身在同配置下**不是位精确**（同族既有结论"PPL 非位精确"）。**这不是 seed 能解决的**——`SamplingParams.seed` 只在 `temperature ≥ eps` 时生效（`sampling_params.py:757-761`，temperature=0 直接 `GREEDY`，seed 不被读取），分歧在 **logits 层**。vLLM 的对应开关是 **`VLLM_BATCH_INVARIANT=1`**（`envs.py:620-623`，需 SM ≥ 9.0，本机 SM120 满足）⇒ 要位精确闸门时开它，代价是禁 split-K 等 ⇒ **变慢**，只作测量档。而且装配路径与全量路径的**计算路径本来就不同**（chunk 起点、`seq_len`、KV 物理块），即使 kernel 全确定，归约序也可能不同 ⇒ 逐位一致不是"加开关就能拿到"的性质。
+- 本步不判性能（阶段 1 判据不含性能）；臂**仍 `--enforce-eager`** ⇒ 速度不可与生产比（**下一步：全图捕获兼容**，见 §12.13）。
+- 装配边界受**连续页前缀**限制 ⇒ 可省比例 = `(L−W)/L`（本例 17.2%），且**亚线性**。工作区只装"窗口外的部分"是设计既定的（§12.5.3）。
+- 快照只增不减（按轨迹环形，超出整环丢弃并告警）；多轨迹串行未压测（`--max-num-seqs 1`）。
+- 页哈希一致检查用**页 token 哈希**（`(轨迹, 页偏移) → blake2b8`），它补上了轨迹键只钉前 512 token 的缺口。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |

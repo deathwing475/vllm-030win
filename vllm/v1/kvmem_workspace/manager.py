@@ -24,11 +24,15 @@ from vllm.v1.kvmem_workspace import config
 from vllm.v1.kvmem_workspace.groups import workspace_group_ids
 from vllm.v1.kvmem_workspace.metadata import (
     KVMemConnectorMetadata,
+    KVMemLoadJob,
+    KVMemPageLoad,
     KVMemPageTransfer,
     KVMemScoreRequest,
+    KVMemSnapshotRequest,
     KVMemStepSpan,
     KVMemStoreJob,
 )
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.outputs import KVConnectorOutput
 
 logger = init_logger(__name__)
@@ -98,6 +102,36 @@ class KVMemWorkspaceScheduler:
         self.rawk = config.rawk_enabled()
         self.recent_tokens = config.recent_tokens()
         self.scores_emitted = 0
+
+        # Step 066: prefix assembly. The mamba groups are not stored page-wise
+        # (their blocks are recurrent state slots), but an assembled prefix is
+        # only valid if the recurrent state at its boundary is restored too, so
+        # the worker snapshots those slots at page-aligned boundaries.
+        self.load_enabled = config.load_enabled() and bool(self.group_ids)
+        self.snapshot_every_pages = config.snapshot_every_pages()
+        self.mamba_group_ids = [
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_page_bytes = {
+            group_id: kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.page_size_bytes
+            for group_id in self.mamba_group_ids
+        }
+        # trajectory -> page-aligned boundaries with a completed snapshot.
+        self._snapshots: dict[bytes, set[int]] = {}
+        # (trajectory, boundary) pairs already handed to the worker.
+        self._snapshot_sent: set[tuple[bytes, int]] = set()
+        # (trajectory, page offset) -> page token hash, so an assembled prefix
+        # is provably the *same tokens* this request would prefill (the
+        # trajectory key only pins the leading VLLM_KVMEM_TRAJ_PREFIX tokens).
+        self._page_hashes: dict[tuple[bytes, int], bytes] = {}
+        # request_id -> (KVCacheBlocks, matched tokens) awaiting the load job.
+        self._pending_loads: dict[str, tuple] = {}
+        self.loads_requested = 0
+        self.loads_completed = 0
+        self.snapshots_requested = 0
+        self.snapshots_completed = 0
 
         self.pages_evicted = 0
         self.pages_stored = 0
@@ -178,8 +212,16 @@ class KVMemWorkspaceScheduler:
         return hashlib.blake2b(tokens.tobytes(), digest_size=16).digest()
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens) -> None:
-        del blocks, num_external_tokens
         if request.request_id in self._req_trajectory:
+            # A repeated call for an in-flight request (preemption replay):
+            # only the assembly plan needs refreshing, and only for a fresh
+            # external allocation.
+            if num_external_tokens > 0 and request.request_id in self._pending_loads:
+                self._pending_loads[request.request_id] = (
+                    blocks,
+                    num_external_tokens,
+                    self._req_trajectory[request.request_id],
+                )
             return
         token_ids = getattr(request, "prompt_token_ids", None)
         if token_ids is None:
@@ -198,6 +240,12 @@ class KVMemWorkspaceScheduler:
             self.pages_stored,
             self.pages_dropped,
         )
+        if num_external_tokens > 0 and self.load_enabled:
+            self._pending_loads[request.request_id] = (
+                blocks,
+                num_external_tokens,
+                self._req_trajectory[request.request_id],
+            )
 
     # ------------------------------------------------------------------
     # eviction hand-off
@@ -228,10 +276,13 @@ class KVMemWorkspaceScheduler:
     ) -> None:
         """Tell the worker which token range of which trajectory this step is.
 
-        Only needed once the raw-K capture is armed; without it the workspace
-        is a write-only store and no position bookkeeping is required.
+        Only needed once the raw-K capture is armed, or (step 066) once prefix
+        assembly is: the snapshot capture also needs to know where each step
+        ends so it can grab the boundary state while its block is still in the
+        CoW window. Without both, the workspace is a write-only store and no
+        position bookkeeping is required.
         """
-        if not self.rawk or not self.group_ids:
+        if not (self.rawk or self.load_enabled) or not self.group_ids:
             return
         scheduled = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
         group_id = self.group_ids[0]
@@ -271,14 +322,137 @@ class KVMemWorkspaceScheduler:
                 )
                 self.scores_emitted += 1
 
+    @staticmethod
+    def _page_token_hash(token_ids, start: int, size: int) -> bytes:
+        tokens = np.asarray(token_ids[start:start + size], dtype=np.int64)
+        return hashlib.blake2b(tokens.tobytes(), digest_size=8).digest()
+
+    def _emit_snapshots(
+        self, meta: KVMemConnectorMetadata, scheduler_output
+    ) -> None:
+        """Request the mamba state at a page boundary this step just crossed.
+
+        The sliding window keeps the workspace's contiguous page prefix ~W
+        tokens behind the live sequence, so by the time page k is evicted the
+        recurrent state at boundary (k+1)*block_size is long gone from its
+        slot (the align-mode CoW window is two blocks). The only moment that
+        state is capturable is right after the step that completes the page:
+        the running slot then holds the exact state after ``end`` tokens --
+        the engine's own invariant ("slot p holds the state after exactly
+        (p + 1) * block_size tokens; state is written at chunk ends, so chunk
+        ends must be block aligned", scheduler._mamba_block_aligned_split).
+
+        Snapshots are taken every ``VLLM_KVMEM_SNAPSHOT_EVERY_PAGES`` pages:
+        each row is 80.4 MiB of host and the ring must outlive a boundary for
+        W/chunk_tokens steps before the page prefix reaches it, so denser
+        snapshots would need a proportionally larger ring for no assembly
+        gain -- a sparser ring just caps how much of the page run is
+        assemblable (the boundary falls back to the newest sparse one).
+        """
+        if not self.load_enabled or not self.mamba_group_ids:
+            return
+        scheduled = getattr(scheduler_output, "num_scheduled_tokens", None) or {}
+        block_state = getattr(scheduler_output, "kv_connector_block_state", None)
+        # Authoritative per-request block table (per group list of block ids),
+        # filled by the scheduler right before build_connector_meta; a block
+        # id of 0 is the shared null placeholder.
+        req_blocks_map = block_state.block_ids if block_state is not None else None
+        if not req_blocks_map:
+            return
+        group_id = self.group_ids[0]
+        block_size = self.block_size[group_id]
+        for req_id, num_tokens in scheduled.items():
+            trajectory = self._req_trajectory.get(req_id)
+            request = self._req_object.get(req_id)
+            group_tables = req_blocks_map.get(req_id)
+            if (
+                trajectory is None
+                or request is None
+                or num_tokens <= 0
+                or group_tables is None
+            ):
+                continue
+            start = request.num_computed_tokens
+            end = start + num_tokens
+            if end % block_size or end <= start:
+                # The mamba slot holds the state as of the *step end* (the
+                # chunked forward writes its recurrence straight into the
+                # running slot), so only a step that ends exactly on a page
+                # boundary yields the exact boundary state. This requires
+                # --max-num-batched-tokens to be a multiple of the page size;
+                # a step ending mid-page would snapshot a state that is ahead
+                # of the boundary by up to a chunk, and the assembled request
+                # would resume its recurrence from the wrong state.
+                continue
+            if (end // block_size) % max(1, self.snapshot_every_pages):
+                continue  # sparse ring: only every Nth page boundary
+            boundary = end
+            if (trajectory, boundary) in self._snapshot_sent:
+                continue
+            position = end // block_size - 1
+            blocks: list[tuple[int, int]] = []
+            null_groups = 0
+            for mamba_group in self.mamba_group_ids:
+                if mamba_group >= len(group_tables):
+                    null_groups += 1
+                    continue
+                group_blocks = group_tables[mamba_group]
+                if position >= len(group_blocks) or group_blocks[position] == 0:
+                    # Should not happen (the block is one behind the running
+                    # slot), but a null slot must never be snapshotted: the
+                    # copy would read recycled memory and silently poison the
+                    # workspace. A snapshot row is only usable if EVERY mamba
+                    # group's state landed (the load fills one row per group),
+                    # so any null group voids the whole boundary.
+                    null_groups += 1
+                    continue
+                blocks.append((mamba_group, group_blocks[position]))
+            self._snapshot_sent.add((trajectory, boundary))
+            if null_groups:
+                logger.warning(
+                    "vllm-030win KVMem snapshot (req=%s boundary=%d): %d mamba "
+                    "group(s) had a null slot at the boundary position; the "
+                    "boundary is not capturable",
+                    req_id,
+                    boundary,
+                    null_groups,
+                )
+                continue
+            self.snapshots_requested += 1
+            meta.snapshot_requests.append(
+                KVMemSnapshotRequest(
+                    trajectory=trajectory, boundary=boundary, blocks=blocks
+                )
+            )
+
     def build_connector_meta(self, scheduler_output) -> KVMemConnectorMetadata:
         meta = KVMemConnectorMetadata()
         self._emit_spans(meta, scheduler_output)
+        self._emit_snapshots(meta, scheduler_output)
+        self._emit_load_jobs(meta)
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         evictions = block_state.workspace_evictions if block_state else None
         if evictions:
             for req_id, entries in evictions.items():
                 trajectory = self._req_trajectory.get(req_id)
+                request = self._req_object.get(req_id)
+                # Step 066: pin each stored page's tokens. An assembled prefix
+                # must be the *same tokens* the assembling request carries; the
+                # trajectory key alone only pins the leading prefix tokens.
+                if self.load_enabled and trajectory and request is not None:
+                    token_ids = getattr(request, "prompt_token_ids", None)
+                    if token_ids:
+                        prompt_len = len(token_ids)
+                        page_size = self.block_size[self.group_ids[0]]
+                        for _, _, page_index in entries:
+                            start = page_index * page_size
+                            if start + page_size <= prompt_len:
+                                self._page_hashes.setdefault(
+                                    (trajectory, start),
+                                    self._page_token_hash(
+                                        token_ids, start, page_size
+                                    ),
+                                )
                 pages: list[KVMemPageTransfer] = []
                 retained = []
                 for group_id, block_id, page_index in entries:
@@ -385,15 +559,214 @@ class KVMemWorkspaceScheduler:
                 self.slots_used,
                 self.num_slots,
             )
+        # Step 066: snapshots and loads are DMA-verified before they count, so
+        # the assembly match can only ever see boundaries that really landed.
+        for trajectory, boundary in list(
+            getattr(worker_meta, "completed_snapshots", ())
+        ):
+            self._snapshots.setdefault(trajectory, set()).add(boundary)
+            self.snapshots_completed += 1
+            logger.info(
+                "vllm-030win KVMem snapshot: boundary %d of trajectory %s "
+                "captured (%d snapshot(s) available)",
+                boundary,
+                trajectory.hex()[:12],
+                len(self._snapshots[trajectory]),
+            )
+        for trajectory, boundary in list(
+            getattr(worker_meta, "removed_snapshots", ())
+        ):
+            boundaries = self._snapshots.get(trajectory)
+            if boundaries is not None:
+                boundaries.discard(boundary)
+        for req_id in list(getattr(worker_meta, "finished_load_reqs", ())):
+            self.loads_completed += 1
+            logger.info(
+                "vllm-030win KVMem assembly: request %s prefix landed; "
+                "cumulative requested=%d completed=%d",
+                req_id,
+                self.loads_requested,
+                self.loads_completed,
+            )
 
     # ------------------------------------------------------------------
     # connector surface
     # ------------------------------------------------------------------
 
+    def _emit_load_jobs(self, meta: KVMemConnectorMetadata) -> None:
+        """Turn the assembly plan of this step's admissions into load jobs.
+
+        Runs in the same schedule() step as ``update_state_after_alloc``, so
+        the ``KVCacheBlocks`` handed over there still describe this request's
+        block table: attention rows 0..E-1 are the freshly allocated blocks the
+        workspace pages go into, and the mamba rows carry exactly one real
+        block (position E-1, from the MambaManager external-allocation patch)
+        that receives the boundary snapshot.
+        """
+        if not self._pending_loads:
+            return
+        for req_id, (blocks, matched, trajectory) in list(
+            self._pending_loads.items()
+        ):
+            self._pending_loads.pop(req_id, None)
+            group_id = self.group_ids[0]
+            block_size = self.block_size[group_id]
+            num_pages = matched // block_size
+            pages: list[KVMemPageLoad] = []
+            missing_slot = False
+            for gid in self.group_ids:
+                group_blocks = blocks.blocks[gid]
+                for page_index in range(num_pages):
+                    if page_index >= len(group_blocks) or group_blocks[
+                        page_index
+                    ].is_null:
+                        logger.error(
+                            "vllm-030win KVMem assembly (req=%s): group %d has "
+                            "no real block at page %d; skipping the load",
+                            req_id,
+                            gid,
+                            page_index,
+                        )
+                        missing_slot = True
+                        break
+                    slot = self._page_table.get((trajectory, page_index * block_size))
+                    if slot is None:
+                        logger.error(
+                            "vllm-030win KVMem assembly (req=%s): page %d of "
+                            "trajectory %s vanished from the page table; "
+                            "skipping the load",
+                            req_id,
+                            page_index,
+                            trajectory.hex()[:12],
+                        )
+                        missing_slot = True
+                        break
+                    pages.append(
+                        KVMemPageLoad(
+                            group_id=gid,
+                            block_id=group_blocks[page_index].block_id,
+                            page_index=page_index,
+                            slot=slot,
+                        )
+                    )
+                if missing_slot:
+                    break
+            if missing_slot:
+                continue
+            snapshots: list[tuple[int, int, int]] = []
+            for mamba_group in self.mamba_group_ids:
+                group_blocks = blocks.blocks[mamba_group]
+                position = num_pages - 1
+                if position >= len(group_blocks) or group_blocks[position].is_null:
+                    logger.error(
+                        "vllm-030win KVMem assembly (req=%s): mamba group %d "
+                        "has no real state block at position %d; skipping the "
+                        "load (the assembled prefix would resume from a zeroed "
+                        "recurrent state)",
+                        req_id,
+                        mamba_group,
+                        position,
+                    )
+                    snapshots = []
+                    break
+                snapshots.append(
+                    (mamba_group, group_blocks[position].block_id, matched)
+                )
+            if not snapshots:
+                continue
+            self.loads_requested += 1
+            meta.load_jobs.append(
+                KVMemLoadJob(
+                    job_id=self._next_job_id,
+                    req_id=req_id,
+                    trajectory=trajectory,
+                    num_tokens=matched,
+                    pages=pages,
+                    mamba_snapshots=snapshots,
+                )
+            )
+            self._next_job_id += 1
+
+    def _assembly_match(self, request, num_computed_tokens: int) -> int:
+        """Token boundary this request can have assembled, or 0.
+
+        The boundary must simultaneously be (a) the end of a contiguous run of
+        stored pages, (b) a boundary whose mamba snapshot has landed, and (c)
+        built from pages whose tokens are provably identical to this request's
+        prompt at the same offsets.
+        """
+        if num_computed_tokens > 0:
+            # Assembly must own the whole prefix; a local prefix-cache hit
+            # would interleave blocks this connector does not manage.
+            return 0
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if token_ids is None:
+            token_ids = getattr(request, "all_token_ids", None)
+        if not token_ids:
+            return 0
+        trajectory = self.trajectory_key(token_ids, self.trajectory_prefix_tokens)
+        group_id = self.group_ids[0]
+        block_size = self.block_size[group_id]
+        prompt_len = len(token_ids)
+        num_pages = 0
+        while (
+            num_pages * block_size + block_size <= prompt_len
+            and (trajectory, num_pages * block_size) in self._page_table
+        ):
+            num_pages += 1
+        if num_pages == 0:
+            return 0
+        page_boundary = num_pages * block_size
+        available = self._snapshots.get(trajectory)
+        if not available:
+            return 0
+        # The recurrent state must be exact at the boundary we jump to, so the
+        # assembly boundary is a *snapshot* boundary, capped by the page run.
+        candidates = [b for b in available if b <= page_boundary]
+        if not candidates:
+            return 0
+        boundary = max(candidates)
+        if boundary < block_size:
+            return 0
+        pages = boundary // block_size
+        for page_index in range(pages):
+            key = (trajectory, page_index * block_size)
+            recorded = self._page_hashes.get(key)
+            if recorded is None or recorded != self._page_token_hash(
+                token_ids, page_index * block_size, block_size
+            ):
+                if boundary > page_index * block_size:
+                    logger.info(
+                        "vllm-030win KVMem assembly: trajectory %s page %d "
+                        "token hash mismatch (prompt diverged from the stored "
+                        "pages); capping the boundary at %d tokens",
+                        trajectory.hex()[:12],
+                        page_index,
+                        page_index * block_size,
+                    )
+                boundary = min(boundary, page_index * block_size)
+                break
+        if boundary < block_size or boundary >= prompt_len:
+            # Never claim the whole prompt: the scheduler clamps a full hit
+            # back to num_tokens - 1, which is not page aligned.
+            return 0
+        return boundary
+
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
-        del request, num_computed_tokens
-        # Stage 1 K1 stores pages only; retrieval/rematerialisation is K3.
-        return 0, False
+        if not self.load_enabled:
+            # Stage 1 K1 stores pages only; retrieval/rematerialisation is K3.
+            return 0, False
+        boundary = self._assembly_match(request, num_computed_tokens)
+        if not boundary:
+            return 0, False
+        logger.info(
+            "vllm-030win KVMem assembly: request %s matches at %d tokens "
+            "(%d stored page(s)); async load",
+            request.request_id,
+            boundary,
+            boundary // self.block_size[self.group_ids[0]],
+        )
+        return boundary, True
 
     def request_finished(self, request, block_ids):
         del block_ids
@@ -401,6 +774,7 @@ class KVMemWorkspaceScheduler:
         self._req_object.pop(request.request_id, None)
         self._req_prompt_len.pop(request.request_id, None)
         self._req_scored.discard(request.request_id)
+        self._pending_loads.pop(request.request_id, None)
         base = self._req_baseline.pop(request.request_id, None)
         if base is None:
             base = (0, 0, 0)
@@ -457,4 +831,8 @@ class KVMemWorkspaceScheduler:
         self._req_object.clear()
         self._req_prompt_len.clear()
         self._req_scored.clear()
+        self._snapshots.clear()
+        self._snapshot_sent.clear()
+        self._page_hashes.clear()
+        self._pending_loads.clear()
         self.slots_used = 0

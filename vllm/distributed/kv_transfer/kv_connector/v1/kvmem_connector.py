@@ -93,8 +93,11 @@ class KVMemConnector(KVConnectorBase_V1, SupportsHMA):
             self.worker_handler.clear_connector_metadata()
 
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs: Any) -> None:
-        # Stage 1 K1 stores only; retrieval/rematerialisation is K3.
-        return
+        # Stage 1 K1 stored pages only; step 066 issues the prefix-assembly
+        # copies here (the assembling request's step schedules zero tokens, and
+        # the no-forward worker path calls only this hook).
+        if self.worker_handler is not None:
+            self.worker_handler.start_load_kv()
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         return

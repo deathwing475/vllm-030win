@@ -116,6 +116,27 @@ rem .npz beside each report (page mean-K, the per-head-group query, per-sub-bloc
 rem and per-page logits). One 200K ingest costs ~4.5 minutes, so the arrays are
 rem dumped once and re-scored offline rather than one engine run per hypothesis.
 set "VLLM_KVMEM_DUMP_KBAR=1"
+rem Step 066: prefix assembly. A later request of the same trajectory gets the
+rem stored pages (original positions, no re-RoPE) copied into its first blocks
+rem and num_computed_tokens jumped past them, so only the delta is prefilled;
+rem the mamba groups' recurrent state is restored from a page-aligned snapshot
+rem the worker captured during the ingest prefill. Requires the MambaManager
+rem external-allocation patch (tools\apply_kvmem_mamba_ext_step066.py).
+rem --max-num-batched-tokens 1424: a mamba snapshot is only exact when the step
+rem ends on a page boundary (the chunked recurrence writes the running slot
+rem directly), so the prefill chunk MUST stay a page multiple. 1424 (not a
+rem multiple of pages) because the sliding-window admission term
+rem cdiv(W-1+max_in_flight, page)+1 stays at 117 blocks per group only up to
+rem the next cdiv boundary - 9968 (7 pages) grew it to 123 and the boot check
+rem demanded 161 MiB more than the pool has.
+rem SNAPSHOT_KEEP 20 rows x 80.4 MiB: a captured boundary must survive until
+rem the page prefix reaches it, i.e. W/1424 ~ 114.6 steps, during which
+rem 114.6/8 ~ 14.4 newer snapshots push through the ring - 20 rows suffice.
+set "VLLM_KVMEM_LOAD=1"
+set "VLLM_KVMEM_SNAPSHOT_KEEP=20"
+set "VLLM_KVMEM_SNAPSHOT_EVERY_PAGES=8"
+set "VLLM_KVMEM_SNAPSHOT_TRAJ=2"
+set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k4a"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "LIB=C:\PROGRA~1\NVIDIA~2\CUDA\v13.3\lib\x64;%LIB%"
 del /q "G:\qwen3.8model\_tmp_prod029\vllm_offload_*.mmap" 2>nul
@@ -130,7 +151,7 @@ powershell -NoProfile -Command "Get-NetTCPConnection -LocalPort 8080 -ErrorActio
   --kv-cache-memory-bytes 3400000000 ^
   --gpu-memory-utilization 0.922 ^
   --max-model-len 262144 ^
-  --max-num-seqs 1 --max-num-batched-tokens 1024 ^
+  --max-num-seqs 1 --max-num-batched-tokens 1424 ^
   --enable-prefix-caching ^
   --enable-auto-tool-choice ^
   --tool-call-parser qwen3_coder ^

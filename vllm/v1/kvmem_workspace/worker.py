@@ -17,6 +17,7 @@ out of the block pool until the bytes are safely on the host.
 import json
 import os
 import time
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -24,7 +25,7 @@ import torch
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
-from vllm.v1.kv_cache_interface import group_kernel_blocks
+from vllm.v1.kv_cache_interface import MambaSpec, group_kernel_blocks
 from vllm.v1.kvmem_workspace import capture, config, remat
 from vllm.v1.kvmem_workspace.groups import workspace_group_ids
 from vllm.v1.kvmem_workspace.index import KVMemMeanKIndex
@@ -99,6 +100,7 @@ class KVMemWorkspaceWorker:
         self._scratch_host2: dict[int, torch.Tensor] = {}
 
         self._pending: KVMemConnectorMetadata | None = None
+        self._loads_issued = False
         self._events: dict[int, torch.Event] = {}
         self._completed: list[int] = []
         self._selftest_done = 0
@@ -131,6 +133,53 @@ class KVMemWorkspaceWorker:
         self._remat_max_byte_diff = 0
         self._remat_max_abs_delta = 0.0
         self._remat_reports: list[dict] = []
+
+        # Step 066: mamba state snapshots and prefix loads. The mamba groups
+        # are not part of the page store, but an assembled prefix needs the
+        # recurrent state at its boundary, so the worker keeps a small ring of
+        # page-aligned state snapshots per (group, layer) and copies them back
+        # into the assembling request's state block.
+        self.mamba_group_ids = [
+            group_id
+            for group_id, group in enumerate(kv_cache_config.kv_cache_groups)
+            if isinstance(group.kv_cache_spec, MambaSpec)
+        ]
+        self.mamba_page_bytes = {
+            group_id: kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.page_size_bytes
+            for group_id in self.mamba_group_ids
+        }
+        self.snapshot_keep = config.snapshot_keep()
+        self.snapshot_traj = config.snapshot_trajectories()
+        # (group_id, layer_name) -> (traj_slots * keep, page_bytes) pinned region
+        self._snapshot_host: dict[tuple[int, str], torch.Tensor] = {}
+        # (group_id, layer_name) -> gpu state-slot views of the mamba groups
+        self._mamba_views: dict[tuple[int, str], torch.Tensor] = {}
+        self._mamba_layers_per_group: dict[int, list[str]] = {}
+        # trajectory -> {boundary: row}, FIFO per trajectory. The ring is
+        # per-trajectory on purpose: a global FIFO lets a second trajectory's
+        # prefill evict the first one's snapshots, which silently disables
+        # assembly for the first (measured in the step 066 second boot: the
+        # flush request wiped the ingest trajectory's ring and the serve
+        # request fell back to a full prefill).
+        self._snapshot_rings: dict[bytes, OrderedDict[int, int]] = {}
+        # trajectory -> base row of its ring inside the shared region
+        self._snapshot_bases: dict[bytes, int] = {}
+        self._snapshot_events: dict[tuple[bytes, int], torch.Event] = {}
+        self._load_events: dict[str, torch.Event] = {}
+        self._completed_snapshots: list[tuple[bytes, int]] = []
+        self._removed_snapshots: list[tuple[bytes, int]] = []
+        self._finished_loads: set[str] = set()
+        self.snapshots_taken = 0
+        self.snapshots_evicted = 0
+        self.loads_served = 0
+        self.bytes_loaded = 0
+
+    def _snapshot_row(self, trajectory: bytes, boundary: int) -> int | None:
+        """Row of a captured boundary, or None if it is not resident."""
+        ring = self._snapshot_rings.get(trajectory)
+        if not ring:
+            return None
+        return ring.get(boundary)
 
     # ------------------------------------------------------------------
     # registration
@@ -237,6 +286,50 @@ class KVMemWorkspaceWorker:
                 self.num_slots,
                 self.num_slots * page * len(layer_names) / (1024**3),
                 block_stride_bytes,
+            )
+        # Step 066: register the mamba groups' state-slot views and the
+        # snapshot ring. One snapshot row is one full state of every mamba
+        # group (page_bytes per layer), so a row index addresses the same
+        # boundary across all of them.
+        if self.mamba_group_ids and config.load_enabled():
+            for group_id in self.mamba_group_ids:
+                group = self.kv_cache_config.kv_cache_groups[group_id]
+                page = self.mamba_page_bytes[group_id]
+                layer_names: list[str] = []
+                for layer_name in group.layer_names:
+                    ref = group_kernel_blocks(kv_caches[layer_name], num_blocks)
+                    elem_size = ref.element_size()
+                    byte_offset = ref.storage_offset() * elem_size
+                    stride_bytes = ref.stride(0) * elem_size
+                    view = torch.tensor(
+                        [], dtype=torch.int8, device=ref.device
+                    ).set_(
+                        ref.untyped_storage(),
+                        byte_offset,
+                        (num_blocks, page),
+                        (stride_bytes, 1),
+                    )
+                    self._mamba_views[(group_id, layer_name)] = view
+                    self._snapshot_host[(group_id, layer_name)] = _alloc_host(
+                        self.snapshot_traj * self.snapshot_keep, page
+                    )
+                    layer_names.append(layer_name)
+                self._mamba_layers_per_group[group_id] = layer_names
+            total_bytes = self.snapshot_traj * self.snapshot_keep * sum(
+                self.mamba_page_bytes[group_id]
+                * len(self._mamba_layers_per_group[group_id])
+                for group_id in self.mamba_group_ids
+            )
+            logger.info(
+                "vllm-030win KVMem assembly (step 066): mamba groups %s "
+                "registered, %d layer(s), state slot %s B per layer, snapshot "
+                "region %d x %d row(s) (%.2f GiB host)",
+                self.mamba_group_ids,
+                sum(len(v) for v in self._mamba_layers_per_group.values()),
+                next(iter(self.mamba_page_bytes.values()), 0),
+                self.snapshot_traj,
+                self.snapshot_keep,
+                total_bytes / (1024**3),
             )
 
     # ------------------------------------------------------------------
@@ -664,9 +757,26 @@ class KVMemWorkspaceWorker:
     def bind_connector_metadata(self, metadata) -> None:
         if isinstance(metadata, KVMemConnectorMetadata):
             self._pending = metadata
+            self._loads_issued = False
 
     def clear_connector_metadata(self) -> None:
         self._pending = None
+
+    def start_load_kv(self) -> None:
+        """Issue this step's prefix-assembly copies.
+
+        This runs from ``start_load_kv`` rather than ``wait_for_save`` because
+        the assembling request sits in ``WAITING_FOR_REMOTE_KVS``: its step
+        schedules zero tokens, and the no-forward worker path calls only
+        ``start_load_kv`` (``wait_for_save`` is skipped there). Issuing the copy
+        from the save path would never fire and the request would wait forever.
+        """
+        metadata = self._pending
+        if metadata is None or self._loads_issued:
+            return
+        self._loads_issued = True
+        if getattr(metadata, "load_jobs", None):
+            self._run_loads(metadata.load_jobs)
 
     @staticmethod
     def _copy(entries: list[tuple[int, int, int]]) -> None:
@@ -814,35 +924,185 @@ class KVMemWorkspaceWorker:
         if getattr(metadata, "score_requests", None):
             self._score(metadata)
         if not metadata.store_jobs:
-            return
+            pass
+        else:
+            started = time.monotonic()
+            for job in metadata.store_jobs:
+                entries: list[tuple[int, int, int]] = []
+                for page in job.pages:
+                    for layer_name in self._layers_per_group.get(page.group_id, ()):
+                        src_view = self._gpu_views[(page.group_id, layer_name)]
+                        host = self._host[(page.group_id, layer_name)]
+                        entries.append(
+                            (
+                                src_view[page.block_id].data_ptr(),
+                                host[page.slot].data_ptr(),
+                                self.page_bytes[page.group_id],
+                            )
+                        )
+                self._copy(entries)
+                if config.roundtrip_selftest():
+                    self._run_selftest(job)
+                if config.authority_enabled() and config.roundtrip_selftest():
+                    self._run_remat_selftest(job)
+                event = torch.cuda.Event()
+                event.record()
+                self._events[job.job_id] = event
+                self.bytes_stored += sum(
+                    self.page_bytes[p.group_id]
+                    * len(self._layers_per_group.get(p.group_id, ()))
+                    for p in job.pages
+                )
+            self.store_seconds += time.monotonic() - started
+        # Step 066: loads are issued from ``start_load_kv`` (see there), so a
+        # load job can never race the snapshot ring evicting the boundary it
+        # reads -- loads run at the start of a step, snapshots at its end.
+        if getattr(metadata, "snapshot_requests", None):
+            self._take_snapshots(metadata.snapshot_requests)
+
+    def _run_loads(self, load_jobs) -> None:
+        """Copy workspace pages and mamba snapshots into request blocks.
+
+        The inverse of the store path: the host slot (or snapshot row) is the
+        source, the request's freshly allocated block is the destination. The
+        copies are issued on the current stream and tracked per request with a
+        CUDA event; ``get_finished`` reports the request back to the scheduler
+        only once its event has fired, which is what keeps
+        ``WAITING_FOR_REMOTE_KVS`` honest.
+        """
         started = time.monotonic()
-        for job in metadata.store_jobs:
+        for job in load_jobs:
             entries: list[tuple[int, int, int]] = []
+            missing_snapshot = False
+            snapshot_slot = self._snapshot_row(job.trajectory, job.num_tokens)
+            if job.mamba_snapshots and snapshot_slot is None:
+                logger.error(
+                    "vllm-030win KVMem assembly: trajectory %s boundary %d "
+                    "has no snapshot row; refusing to load (the request would "
+                    "resume from a zeroed recurrent state)",
+                    job.trajectory.hex()[:12],
+                    job.num_tokens,
+                )
+                missing_snapshot = True
+            if missing_snapshot:
+                continue
             for page in job.pages:
                 for layer_name in self._layers_per_group.get(page.group_id, ()):
-                    src_view = self._gpu_views[(page.group_id, layer_name)]
-                    host = self._host[(page.group_id, layer_name)]
+                    src = self._host[(page.group_id, layer_name)][page.slot]
+                    dst = self._gpu_views[(page.group_id, layer_name)][
+                        page.block_id
+                    ]
                     entries.append(
                         (
-                            src_view[page.block_id].data_ptr(),
-                            host[page.slot].data_ptr(),
+                            src.data_ptr(),
+                            dst.data_ptr(),
                             self.page_bytes[page.group_id],
                         )
                     )
+            for group_id, block_id, _ in job.mamba_snapshots:
+                for layer_name in self._mamba_layers_per_group.get(group_id, ()):
+                    src = self._snapshot_host[(group_id, layer_name)][
+                        snapshot_slot
+                    ]
+                    dst = self._mamba_views[(group_id, layer_name)][block_id]
+                    entries.append(
+                        (
+                            src.data_ptr(),
+                            dst.data_ptr(),
+                            self.mamba_page_bytes[group_id],
+                        )
+                    )
             self._copy(entries)
-            if config.roundtrip_selftest():
-                self._run_selftest(job)
-            if config.authority_enabled() and config.roundtrip_selftest():
-                self._run_remat_selftest(job)
             event = torch.cuda.Event()
             event.record()
-            self._events[job.job_id] = event
-            self.bytes_stored += sum(
+            self._load_events[job.req_id] = event
+            self.loads_served += 1
+            self.bytes_loaded += sum(
                 self.page_bytes[p.group_id]
                 * len(self._layers_per_group.get(p.group_id, ()))
                 for p in job.pages
+            ) + sum(
+                self.mamba_page_bytes[g]
+                * len(self._mamba_layers_per_group.get(g, ()))
+                for g, _, _ in job.mamba_snapshots
+            )
+            logger.info(
+                "vllm-030win KVMem assembly: job for request %s issued (%d "
+                "page(s) + %d mamba state block(s), boundary %d)",
+                job.req_id,
+                len(job.pages),
+                len(job.mamba_snapshots),
+                job.num_tokens,
             )
         self.store_seconds += time.monotonic() - started
+
+    def _take_snapshots(self, snapshot_requests) -> None:
+        """Copy the mamba state slots at page-aligned boundaries to the host.
+
+        Each request names the block one page behind the step's end, which the
+        align-mode CoW keeps intact (it only advances its running slot, and
+        frees the previous one two steps later). Each trajectory owns a FIFO
+        ring of ``snapshot_keep`` rows; the evicted boundaries are reported
+        back so the scheduler stops matching against them.
+        """
+        for snapshot in snapshot_requests:
+            trajectory = snapshot.trajectory
+            ring = self._snapshot_rings.get(trajectory)
+            if ring is None:
+                if len(self._snapshot_bases) >= self.snapshot_traj:
+                    # All trajectory slots taken: evict the least recently
+                    # started ring whole. Its boundaries are reported as
+                    # removed so the scheduler stops matching them.
+                    oldest = next(iter(self._snapshot_bases))
+                    old_ring = self._snapshot_rings.pop(oldest)
+                    for boundary in old_ring:
+                        self._removed_snapshots.append((oldest, boundary))
+                    logger.warning(
+                        "vllm-030win KVMem snapshot: evicting the whole ring "
+                        "of trajectory %s (%d boundary(ies)) to make room for "
+                        "%s; raise VLLM_KVMEM_SNAPSHOT_TRAJ to keep more",
+                        oldest.hex()[:12],
+                        len(old_ring),
+                        trajectory.hex()[:12],
+                    )
+                    base = self._snapshot_bases.pop(oldest)
+                    self._snapshot_bases[trajectory] = base
+                else:
+                    base = len(self._snapshot_bases) * self.snapshot_keep
+                    self._snapshot_bases[trajectory] = base
+                ring = OrderedDict()
+                self._snapshot_rings[trajectory] = ring
+            if snapshot.boundary in ring:
+                continue
+            base = self._snapshot_bases[trajectory]
+            free_row = None
+            for offset in range(self.snapshot_keep):
+                if offset not in ring.values():
+                    free_row = base + offset
+                    break
+            if free_row is None:
+                evicted_boundary, evicted_row = ring.popitem(last=False)
+                self._removed_snapshots.append((trajectory, evicted_boundary))
+                self.snapshots_evicted += 1
+                free_row = evicted_row
+            entries: list[tuple[int, int, int]] = []
+            for group_id, block_id in snapshot.blocks:
+                for layer_name in self._mamba_layers_per_group.get(group_id, ()):
+                    src = self._mamba_views[(group_id, layer_name)][block_id]
+                    dst = self._snapshot_host[(group_id, layer_name)][free_row]
+                    entries.append(
+                        (
+                            src.data_ptr(),
+                            dst.data_ptr(),
+                            self.mamba_page_bytes[group_id],
+                        )
+                    )
+            self._copy(entries)
+            event = torch.cuda.Event()
+            event.record()
+            ring[snapshot.boundary] = free_row
+            self._snapshot_events[(trajectory, snapshot.boundary)] = event
+            self.snapshots_taken += 1
 
     def _run_selftest(self, job) -> None:
         """Copy each stored page back and compare it byte for byte.
@@ -927,13 +1187,40 @@ class KVMemWorkspaceWorker:
             if event.query():
                 del self._events[job_id]
                 self._completed.append(job_id)
-        return set(), set()
+        # Step 066: a request whose assembly copy has fired is reported as
+        # finished *recving*, which is what promotes it out of
+        # WAITING_FOR_REMOTE_KVS. The set is kept until
+        # build_connector_worker_meta has also carried it (the mixin calls the
+        # two in that order), since the scheduler's bookkeeping consumes the
+        # meta too; re-reporting is idempotent there.
+        for req_id, event in list(self._load_events.items()):
+            if event.query():
+                del self._load_events[req_id]
+                self._finished_loads.add(req_id)
+        for key, event in list(self._snapshot_events.items()):
+            if event.query():
+                del self._snapshot_events[key]
+                self._completed_snapshots.append(key)
+        return set(), set(self._finished_loads)
 
     def build_connector_worker_meta(self) -> KVMemWorkerMetadata | None:
-        if not self._completed:
+        if not (
+            self._completed
+            or self._completed_snapshots
+            or self._removed_snapshots
+            or self._finished_loads
+        ):
             return None
-        meta = KVMemWorkerMetadata(completed_store_jobs=self._completed)
+        meta = KVMemWorkerMetadata(
+            completed_store_jobs=self._completed,
+            completed_snapshots=self._completed_snapshots,
+            removed_snapshots=self._removed_snapshots,
+            finished_load_reqs=sorted(self._finished_loads),
+        )
         self._completed = []
+        self._completed_snapshots = []
+        self._removed_snapshots = []
+        self._finished_loads = set()
         return meta
 
     def stats(self) -> dict:
