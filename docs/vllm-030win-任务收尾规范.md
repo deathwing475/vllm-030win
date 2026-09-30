@@ -65,6 +65,7 @@
 4. **索引超限时做一次纯目录化**：用脚本把每条索引行的长描述搬回各自 topic 文件（已存在则末尾追加"来自 MEMORY.md 索引行"一节，信息零删减），再重写索引。2026-09-30 已做过一次（29.6 KB → 18.4 KB，119 条全部搬运，0 个文件缺失；脚本 `_tmp_line_b/slim_memory_index.py`，备份 `MEMORY.md.bak-20260930-slim`）。
 5. **允许用脚本搬运记忆文件**（memory 目录不在 git 仓库里，不受"仓库内文件写入走 Write/Edit"约束）；但**搬运必须零删减**，hook 允许直接截断原文而不是手写。
 6. **索引开头必须保留「给 AI 的使用规则」块**（2026-09-30 用户指令）：明示"本文件只是目录、详情在 topic 文件、**禁止把目录指向的文件全读一遍**（100+ 个文件全读会把上下文撑爆）、只有直接相关才读、一次最多 2-3 个"。改 MEMORY.md 头部时**不得删掉这个块**。
+7. **按项目归档（2026-09-30 用户指令「归档 MEMORY.md，只需要留注意事项和本项目相关」）**：非本项目条目（ninfer-5080 / decode-gemv / 打擂 / minicpm5 / ragflow / ocr / cavoti / nvfp4 论文精读 / gsq-vision / q3g64 / vision-hostmapped 等 45 条）整行移至 `memory/MEMORY-archive.md`（原样零删减），**topic 文件一律不动**；MEMORY.md 头部注释标明归档位置；恢复 = 把行搬回条目区。脚本 `_tmp_line_b/archive_memory_index.py`（分类规则显式写在脚本里；**注意名单比较要先 `os.path.splitext` 去掉 `.md` 后缀**——首版因此漏移 21 条，靠"归档前先备份 + 复核归档清单"兜住）。归档前必备份（先例 `MEMORY.md.bak-20260930-slim` / `.bak-20260930-archive`）。保留口径 = vllm-030win 及其前身战役（vllm-overlay / dflash2 / humming / GSQ / KV 池 / MTP）+ 用户通用铁律与工作偏好 + 通用方法论（测量纪律 / 外锚 / CRLF / nsys / 子智能体规则等）。
 
 ---
 
