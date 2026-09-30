@@ -23,8 +23,9 @@ import torch
 
 from vllm import _custom_ops as ops
 from vllm.logger import init_logger
+from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import group_kernel_blocks
-from vllm.v1.kvmem_workspace import capture, config
+from vllm.v1.kvmem_workspace import capture, config, remat
 from vllm.v1.kvmem_workspace.groups import workspace_group_ids
 from vllm.v1.kvmem_workspace.index import KVMemMeanKIndex
 from vllm.v1.kvmem_workspace.metadata import (
@@ -35,6 +36,7 @@ from vllm.v1.kvmem_workspace.metadata import (
 logger = init_logger(__name__)
 
 SELFTEST_PAGES = 8
+REMAT_SELFTEST_PAGES = 4
 
 
 def _alloc_host(num_slots: int, page: int) -> torch.Tensor:
@@ -87,6 +89,10 @@ class KVMemWorkspaceWorker:
         # (group_id, layer_name) -> (num_slots, page_bytes) pinned int8
         self._host: dict[tuple[int, str], torch.Tensor] = {}
         self._layers_per_group: dict[int, list[str]] = {}
+        self._group_of_layer: dict[str, int] = {}
+        self._layer_name_by_index: dict[int, str] = {}
+        self._block_size: dict[int, int] = {}
+        self._geometry: dict[int, remat.PageGeometry] = {}
         # scratch buffers for the round-trip self test
         self._scratch_gpu: dict[int, torch.Tensor] = {}
         self._scratch_host: dict[int, torch.Tensor] = {}
@@ -109,6 +115,23 @@ class KVMemWorkspaceWorker:
         self._retrieval_reports: list[dict] = []
         self._score_seconds = 0.0
 
+        # K3 second half (step 064): the pre-RoPE rotary prefix kept as the
+        # rematerialisation authority. trajectory -> layer -> fp16
+        # (authority_tokens, num_kv_heads * rotary_dim).
+        self._authority: dict[bytes, dict[str, torch.Tensor]] = {}
+        self._authority_bytes = 0
+        self._authority_missing = 0
+        self._authority_unmapped = 0
+        self._authority_rows_written = 0
+        self._rotary = None
+        self._rotary_dim: int | None = None
+        self._remat_done = 0
+        self._remat_missing = 0
+        self._remat_mismatch = 0
+        self._remat_max_byte_diff = 0
+        self._remat_max_abs_delta = 0.0
+        self._remat_reports: list[dict] = []
+
     # ------------------------------------------------------------------
     # registration
     # ------------------------------------------------------------------
@@ -125,6 +148,13 @@ class KVMemWorkspaceWorker:
             group = self.kv_cache_config.kv_cache_groups[group_id]
             spec = group.kv_cache_spec
             page = self.page_bytes[group_id]
+            self._block_size[group_id] = spec.block_size
+            self._geometry[group_id] = remat.PageGeometry(
+                head_size=spec.head_size,
+                num_heads=spec.num_kv_heads,
+                block_size=spec.block_size,
+                rotary_dim=self._rotary_prefix_width(spec.head_size),
+            )
             layer_names: list[str] = []
             for layer_name in group.layer_names:
                 ref = group_kernel_blocks(kv_caches[layer_name], num_blocks)
@@ -144,6 +174,32 @@ class KVMemWorkspaceWorker:
                     self.num_slots, page
                 )
                 layer_names.append(layer_name)
+                self._group_of_layer[layer_name] = group_id
+                # The capture and the retrieval index key layers by *index*
+                # (``extract_layer_index``), the workspace keys them by name.
+                # The authority crosses the two spaces, so the bridge is built
+                # here once; a missing entry is counted and warned about rather
+                # than silently dropping the rows (step 064 hit exactly that).
+                try:
+                    index = extract_layer_index(layer_name)
+                except Exception as exc:  # noqa: BLE001 - report, keep going
+                    logger.warning(
+                        "vllm-030win KVMem authority: cannot derive a layer "
+                        "index from %r (%r); its pages will not be "
+                        "rematerialisable",
+                        layer_name,
+                        exc,
+                    )
+                    continue
+                existing = self._layer_name_by_index.setdefault(index, layer_name)
+                if existing != layer_name:
+                    logger.warning(
+                        "vllm-030win KVMem authority: layer index %d is shared "
+                        "by %r and %r; the authority will use the first",
+                        index,
+                        existing,
+                        layer_name,
+                    )
             self._layers_per_group[group_id] = layer_names
             self._scratch_gpu[group_id] = torch.zeros(
                 (page,), dtype=torch.int8, device="cuda"
@@ -164,6 +220,400 @@ class KVMemWorkspaceWorker:
                 self.num_slots,
                 self.num_slots * page * len(layer_names) / (1024**3),
                 block_stride_bytes,
+            )
+
+    # ------------------------------------------------------------------
+    # K3 second half: rematerialisation authority (step 064)
+    # ------------------------------------------------------------------
+
+    def _text_config(self):
+        hf = self.vllm_config.model_config.hf_config
+        getter = getattr(hf, "get_text_config", None)
+        return getter() if callable(getter) else hf
+
+    def _rotary_prefix_width(self, head_size: int) -> int:
+        """How many head dims the model rotates (partial rotary factor)."""
+        if self._rotary_dim is None:
+            rope = getattr(self._text_config(), "rope_parameters", None) or {}
+            factor = float(rope.get("partial_rotary_factor", 1.0))
+            self._rotary_dim = max(1, int(head_size * factor))
+        return self._rotary_dim
+
+    def _rotary_embedding(self):
+        """The model's own rotary embedding, so the convention cannot drift.
+
+        ``get_rope`` is memoised on its arguments, so this returns the very
+        instance ``Qwen3NextAttention`` built and therefore the very
+        ``cos_sin_cache`` the forward pass rotates with. The config context is
+        re-entered because the object is a ``CustomOp``.
+        """
+        if self._rotary is not None:
+            return self._rotary
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.layers.rotary_embedding import get_rope
+
+        text = self._text_config()
+        head_size = next(iter(self._geometry.values())).head_size
+        max_position = int(getattr(text, "max_position_embeddings", 0) or 0)
+        if not max_position:
+            max_position = self.vllm_config.model_config.max_model_len
+        with set_current_vllm_config(self.vllm_config):
+            self._rotary = get_rope(
+                head_size=head_size,
+                max_position=max_position,
+                rope_parameters=getattr(text, "rope_parameters", None),
+                dual_chunk_attention_config=None,
+            )
+        cache = self._rotary.cos_sin_cache
+        if cache.shape[-1] != self._rotary_prefix_width(head_size):
+            raise RuntimeError(
+                "vllm-030win KVMem authority: cos_sin_cache width "
+                f"{cache.shape[-1]} does not match the rotary prefix "
+                f"{self._rotary_prefix_width(head_size)}"
+            )
+        logger.info(
+            "vllm-030win patch (step 064): KVMem authority rotary = %s, cache "
+            "%s %s, rotary_dim %d, is_neox=%s, interleaved=%s",
+            type(self._rotary).__name__,
+            tuple(cache.shape),
+            cache.dtype,
+            self._rotary.rotary_dim,
+            self._rotary.is_neox_style,
+            getattr(self._rotary, "mrope_interleaved", None),
+        )
+        return self._rotary
+
+    def _authority_width(self) -> int:
+        geom = next(iter(self._geometry.values()))
+        return geom.num_heads * geom.rotary_dim
+
+    def _authority_region(
+        self, trajectory: bytes, layer_name: str
+    ) -> torch.Tensor | None:
+        """This trajectory's authority for one layer, allocated on first use."""
+        per_trajectory = self._authority.get(trajectory)
+        if per_trajectory is None:
+            limit = config.authority_trajectories()
+            if len(self._authority) >= limit:
+                self._authority_missing += 1
+                return None
+            per_trajectory = {}
+            self._authority[trajectory] = per_trajectory
+            logger.info(
+                "vllm-030win patch (step 064): KVMem authority region for "
+                "trajectory %s (%d/%d), %d tokens x %d B per layer",
+                trajectory.hex()[:12],
+                len(self._authority),
+                limit,
+                config.authority_tokens(),
+                self._authority_width() * 2,
+            )
+        region = per_trajectory.get(layer_name)
+        if region is None:
+            region = torch.zeros(
+                (config.authority_tokens(), self._authority_width()),
+                dtype=torch.float16,
+            )
+            per_trajectory[layer_name] = region
+            self._authority_bytes += region.numel() * region.element_size()
+        return region
+
+    def _authority_store(
+        self, trajectory: bytes, positions: np.ndarray, k_by_layer: dict
+    ) -> None:
+        """Keep this step's pre-RoPE rotary prefix for future rematerialisation.
+
+        The rows come out of the same capture the retrieval index consumes, so
+        this adds a host-side slice and a copy, not a second device read. The
+        keys here are capture *layer indices*, so they are bridged to the
+        workspace's layer names first; an unmapped index is counted and warned
+        about, never dropped in silence.
+        """
+        for layer_index, k in k_by_layer.items():
+            layer_name = self._layer_name_by_index.get(layer_index)
+            if layer_name is None:
+                self._authority_unmapped += 1
+                if self._authority_unmapped <= 3:
+                    logger.warning(
+                        "vllm-030win KVMem authority: captured layer index %r "
+                        "has no workspace layer name (%d known); its rows are "
+                        "not kept",
+                        layer_index,
+                        len(self._layer_name_by_index),
+                    )
+                continue
+            region = self._authority_region(trajectory, layer_name)
+            if region is None:
+                continue
+            group_id = self._group_of_layer.get(layer_name)
+            if group_id is None:
+                continue
+            geom = self._geometry[group_id]
+            rows = remat.rotated_prefix_from_packed_k(
+                k, geom.head_size, geom.rotary_dim
+            ).reshape(k.shape[0], -1)
+            valid = positions < region.shape[0]
+            if not valid.any():
+                self._authority_missing += 1
+                continue
+            region.numpy()[positions[valid]] = rows[valid]
+            self._authority_rows_written += int(valid.sum())
+
+    def _authority_rows(
+        self, trajectory: bytes, layer_name: str, positions: np.ndarray
+    ) -> np.ndarray | None:
+        per_trajectory = self._authority.get(trajectory)
+        if per_trajectory is None:
+            return None
+        region = per_trajectory.get(layer_name)
+        if region is None or positions[-1] >= region.shape[0]:
+            return None
+        return region.numpy()[positions]
+
+    def _run_remat_selftest(self, job) -> None:
+        """Rebuild each stored page's rotary prefix from the authority.
+
+        The stored page is the engine's own NVFP4 output, baked at the page's
+        original positions. Rematerialising *those same positions* from the
+        pre-RoPE authority has to reproduce them: the offline round trip of
+        tools/kvmem_remat_test.py runs here on real pages, and it also exercises
+        the authority's token indexing end to end. What is compared is the
+        quantised bytes and, more usefully, the dequantised values, because the
+        capture stores fp16 while the model rotated in bf16 -- a difference well
+        inside one E2M1 step, so a handful of differing codes is expected while
+        a large delta is not.
+        """
+        if self._remat_done >= REMAT_SELFTEST_PAGES:
+            return
+        try:
+            rotary = self._rotary_embedding()
+        except Exception as exc:  # noqa: BLE001 - report, never break the run
+            self._remat_missing += 1
+            logger.warning(
+                "vllm-030win patch (step 064): KVMem rematerialisation selftest "
+                "skipped, could not obtain the model's rotary embedding (%r)",
+                exc,
+            )
+            return
+        for page in job.pages:
+            if self._remat_done >= REMAT_SELFTEST_PAGES:
+                break
+            group_id = page.group_id
+            geom = self._geometry.get(group_id)
+            block = self._block_size.get(group_id)
+            if geom is None or not block:
+                continue
+            start = page.page_index * block
+            positions = np.arange(start, start + block, dtype=np.int64)
+            for layer_name in self._layers_per_group.get(group_id, ()):
+                rows = self._authority_rows(job.trajectory, layer_name, positions)
+                if rows is None:
+                    self._remat_missing += 1
+                    continue
+                stored = self._host[(group_id, layer_name)][page.slot]
+                stored_u8 = stored.view(torch.uint8)
+                rebuilt = stored_u8.clone()
+                raw = torch.from_numpy(
+                    np.ascontiguousarray(rows).reshape(
+                        block, geom.num_heads, geom.rotary_dim
+                    )
+                )
+                device = rotary.cos_sin_cache.device
+                cos_sin = rotary.cos_sin_cache[
+                    torch.from_numpy(positions).to(device)
+                ].to(dtype=raw.dtype, device="cpu")
+                tokens = torch.arange(block, dtype=torch.long)
+                remat.rematerialize_page(
+                    rebuilt,
+                    geom,
+                    raw,
+                    tokens,
+                    tokens,
+                    cos_sin,
+                    is_neox_style=bool(rotary.is_neox_style),
+                    mrope_section=getattr(rotary, "mrope_section", None),
+                )
+                n_diff = int((rebuilt != stored_u8).sum())
+                packed_old, sf_old = remat.read_rotated(stored_u8, geom, tokens)
+                packed_new, sf_new = remat.read_rotated(rebuilt, geom, tokens)
+                delta = (
+                    remat.dequantize_rotated(packed_old, sf_old)
+                    - remat.dequantize_rotated(packed_new, sf_new)
+                ).abs()
+                nan_count = int(torch.isnan(delta).sum())
+                max_delta = float(torch.nan_to_num(delta, nan=0.0, posinf=0.0).max())
+                if n_diff:
+                    self._remat_mismatch += 1
+                    self._remat_max_byte_diff = max(
+                        self._remat_max_byte_diff,
+                        int(
+                            (
+                                rebuilt.to(torch.int16) - stored_u8.to(torch.int16)
+                            ).abs().max()
+                        ),
+                    )
+                self._remat_max_abs_delta = max(self._remat_max_abs_delta, max_delta)
+                self._remat_done += 1
+                self._remat_reports.append(
+                    {
+                        "layer": layer_name,
+                        "page_index": page.page_index,
+                        "token_start": int(start),
+                        "rotated_bytes": int(
+                            block * geom.num_heads * (geom.rot_data_bytes + geom.rot_scale_bytes)
+                        ),
+                        "bytes_differing": n_diff,
+                        "max_byte_diff": int(
+                            (rebuilt.to(torch.int16) - stored_u8.to(torch.int16))
+                            .abs()
+                            .max()
+                        ),
+                        "max_abs_delta_dequantised": max_delta,
+                        "nan_elements": nan_count,
+                    }
+                )
+                if len(self._remat_reports) == 1:
+                    self._dump_remat_arrays(
+                        layer_name,
+                        stored_u8,
+                        rebuilt,
+                        packed_old,
+                        sf_old,
+                        packed_new,
+                        sf_new,
+                        raw,
+                        cos_sin,
+                        geom,
+                        tokens,
+                        positions,
+                    )
+        if self._remat_reports:
+            logger.info(
+                "vllm-030win patch (step 064): KVMem rematerialisation round "
+                "trip: %d page(s) rebuilt from the pre-RoPE authority, %d with "
+                "differing bytes, max byte diff %d, max |delta| dequantised "
+                "%.6e",
+                self._remat_done,
+                self._remat_mismatch,
+                self._remat_max_byte_diff,
+                self._remat_max_abs_delta,
+            )
+            self._write_remat_report()
+
+    def _dump_remat_arrays(
+        self,
+        layer_name,
+        stored_u8,
+        rebuilt,
+        packed_old,
+        sf_old,
+        packed_new,
+        sf_new,
+        raw,
+        cos_sin,
+        geom,
+        tokens,
+        positions,
+    ) -> None:
+        """One-shot diagnostic dump of the first compared page.
+
+        Kept because the first live run of the round trip disagreed with the
+        offline one and the failure mode (differing bytes, non-finite
+        dequantised delta) does not say *which* side is wrong; the arrays let
+        that be settled offline instead of by re-running a 200K ingest.
+        """
+        directory = config.dump_dir()
+        if not directory:
+            return
+        try:
+            os.makedirs(directory, exist_ok=True)
+            baked = remat.bake_rotated_k(
+                raw, torch.arange(raw.shape[0], dtype=torch.long), cos_sin
+            )
+            np.savez(
+                os.path.join(directory, "kvmem_remat_arrays.npz"),
+                layer=np.array([layer_name]),
+                positions=positions,
+                authority_rows=raw.numpy(),
+                baked_from_authority=baked.numpy(),
+                stored_packed=packed_old.numpy(),
+                stored_sf=sf_old.view(torch.uint8).numpy(),
+                rebuilt_packed=packed_new.numpy(),
+                rebuilt_sf=sf_new.view(torch.uint8).numpy(),
+                stored_page=stored_u8.numpy(),
+                rebuilt_page=rebuilt.numpy(),
+                geom=np.array(
+                    [
+                        geom.head_size,
+                        geom.num_heads,
+                        geom.block_size,
+                        geom.rotary_dim,
+                    ]
+                ),
+            )
+            logger.info(
+                "vllm-030win patch (step 064): KVMem rematerialisation "
+                "diagnostic arrays written to %s",
+                os.path.join(directory, "kvmem_remat_arrays.npz"),
+            )
+        except OSError as exc:
+            logger.warning(
+                "vllm-030win KVMem rematerialisation diagnostics: could not "
+                "write to %s (%s)",
+                directory,
+                exc,
+            )
+
+    def _write_remat_report(self) -> None:
+        directory = config.dump_dir()
+        if not directory:
+            return
+        payload = {
+            "rotary": type(self._rotary).__name__ if self._rotary else None,
+            "rotary_dim": self._rotary_prefix_width(
+                next(iter(self._geometry.values())).head_size
+            ),
+            "pages_rebuilt": self._remat_done,
+            "pages_with_differing_bytes": self._remat_mismatch,
+            "max_byte_diff": self._remat_max_byte_diff,
+            "max_abs_delta_dequantised": self._remat_max_abs_delta,
+            "authority_bytes": self._authority_bytes,
+            "authority_tokens": config.authority_tokens(),
+            "authority_layers": sorted(
+                layer
+                for per_trajectory in self._authority.values()
+                for layer in per_trajectory
+            ),
+            "layers_mapped": sorted(self._layer_name_by_index),
+            "rows_written": self._authority_rows_written,
+            "unmapped_layers": self._authority_unmapped,
+            "missing": self._authority_missing,
+            "authority_nonzero_rows": (
+                {
+                    layer: int(np.count_nonzero(region.numpy().any(axis=1)))
+                    for layer, region in next(iter(self._authority.values())).items()
+                }
+                if self._authority
+                else {}
+            ),
+            "per_page": self._remat_reports,
+        }
+        try:
+            os.makedirs(directory, exist_ok=True)
+            path = os.path.join(directory, "kvmem_remat_selftest.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=1)
+            logger.info(
+                "vllm-030win patch (step 064): KVMem rematerialisation report "
+                "written to %s",
+                path,
+            )
+        except OSError as exc:
+            logger.warning(
+                "vllm-030win KVMem rematerialisation report: could not write "
+                "to %s (%s)",
+                directory,
+                exc,
             )
 
     # ------------------------------------------------------------------
@@ -214,11 +664,10 @@ class KVMemWorkspaceWorker:
             if not mask.any():
                 continue
             span_positions = positions[mask]
-            self._index.add(
-                span.trajectory,
-                span_positions,
-                {layer: k[mask] for layer, (_, _, k) in step.items()},
-            )
+            k_by_layer = {layer: k[mask] for layer, (_, _, k) in step.items()}
+            self._index.add(span.trajectory, span_positions, k_by_layer)
+            if config.authority_enabled():
+                self._authority_store(span.trajectory, span_positions, k_by_layer)
             # The query span is the tail of the step, and the last prefill step
             # is the one that holds the tail of the prompt, so overwriting here
             # leaves exactly the right query behind. Rows are ordered, so the
@@ -342,6 +791,8 @@ class KVMemWorkspaceWorker:
             self._copy(entries)
             if config.roundtrip_selftest():
                 self._run_selftest(job)
+            if config.authority_enabled() and config.roundtrip_selftest():
+                self._run_remat_selftest(job)
             event = torch.cuda.Event()
             event.record()
             self._events[job.job_id] = event
@@ -457,4 +908,21 @@ class KVMemWorkspaceWorker:
             "index": self._index.stats() if self._index is not None else None,
             "score_seconds": round(self._score_seconds, 3),
             "retrieval_reports": len(self._retrieval_reports),
+            "authority": {
+                "enabled": config.authority_enabled(),
+                "trajectories": len(self._authority),
+                "bytes": self._authority_bytes,
+                "tokens": config.authority_tokens(),
+                "layers_mapped": len(self._layer_name_by_index),
+                "rows_written": self._authority_rows_written,
+                "missing": self._authority_missing,
+                "unmapped_layers": self._authority_unmapped,
+                "remat_pages": self._remat_done,
+                "remat_mismatch": self._remat_mismatch,
+                "remat_max_byte_diff": self._remat_max_byte_diff,
+                "remat_max_abs_delta": self._remat_max_abs_delta,
+            },
         }
+
+    def remat_reports(self) -> list[dict]:
+        return self._remat_reports

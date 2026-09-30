@@ -150,6 +150,7 @@ def main() -> int:
         read_rotated,
         rematerialize_page,
         rotated_byte_offsets,
+        rotated_prefix_from_packed_k,
         write_rotated,
     )
 
@@ -423,6 +424,48 @@ def main() -> int:
     check("rebuild from pre-RoPE authority == engine page, bit for bit",
           bool(torch.equal(rebuilt, engine_page)),
           f"{int((rebuilt != engine_page).sum())} bytes differ")
+
+    # ---------------------------------------------------------------- T8
+    print("\nT8 packed-K slicing (the authority write path, step 064)")
+    # External anchor: every (head, dim) carries a distinct value, so a wrong
+    # head/dim mapping cannot pass. `k[:, :rotary_dim]` would take head 0's
+    # prefix for every token and look plausible, which is exactly the silent
+    # failure this checks against.
+    packed = (
+        torch.arange(num_heads * head_size, dtype=torch.float32)
+        .repeat(BLOCK_SIZE, 1)
+        .to(dtype)
+    )
+    sliced = rotated_prefix_from_packed_k(packed, head_size, rotary_dim)
+    expect = (
+        torch.arange(num_heads * head_size)
+        .reshape(num_heads, head_size)[:, :rotary_dim]
+        .repeat(BLOCK_SIZE, 1, 1)
+    )
+    check("slicing takes each head's first rotary_dim dims",
+          bool(torch.equal(sliced, expect)),
+          f"shape {tuple(sliced.shape)}")
+    check("the naive k[:, :rotary_dim] is a different (wrong) answer",
+          not bool(torch.equal(sliced.reshape(BLOCK_SIZE, -1),
+                               packed[:, :rotary_dim])),
+          "head axis really is restored")
+
+    # ---------------------------------------------------------------- T9
+    print("\nT9 authority token indexing (absolute offsets, gaps allowed)")
+    import numpy as np
+
+    capacity = 4096
+    region = torch.zeros((capacity, num_heads * rotary_dim), dtype=torch.float16)
+    # A gap models a prefix-cache hit: the step's rows are not contiguous.
+    offsets = np.array([10, 11, 12, 500, 501], dtype=np.int64)
+    rows = np.arange(
+        offsets.size * num_heads * rotary_dim, dtype=np.float32
+    ).reshape(offsets.size, -1).astype(np.float16)
+    region.numpy()[offsets] = rows
+    check("rows read back by absolute token offset",
+          bool(np.array_equal(region.numpy()[offsets], rows)))
+    check("offsets nobody wrote stay zero",
+          int(region.numpy()[13:500].sum()) == 0)
 
     failed = [name for name, ok, _ in _results if not ok]
     print("\n" + "=" * 72)

@@ -295,6 +295,22 @@ def read_rotated(
     return packed, sf
 
 
+def rotated_prefix_from_packed_k(
+    k: torch.Tensor, head_size: int, rotary_dim: int
+) -> torch.Tensor:
+    """Slice the rotary prefix out of a packed ``[T, num_heads * head_size]`` K.
+
+    The capture hands out K exactly as the attention layer held it: heads
+    concatenated along the last axis. Taking ``k[:, :rotary_dim]`` would grab
+    the first head's prefix only, so the head axis has to be restored first.
+    """
+    num_tokens, width = k.shape
+    num_heads = width // head_size
+    if num_heads * head_size != width:
+        raise ValueError(f"packed K width {width} is not a multiple of {head_size}")
+    return k.reshape(num_tokens, num_heads, head_size)[..., :rotary_dim]
+
+
 def rematerialize_page(
     page: torch.Tensor,
     geom: PageGeometry,

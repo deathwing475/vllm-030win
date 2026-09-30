@@ -18,6 +18,7 @@ DEFAULT_INDEX_SUBBLOCK = 128
 DEFAULT_QUERY_SPAN = 256
 DEFAULT_RETRIEVAL_TOPN = 16
 DEFAULT_RECENT_TOKENS = 32768
+DEFAULT_AUTHORITY_TRAJECTORIES = 2
 
 
 def _env_int(name: str, default: int) -> int:
@@ -93,6 +94,43 @@ def rawk_enabled() -> bool:
     design compares the KVMem arm only against itself (see design doc §5.2).
     """
     return bool(int(os.environ.get("VLLM_KVMEM_RAWK", "0")))
+
+
+def authority_enabled() -> bool:
+    """Keep the pre-RoPE rotary prefix as the rematerialisation authority.
+
+    A stored page's K is baked at the positions it was written at. Putting it
+    back into the window means giving it *new* positions (the fixed-slot layout
+    compresses the window to ``0..B-1``), and NVFP4 cannot be re-rotated in
+    place: the fp8 block scale covers 16 consecutive head dims, so every group
+    the rotation touches needs a new scale. The design's answer is to keep the
+    pre-RoPE rotary prefix (64 of the 256 head dims, fp16) as the authority and
+    rebuild from it, once, per re-entry -- never from a previously rotated copy,
+    which is what makes displacement drift-free (design §5.3, step 063).
+
+    Arming this costs ``num_kv_heads * rotary_dim * 2`` bytes per token per
+    layer of host memory (512 B here, so 2.0 GiB over a full 262,144-token
+    workspace) and nothing on the device. Requires ``VLLM_KVMEM_RAWK``, which
+    is where the pre-RoPE K comes from. It changes no attention behaviour: the
+    authority is written and read back for verification only until the assembly
+    path lands.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_AUTHORITY", "0")))
+
+
+def authority_tokens() -> int:
+    """Token capacity of one trajectory's authority region."""
+    return _env_int("VLLM_KVMEM_AUTHORITY_TOKENS", max_workspace_tokens())
+
+
+def authority_trajectories() -> int:
+    """How many trajectories may hold an authority region at once.
+
+    One region is 2.0 GiB at full workspace length, so this is a host-memory
+    bound rather than a semantic one; past it the pages are still stored and
+    simply cannot be rematerialised, which is counted and reported.
+    """
+    return _env_int("VLLM_KVMEM_AUTHORITY_TRAJ", DEFAULT_AUTHORITY_TRAJECTORIES)
 
 
 def index_subblock() -> int:

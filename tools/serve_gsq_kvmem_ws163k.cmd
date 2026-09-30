@@ -54,6 +54,17 @@ rem      it outright (torch._dynamo.exc.Unsupported on the stash's side effects,
 rem      first observed as "logging.Logger method not supported"). Consequence:
 rem      this arm's prefill/decode speeds are NOT comparable with step 057/060,
 rem      which were measured with compilation on.
+rem  10. VLLM_KVMEM_AUTHORITY=1 (step 064) -> keep the pre-RoPE rotary prefix
+rem      (64 of 256 head dims, fp16) as the rematerialisation authority, and
+rem      VLLM_KVMEM_AUTHORITY_TRAJ=1 caps it at one trajectory (2.0 GiB host at
+rem      a full 262,144-token workspace). With VLLM_KVMEM_SELFTEST=1 this also
+rem      runs the rematerialisation round trip: each stored page's rotary prefix
+rem      is rebuilt from the authority at the page's ORIGINAL positions and
+rem      compared with the engine's own nvfp4 bytes. Nothing is put back into
+rem      the window, so attention behaviour is unchanged; the report lands in
+rem      <VLLM_KVMEM_DUMP>\kvmem_remat_selftest.json.
+rem  11. VLLM_KVMEM_DUMP -> kvmem_k3e (step 064 run; k3c/k3d are step 062's
+rem      evidence and must not be overwritten).
 rem Everything else (pool 3.4e9, nvfp4, mamba align, ssm bf16, G=8, pin shim,
 rem prefix caching) is byte-for-byte the production recipe.
 rem
@@ -89,7 +100,9 @@ set "VLLM_KVMEM_WORKSPACE=1"
 set "VLLM_KVMEM_WORKSPACE_MB=3072"
 set "VLLM_KVMEM_SELFTEST=1"
 set "VLLM_KVMEM_RAWK=1"
-set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k3d"
+set "VLLM_KVMEM_AUTHORITY=1"
+set "VLLM_KVMEM_AUTHORITY_TRAJ=1"
+set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k3e"
 rem K3 measurement knobs. The index stores at the finest granularity and the
 rem coarser ones are summed from it, so one 200K ingest reports every variant:
 rem granularity 32/64/128 (design risk R1: the paper uses 32-token blocks, the

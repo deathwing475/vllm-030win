@@ -738,6 +738,56 @@ NVFP4 页 = `[K_data | K_scale | V_data | V_scale]`，HND 物理序 `(blocks, 2,
 
 ---
 
+## 12.10 阶段 1 K3 后半接线第一半（步骤 064：raw-K 权威区 + 实时往返自检 → **页布局假设被证伪**）
+
+> 本节记录 §12.9.7-1 的落地与实测。**结论先行**：权威区机制 GO（2.0 GiB、16 层、零未映射），但**实时重物化往返失败**——根因是 §12.9 的页几何假设**对真实缓存不成立**，本节给出实证拟合出的真实布局与修复公式。**本节是 `PageGeometry` 的权威依据**。
+
+### 12.10.1 落点与门控
+
+| 文件 | 内容 |
+|---|---|
+| `v1/kvmem_workspace/config.py` | `VLLM_KVMEM_AUTHORITY`（默认关）/ `VLLM_KVMEM_AUTHORITY_TOKENS`（默认 262,144）/ `VLLM_KVMEM_AUTHORITY_TRAJ`（默认 2） |
+| `v1/kvmem_workspace/worker.py` | 层号↔层名映射、权威区分配/写入/读回、`_run_remat_selftest`（实时往返）、报告与数组转储 |
+| `tools/serve_gsq_kvmem_ws163k.cmd` | 3 行环境变量 + dump 目录 `kvmem_k3e` |
+
+**存储格式决策（与设计 §5.3 的"槽内拆分"不同，勿误读）**：工作区页**保持整页原样**（K1 的整页 memcpy 与往返自检语义不变），旋转前缀的 pre-RoPE 权威放**独立区域**。理由：①槽内拆分会把每逻辑页从 25.03 MiB 涨到 33.02 MiB ⇒ 122 槽 = 4,028 MiB **超出** 3,072 MiB 预算；独立权威区只要 **2,147,483,648 B = 2.0 GiB**（512 B/token/层 × 16 层 × 262,144，与 §3.4 的 2.1 GiB 估计吻合）；②拆分要在 store 路径逐头重排（host ~26 MB/逻辑页），阶段 1 判正确性不判性能，不值得先付。**副作用**：槽内旋转前缀的 nvfp4 字节成为死重（12.5%），重物化时总是被覆盖，无正确性问题。
+
+### 12.10.2 机制
+
+- **写入**：`_ingest` 在喂检索索引的**同一批** capture 行上追加切片（`remat.rotated_prefix_from_packed_k`），按**绝对 token 偏移**写入 `region[abs_pos]`（允许前缀缓存空洞）；键 = (轨迹, 层名)，层号经 `extract_layer_index` 桥接到工作区的层名空间。
+- **读回 + 自检**：对每张已存页取 `page_index × block_size` 起的权威行，用**引擎自己的** `get_rope(...)`（命中同一 `_ROPE_DICT` ⇒ 与模型同一实例；日志核实 `MRotaryEmbedding / cache (1048576,64) fp32 / rotary_dim 64 / NeoX / interleaved`）在**原始位置**重建旋转前缀，与页内字节比对 + 去量化偏差。
+- **实测（机制侧）**：16 层全映射（3,7,…,63）、`rows_written = 2,659,328`、`unmapped = 0`、`missing = 0`；K1 整页往返自检不受影响（`8 pages × 16 layers byte-identical`）。
+
+### 12.10.3 ⭐ 实时往返失败 → 真实页布局（实证拟合，本节的权威结论）
+
+**现象**：8 页 × 16 层全部重建，**8/8 页字节不同**、`max_byte_diff = 255`、去量化差 **44.6% 非有限**（NaN/inf = 把 data 字节当 scale 读的特征）；差异**全部落在 K 侧**（V 侧 0 字节不同）；差异模式 = **token 0..15 的旋转数据完全一致、token 16 起整段不同**。
+
+**真实布局（数据区 15/15 探针精确命中 + 尺度区 58.84% vs 旧假设 0.93%）**：
+
+```
+页（1,640,448 B）= 89 个 18,432 B 的 chunk（89 = 1424 / 16；16 = 内核块大小 kbs）
+chunk(t//16) = [ K 侧 9,216 B | V 侧 9,216 B ]
+每侧 = [heads × kbs × data_dim (8,192 B)] 紧接 [heads × kbs × scale_dim (1,024 B)]
+
+data 偏移  = (t//kbs)*chunk_bytes + side*side_bytes + h*(kbs*data_dim) + (t%kbs)*data_dim + j
+scale 偏移 = (t//kbs)*chunk_bytes + side*side_bytes + heads*kbs*data_dim
+             + h*(kbs*scale_dim) + (t%kbs)*scale_dim + k
+```
+
+即 **K/V 按 16-token 内核块交错**，**不是** §12.9 假设的"整块 K 侧 + 整块 V 侧、每侧内部 `[heads][1424]`"。`side_carve_views` 的公式对 **kbs-token 内核块**成立、对 **1424-token 管理块**不成立——它硬编码了 `base + heads*block*data_dim` 的尺度基址与 `[heads][block]` 内序。
+
+**修法（已定，未实现）**：`ref = group_kernel_blocks(kv_caches[layer], num_blocks)` 返回 `cache.unflatten(0, (num_blocks, -1))`，故 **`kbs = spec.block_size // ref.shape[1]`**（本例 1424 // 89 = 16）。把 `PageGeometry` 换成上面的公式，并**同步改离线单测的页构造**（单测现在自造视图 = 自证陷阱，与《格式搬运必须有外锚》同构）。
+
+### 12.10.4 本步的边界（勿误读）
+
+- **重物化在真实页上仍未通过**：`PageGeometry` 尚未按真实布局实现，离线单测尚未在真实布局上重建。
+- **没有任何页被放回视窗** ⇒ 注意力行为逐字节不变；全部新行为在 `VLLM_KVMEM_AUTHORITY`（默认关）门控后。
+- 位置解耦（`gpu_model_runner.py` 的 `positions`）+ 块表改写**仍未开工**。
+- 权威区只增不减（无跨轨迹淘汰，超出 `AUTHORITY_TRAJ` 计数丢弃并告警）。
+- **教训（进必守）**：**页字节布局这类断言的锚必须是引擎的真实张量**（`ref.shape`/stride 或内核块公式 + 真实页比对），**不能是"参考 writer 写进自己构造的视图"**；自检必须带**可核对量**（`rows_written` / 非零行数），否则映射类缺陷会静默。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |
