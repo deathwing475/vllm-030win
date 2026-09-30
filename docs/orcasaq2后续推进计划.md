@@ -108,15 +108,17 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 
 **未开工（K3 后半）**：
 
+> **✅ 步骤 063 已开工并完成其中第 5 与第 12 项的算法核心**：新增 `vllm/v1/kvmem_workspace/remat.py`（重物化原语）+ `tools/kvmem_remat_test.py`（**离线 18/18，逐位**）。**锚全部取自引擎自己的代码**（逐行移植的 `_triton_mrope_forward` / `write_reference_nvfp4_cache` / `side_carve_views`）：**位移 d=4096 后搬回原位逐位一致、连续 8 次位移后搬回仍逐位一致**、**以 pre-RoPE 旋转前缀为唯一输入重建整页 == 引擎整页逐位一致**。**新查出的结构前提 = `rotary_dim 64 = 4 × 16` 恰好落在 NVFP4 尺度组边界上** ⇒ 只重写旋转前缀（**全页 12.5%** = 205,056 / 1,640,448 B），其余 192 维与整个 V 一字不动。**该模块零调用者 ⇒ 无门控、引擎行为逐字节不变**。**剩下 = 接线**（建议顺序：①**先做**存储格式 + raw-K 权威区并在工作区自检里加"重烘焙往返"——**不改变注意力行为**；②**再做**位置解耦 + 块表改写）。细节见设计档 §12.9。
+
 4. **固定槽位布局，query 位置不随选页变化**——位置解耦 + 重 RoPE + 块表改写；**已知唯一缝 = `gpu_model_runner.py` 的 `positions`**（每步从头重建、`slot_mapping` 由它派生 ⇒ 必须"先改位置、后算 slot"，且无任何现成 per-request 钩子），而 **`update_block_table` 只在 flash_attn/mamba 后端实现、flashinfer（nvfp4 路径）没有** ⇒ 确实要动模型执行器（本线最重工程）；
-5. 每次从 raw K 单次重建，禁止 delta re-RoPE；
+5. ✅ **（063）** 每次从 raw K 单次重建，禁止 delta re-RoPE —— **原语已落地并单测钉死（8 次位移后搬回逐位一致）**；
 6. V 与非旋转 K 按整页搬运；
 7. identity canary：预算不收紧时与 KVMem-off 逐 token 一致；
 8. 紧预算 needle：recency-only 必须失败，retrieval 必须成功；
 9. 40/55/70/85% 多深度 needle；
 10. 冷 262K prompt；
 11. 固定提问顺序重复，串台检测；
-12. rematerialization 往返单测，记录量化步内误差。
+12. ✅ **（063）** rematerialization 往返单测，记录量化步内误差 —— **实测逐位一致（0 字节差），量化误差 2.734e-02 vs 最大 E2M1 步长 7.813e-02（比值 0.35）**。
 
 ### 阶段 K4：性能与生产特性（K1-K3 出口之后）
 
