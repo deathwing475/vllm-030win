@@ -16,7 +16,13 @@ Every claim is anchored on the engine's own code, never on the primitive:
 * the bytes are checked against the engine's own
   ``write_reference_nvfp4_cache`` writer, and read back through the engine's
   own ``side_carve_views`` so the offset arithmetic is derived twice,
-  independently.
+  independently;
+* the page itself is built in the real physical layout step 064 established
+  empirically (kernel-block interleaved chunks of [K side | V side]) and the
+  writer is invoked through kernel-block-granular illusion views, the way the
+  engine hands the cache over -- a manager-block-sized view would silently
+  rebuild the disproven layout and re-create the self-confirmation trap this
+  test used to have.
 
 Usage:
     python kvmem_remat_test.py [--device cpu|cuda]
@@ -34,6 +40,10 @@ import torch
 MODEL_CONFIG = r"G:\qwen3.8model\Qwen3.8-27B-3Bit-GSQ\config.json"
 # Engine-reported for this arm (attn block size, step 060/061/062).
 BLOCK_SIZE = 1424
+# Engine kernel block size, step 064: the NVFP4 append kernel writes at
+# 16-token granularity, so a page is 89 chunks of 18,432 B. Derived from the
+# real cache as block_size // group_kernel_blocks(cache, nb).shape[1].
+KERNEL_BLOCK_SIZE = 16
 # Fallbacks if the checkpoint config is not readable.
 FALLBACK = {
     "head_size": 256,
@@ -160,17 +170,21 @@ def main() -> int:
     rotary_dim = int(head_size * cfg["partial_rotary_factor"])
     rope_parameters = cfg["rope_parameters"]
     mrope_section = list(rope_parameters["mrope_section"])
-    geom = PageGeometry(head_size, num_heads, BLOCK_SIZE, rotary_dim)
+    geom = PageGeometry(
+        head_size, num_heads, BLOCK_SIZE, rotary_dim, KERNEL_BLOCK_SIZE
+    )
 
-    print("KVMem rematerialisation unit test (step 063)")
+    print("KVMem rematerialisation unit test (step 063, real layout per 064)")
     print(
         f"  geometry: head_size={head_size} heads={num_heads} block={BLOCK_SIZE} "
-        f"rotary_dim={rotary_dim} full_dim={geom.full_dim}"
+        f"kernel_block={KERNEL_BLOCK_SIZE} rotary_dim={rotary_dim} "
+        f"full_dim={geom.full_dim}"
     )
     print(
-        f"  page: {geom.page_bytes} B = 2 x {geom.side_bytes} B "
-        f"(k_data {geom.k_data_bytes} B, rot prefix {geom.rot_data_bytes} B data "
-        f"+ {geom.rot_scale_bytes} B scales per head)"
+        f"  page: {geom.page_bytes} B = {geom.chunks_per_page} chunks x "
+        f"{geom.chunk_bytes} B (per chunk K side {geom.side_chunk_bytes} B: "
+        f"data {geom.k_data_bytes} B + scales; then V side; rot prefix "
+        f"{geom.rot_data_bytes} B data + {geom.rot_scale_bytes} B scales per head)"
     )
     print(f"  device: {device}")
 
@@ -200,9 +214,16 @@ def main() -> int:
     cache = cos_sin_cache.to(device=device, dtype=dtype)
 
     # ---------------------------------------------------------------- T0
-    print("\nT0 geometry constants")
-    check("page_bytes == 2 * heads * block * full_dim", geom.page_bytes == 1640448,
+    print("\nT0 geometry constants (real layout, step 064)")
+    check("page_bytes == chunks * chunk_bytes == 1640448",
+          geom.page_bytes == 1640448
+          and geom.page_bytes == geom.chunks_per_page * geom.chunk_bytes,
           f"{geom.page_bytes}")
+    check("chunk == 89 x 18432 B (kernel block interleaved)",
+          geom.chunks_per_page == 89 and geom.chunk_bytes == 18432,
+          f"{geom.chunks_per_page} x {geom.chunk_bytes} B")
+    check("K-side data region per chunk == heads*kbs*data_dim == 8192",
+          geom.k_data_bytes == 8192, f"{geom.k_data_bytes}")
     check("rotary prefix ends on a scale-group boundary", rotary_dim % 16 == 0,
           f"{rotary_dim} = {rotary_dim // 16} groups")
 
@@ -262,14 +283,25 @@ def main() -> int:
           f"max|d|={d4:.3e}")
 
     # ---------------------------------------------------------------- T2
-    print("\nT2 bytes vs the engine's own NVFP4 writer")
-    num_blocks = 2
-    phys = torch.zeros(
-        (num_blocks, 2, num_heads, BLOCK_SIZE, geom.full_dim),
-        dtype=torch.uint8, device=device,
+    print("\nT2 bytes vs the engine's own NVFP4 writer (real layout)")
+    num_pages = 2
+    # The real physical buffer: a page is a flat byte range whose 18,432 B
+    # chunks are [K side | V side]. The writer reaches it through
+    # kernel-block-granular NHD illusion views, exactly how the engine hands
+    # the cache over -- step 064 established that side_carve_views' formula
+    # holds per kernel block, NOT per manager block, so a manager-block-sized
+    # view here would rebuild the disproven layout and re-create the
+    # self-confirmation trap this test used to have.
+    phys = torch.zeros(num_pages * geom.page_bytes, dtype=torch.uint8,
+                       device=device)
+    kv_shape = (
+        num_pages * geom.chunks_per_page, KERNEL_BLOCK_SIZE, num_heads,
+        geom.full_dim,
     )
-    hnd = phys.permute(0, 1, 3, 2, 4)  # [blocks, 2, block, heads, full_dim]
-    key_cache, value_cache = hnd[:, 0], hnd[:, 1]
+    kv_stride = (geom.chunk_bytes, geom.full_dim,
+                 KERNEL_BLOCK_SIZE * geom.full_dim, 1)
+    key_cache = phys.as_strided(kv_shape, kv_stride, 0)
+    value_cache = phys.as_strided(kv_shape, kv_stride, geom.side_chunk_bytes)
 
     raw_k = raw.view(BLOCK_SIZE, num_heads, head_size)
     v = (torch.randn(BLOCK_SIZE, num_heads * head_size, dtype=torch.float32) * 0.05)
@@ -287,7 +319,10 @@ def main() -> int:
         torch.tensor(k_scale, dtype=torch.float32, device=device),
         torch.tensor(k_scale, dtype=torch.float32, device=device),
     )
-    engine_page = phys.reshape(-1)[: geom.page_bytes].clone()
+    engine_page = phys[: geom.page_bytes].clone()
+    check("the writer only touched page 0 (slot -> kernel block mapping)",
+          int(phys[geom.page_bytes:].sum()) == 0,
+          f"{int(phys[geom.page_bytes:].sum())} stray bytes on page 1")
 
     ours_page = torch.zeros(geom.page_bytes, dtype=torch.uint8, device=device)
     rematerialize_page(
@@ -317,9 +352,19 @@ def main() -> int:
 
     # ---------------------------------------------------------------- T3
     print("\nT3 offsets re-derived through the engine's own carve")
+    # Carve the kernel-block-granular view: [chunk, heads, kbs, w] ->
+    # [chunk, kbs, heads, w] -> [t = chunk*kbs + r, heads, w].
     carve_data, carve_scale = side_carve_views(key_cache)
-    cd = carve_data[0, :, :, : geom.rot_data_bytes].permute(1, 0, 2)
-    cs = carve_scale[0, :, :, : geom.rot_scale_bytes].permute(1, 0, 2)
+    cd = (
+        carve_data[: geom.chunks_per_page, :, :, : geom.rot_data_bytes]
+        .permute(0, 2, 1, 3)
+        .reshape(BLOCK_SIZE, num_heads, geom.rot_data_bytes)
+    )
+    cs = (
+        carve_scale[: geom.chunks_per_page, :, :, : geom.rot_scale_bytes]
+        .permute(0, 2, 1, 3)
+        .reshape(BLOCK_SIZE, num_heads, geom.rot_scale_bytes)
+    )
     ours_packed, ours_sf = read_rotated(ours_page, geom, tokens)
     check("carve data slice == primitive's view",
           bool(torch.equal(cd.contiguous(), ours_packed.contiguous())),

@@ -63,8 +63,8 @@ rem      is rebuilt from the authority at the page's ORIGINAL positions and
 rem      compared with the engine's own nvfp4 bytes. Nothing is put back into
 rem      the window, so attention behaviour is unchanged; the report lands in
 rem      <VLLM_KVMEM_DUMP>\kvmem_remat_selftest.json.
-rem  11. VLLM_KVMEM_DUMP -> kvmem_k3e (step 064 run; k3c/k3d are step 062's
-rem      evidence and must not be overwritten).
+rem  11. VLLM_KVMEM_DUMP -> kvmem_k3f (step 065 run; k3c/k3d are step 062's
+rem      evidence and k3e is step 064's; none may be overwritten).
 rem Everything else (pool 3.4e9, nvfp4, mamba align, ssm bf16, G=8, pin shim,
 rem prefix caching) is byte-for-byte the production recipe.
 rem
@@ -102,7 +102,7 @@ set "VLLM_KVMEM_SELFTEST=1"
 set "VLLM_KVMEM_RAWK=1"
 set "VLLM_KVMEM_AUTHORITY=1"
 set "VLLM_KVMEM_AUTHORITY_TRAJ=1"
-set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k3e"
+set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k3f"
 rem K3 measurement knobs. The index stores at the finest granularity and the
 rem coarser ones are summed from it, so one 200K ingest reports every variant:
 rem granularity 32/64/128 (design risk R1: the paper uses 32-token blocks, the

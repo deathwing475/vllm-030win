@@ -18,9 +18,8 @@ does not exist here. :func:`rematerialize_page` is that single rebuild.
 
 What this module owns:
 
-* the byte geometry of one NVFP4 KV page (``[K_data | K_scale | V_data |
-  V_scale]``, HND, per-head rows carved as ``[block, data]`` then
-  ``[block, scale]`` -- see ``v1/attention/reference_nvfp4.py``);
+* the byte geometry of one NVFP4 KV page (kernel-block interleaved -- see
+  ``PageGeometry``);
 * the rotation of the rotary prefix, delegating to the engine's own
   ``ApplyRotaryEmb``/``apply_interleaved_rope`` so the convention cannot drift
   from the model's;
@@ -52,20 +51,33 @@ _E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 @dataclass(frozen=True)
 class PageGeometry:
-    """Byte geometry of one NVFP4 KV page (one layer, one block, K side + V side).
+    """Byte geometry of one NVFP4 KV page (one layer, one manager block).
 
-    The physical layout is the engine's HND NVFP4 layout: per block, the K side
-    is one contiguous byte range followed by the V side, and each side is
-    ``[num_heads][block_size][data_dim]`` followed by
-    ``[num_heads][block_size][scale_dim]``. ``page_bytes`` is therefore
-    ``2 * num_heads * block_size * full_dim`` and equals the byte count the
-    workspace copies per (layer, block).
+    Step 064 established the real layout empirically (data probes 15/15 exact,
+    scale probes 58.84% vs 0.93% under the old assumption): the page is *not*
+    one contiguous K side followed by one contiguous V side. It is
+    ``block_size // kernel_block_size`` chunks of 18,432 B, one per kernel
+    block -- the NVFP4 append kernel writes at 16-token granularity -- and
+    each chunk carries the K side first, then the V side:
+
+        chunk(t // kbs) = [ K side | V side ]
+        side            = [heads * kbs * data_dim data bytes]
+                          [heads * kbs * scale_dim scale bytes]
+
+    ``kernel_block_size`` is derived from the engine's own cache tensor:
+    ``spec.block_size // group_kernel_blocks(cache, num_blocks).shape[1]``
+    (1424 // 89 = 16 here). With ``kernel_block_size == block_size`` this
+    degenerates to "one K side, then one V side" with per-side ``[heads]
+    [block_size]`` order, which is exactly what ``side_carve_views``' formula
+    assumes for the NHD illusion view it is handed -- and why that view has to
+    be taken at kernel-block, not manager-block, granularity.
     """
 
     head_size: int
     num_heads: int
     block_size: int
     rotary_dim: int
+    kernel_block_size: int
 
     @property
     def data_dim(self) -> int:
@@ -80,17 +92,27 @@ class PageGeometry:
         return self.data_dim + self.scale_dim
 
     @property
-    def k_data_bytes(self) -> int:
-        """Bytes of the K side's data region (the scale region starts here)."""
-        return self.num_heads * self.block_size * self.data_dim
+    def chunks_per_page(self) -> int:
+        return self.block_size // self.kernel_block_size
 
     @property
-    def side_bytes(self) -> int:
-        return self.num_heads * self.block_size * self.full_dim
+    def chunk_bytes(self) -> int:
+        return 2 * self.num_heads * self.kernel_block_size * self.full_dim
+
+    @property
+    def side_chunk_bytes(self) -> int:
+        """Bytes of one side (K or V) within one chunk."""
+        return self.num_heads * self.kernel_block_size * self.full_dim
+
+    @property
+    def k_data_bytes(self) -> int:
+        """Bytes of the K side's data region within one chunk (the K scale
+        region starts here)."""
+        return self.num_heads * self.kernel_block_size * self.data_dim
 
     @property
     def page_bytes(self) -> int:
-        return 2 * self.side_bytes
+        return self.chunks_per_page * self.chunk_bytes
 
     @property
     def rot_groups(self) -> int:
@@ -118,6 +140,11 @@ class PageGeometry:
             raise ValueError(
                 f"rotary_dim {self.rotary_dim} is not a multiple of {_SCALE_GROUP}"
             )
+        if self.kernel_block_size <= 0 or self.block_size % self.kernel_block_size:
+            raise ValueError(
+                f"kernel_block_size {self.kernel_block_size} must divide "
+                f"block_size {self.block_size}"
+            )
 
 
 def _check(page: torch.Tensor, geom: PageGeometry) -> None:
@@ -136,20 +163,27 @@ def rotated_byte_offsets(
 
     ``tokens`` holds block-local token indices. Returns ``(data, scale)``, both
     shaped ``[T, num_heads, width]`` and relative to the start of the page.
+    The rotary prefix lives on the K side (side 0) of each chunk, so no V-side
+    term appears; within the K side each head owns ``kbs`` consecutive rows.
     """
     tokens = torch.as_tensor(tokens, dtype=torch.long)
     heads = torch.arange(geom.num_heads, dtype=torch.long)
     t = tokens[:, None, None]
     h = heads[None, :, None]
+    kbs = geom.kernel_block_size
+    chunk = (t // kbs) * geom.chunk_bytes
+    in_chunk = t % kbs
     data = (
-        h * (geom.block_size * geom.data_dim)
-        + t * geom.data_dim
+        chunk
+        + h * (kbs * geom.data_dim)
+        + in_chunk * geom.data_dim
         + torch.arange(geom.rot_data_bytes, dtype=torch.long)[None, None, :]
     )
     scale = (
-        geom.k_data_bytes
-        + h * (geom.block_size * geom.scale_dim)
-        + t * geom.scale_dim
+        chunk
+        + geom.k_data_bytes
+        + h * (kbs * geom.scale_dim)
+        + in_chunk * geom.scale_dim
         + torch.arange(geom.rot_scale_bytes, dtype=torch.long)[None, None, :]
     )
     return data, scale

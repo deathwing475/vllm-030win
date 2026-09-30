@@ -149,11 +149,25 @@ class KVMemWorkspaceWorker:
             spec = group.kv_cache_spec
             page = self.page_bytes[group_id]
             self._block_size[group_id] = spec.block_size
+            # Step 064: the physical page is kernel-block interleaved, so the
+            # geometry needs the kernel block size. It falls out of the real
+            # cache tensor -- the append kernel's blocks are the leading dim
+            # before ``group_kernel_blocks`` unflattens them into manager
+            # blocks (num_blocks * ratio); when the cache is not split the
+            # ratio degenerates to 1.
+            first_raw = kv_caches[group.layer_names[0]]
+            ratio = first_raw.shape[0] // num_blocks
+            if num_blocks * ratio != first_raw.shape[0]:
+                raise ValueError(
+                    f"cache blocks {first_raw.shape[0]} are not a multiple of "
+                    f"num_blocks {num_blocks}"
+                )
             self._geometry[group_id] = remat.PageGeometry(
                 head_size=spec.head_size,
                 num_heads=spec.num_kv_heads,
                 block_size=spec.block_size,
                 rotary_dim=self._rotary_prefix_width(spec.head_size),
+                kernel_block_size=spec.block_size // ratio,
             )
             layer_names: list[str] = []
             for layer_name in group.layer_names:
@@ -212,11 +226,14 @@ class KVMemWorkspaceWorker:
             )
             logger.info(
                 "vllm-030win patch (step 060): KVMem workspace group %d: %d "
-                "layers, page %d B, %d host slots (%.2f GiB pinned), "
-                "block_stride %d B",
+                "layers, page %d B (%d chunks x %d B, kernel block %d), %d "
+                "host slots (%.2f GiB pinned), block_stride %d B",
                 group_id,
                 len(layer_names),
                 page,
+                self._geometry[group_id].chunks_per_page,
+                self._geometry[group_id].chunk_bytes,
+                self._geometry[group_id].kernel_block_size,
                 self.num_slots,
                 self.num_slots * page * len(layer_names) / (1024**3),
                 block_stride_bytes,
@@ -378,10 +395,13 @@ class KVMemWorkspaceWorker:
         pre-RoPE authority has to reproduce them: the offline round trip of
         tools/kvmem_remat_test.py runs here on real pages, and it also exercises
         the authority's token indexing end to end. What is compared is the
-        quantised bytes and, more usefully, the dequantised values, because the
-        capture stores fp16 while the model rotated in bf16 -- a difference well
-        inside one E2M1 step, so a handful of differing codes is expected while
-        a large delta is not.
+        quantised bytes and, more usefully, the dequantised values against the
+        page's largest E2M1 step. Expected shape: the rebuild is not
+        bit-identical because the engine's triton kernel and the host-side
+        bake differ in fp32 rounding order, but the differing codes are
+        neighbour rungs (~0.5% of bytes) and every delta stays inside one
+        quantisation step; a non-finite delta or a delta over one step means
+        the layout or the precision contract is broken, not noise.
         """
         if self._remat_done >= REMAT_SELFTEST_PAGES:
             return
@@ -413,15 +433,21 @@ class KVMemWorkspaceWorker:
                 stored = self._host[(group_id, layer_name)][page.slot]
                 stored_u8 = stored.view(torch.uint8)
                 rebuilt = stored_u8.clone()
+                # The authority keeps the pre-RoPE rows as fp16, which is exact
+                # for bf16 values. The engine rotates in bf16 against fp32
+                # cos/sin (the triton kernel's input precision), so the rebuild
+                # has to restore both: feeding the fp16 rows (and truncating
+                # cos/sin to match) double-rounds the inputs and flips ~2% of
+                # the codes outside the quantisation step.
                 raw = torch.from_numpy(
                     np.ascontiguousarray(rows).reshape(
                         block, geom.num_heads, geom.rotary_dim
                     )
-                )
+                ).to(torch.bfloat16)
                 device = rotary.cos_sin_cache.device
                 cos_sin = rotary.cos_sin_cache[
                     torch.from_numpy(positions).to(device)
-                ].to(dtype=raw.dtype, device="cpu")
+                ].to(device="cpu")
                 tokens = torch.arange(block, dtype=torch.long)
                 remat.rematerialize_page(
                     rebuilt,
@@ -442,6 +468,15 @@ class KVMemWorkspaceWorker:
                 ).abs()
                 nan_count = int(torch.isnan(delta).sum())
                 max_delta = float(torch.nan_to_num(delta, nan=0.0, posinf=0.0).max())
+                # Largest E2M1 step on the page (the 6->4 magnitude rung), so
+                # the report carries a scale-free error measure: a
+                # neighbour-code flip must stay <= 1 step.
+                sf_value = sf_old.view(torch.float8_e4m3fn).float()
+                max_step = float(
+                    torch.where(
+                        sf_value > 0, 2.0 / sf_value, torch.zeros_like(sf_value)
+                    ).max()
+                )
                 if n_diff:
                     self._remat_mismatch += 1
                     self._remat_max_byte_diff = max(
@@ -469,6 +504,10 @@ class KVMemWorkspaceWorker:
                             .max()
                         ),
                         "max_abs_delta_dequantised": max_delta,
+                        "max_e2m1_step": max_step,
+                        "delta_over_step": (
+                            max_delta / max_step if max_step > 0 else 0.0
+                        ),
                         "nan_elements": nan_count,
                     }
                 )
@@ -530,12 +569,14 @@ class KVMemWorkspaceWorker:
             baked = remat.bake_rotated_k(
                 raw, torch.arange(raw.shape[0], dtype=torch.long), cos_sin
             )
+            # numpy has no bfloat16, and the rebuilt rows are bf16 by the
+            # precision contract -- dump them as fp32 (exact widening).
             np.savez(
                 os.path.join(directory, "kvmem_remat_arrays.npz"),
                 layer=np.array([layer_name]),
                 positions=positions,
-                authority_rows=raw.numpy(),
-                baked_from_authority=baked.numpy(),
+                authority_rows=raw.float().numpy(),
+                baked_from_authority=baked.float().numpy(),
                 stored_packed=packed_old.numpy(),
                 stored_sf=sf_old.view(torch.uint8).numpy(),
                 rebuilt_packed=packed_new.numpy(),

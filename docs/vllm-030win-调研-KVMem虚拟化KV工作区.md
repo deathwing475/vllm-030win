@@ -788,6 +788,45 @@ scale 偏移 = (t//kbs)*chunk_bytes + side*side_bytes + heads*kbs*data_dim
 
 ---
 
+## 12.11 阶段 1 K3 后半接线第二半（步骤 065：`PageGeometry` 内核块重写 + 实时往返 GO）
+
+> 本节记录 §12.9.7-1 的收口：按 §12.10.3 的真实布局重写 `PageGeometry`、离线单测在真实布局上重建、实时往返重跑。**结论先行：实时重物化往返 GO（量化步内一致）**——8 页 × 16 层 delta ≤ 0.127 步长、nan = 0；位级残余 ~0.5% = triton kernel 与 host 复算的 fp32 舍入序列差，对注意力等价。
+
+### 12.11.1 落点
+
+| 文件 | 改动 |
+|---|---|
+| `v1/kvmem_workspace/remat.py` | `PageGeometry` 加 `kernel_block_size`（必填），偏移公式换内核块形式（§12.10.3） |
+| `v1/kvmem_workspace/worker.py` | `register_kv_caches` 从真实 cache 张量推 kbs；自检精度契约（bf16 还原）；报告加 `max_e2m1_step` / `delta_over_step`；dump 转 fp32 落盘 |
+| `tools/kvmem_remat_test.py` | T0/T2/T3 重写：物理 buffer = 真实布局 flat 字节，writer 经**内核块粒度幻象视图**写入（25/25 全过） |
+
+### 12.11.2 机制
+
+- **kbs 的来源**：`ratio = cache.shape[0] // num_blocks`（未拆分时 1），`kbs = spec.block_size // ratio`。worker 注册日志打 `89 chunks x 18432 B, kernel block 16` 供现场核对。
+- **离线单测去自证**：物理 buffer 是 flat 字节（真实布局），`write_reference_nvfp4_cache` 经 `as_strided` 的内核块粒度 NHD 幻象视图写入（stride(0)=18,432、V 侧 offset=9,216），`slot_mapping` 用真实引擎语义（绝对 token 号，writer 内部 `slot // 16` 落 kernel block）。T3 的 carve 复推从同一视图出发。**manager 块粒度的视图会重建被证伪的布局——这正是 064 的自证陷阱**。
+- **⭐精度契约（实时往返从 2% 码差到 0.5% 的关键）**：权威区以 fp16 存 pre-RoPE K（对 bf16 值**无损**）；引擎 triton kernel 的输入精度 = **bf16 K × fp32 cos/sin** ⇒ 重建时必须 `raw.to(bfloat16)` 且 cos/sin 保 fp32，再走 `bake_rotated_k`。fp16 行直喂 + cos/sin 截 fp16 = 双重舍入 ⇒ amax 抖动 ⇒ ~2% 码差且 delta 达 2.0（超步）。
+- **残余差异的定性（判定依据）**：写页的 triton kernel 与重建的 host 复算在 fp32 舍入序列上不同 ⇒ ~0.5% 码在**邻档**翻动（932 个幅度差 1 档 + 13 个近零符号翻转），dequant 误差 **≤ 0.56 步**——对注意力等价，满足设计出口"逐位**或**量化步内一致"。
+
+### 12.11.3 实测（步骤 065）
+
+| 项 | 结果 |
+|---|---|
+| 离线单测（CPU，真实布局） | **25/25**：旋转字节 205,056 **0 mismatch**、carve 复推全等、整页重建逐位一致、writer 只碰页 0 |
+| 实时往返 r2（8 页 × 16 层） | 字节差率 **0.41-0.56%**、`delta_over_step` **0.0068-0.127**、**nan = 0**、`rows_written = 2,659,328`、`unmapped/missing = 0` |
+| 离线逐元素口径 | 码差 0.5% 全邻档；dequant 误差/步长 **max 0.5625、mean 5e-4、0/364,544 超步** |
+| 检索侧 | r2 `dot@64` rank 2（与 061 量级一致，未回归） |
+| 证据 | `prod029_logs\kvmem_k3f\`（r1 失败态已改名 `_r1_fp16asis` 保留）+ `kvmem_k3f_boot{,2,3}_20260930.{out,err}` + `kvmem_k3f_r{1,2}_needle_d10.json` |
+
+### 12.11.4 本步的边界（勿误读）
+
+- **实时往返通过 ≠ 页能被放回视窗**：往返自检只测"原位重建"；位置解耦（`gpu_model_runner.py` 的 positions）+ 块表改写未开工 ⇒ **窗外 needle 仍答不出**。
+- 真实"压缩到固定槽位 0..B-1"的目标位置装配未测（063 T4 只测离线位移）。
+- 本步不判性能（阶段 1 判据不含性能）。
+- 诊断 dump 的数组转 fp32（numpy 无 bf16）——第一版直接 `.numpy()` 会让 EngineCore 崩在 `np.savez`。
+- **精度契约已进必守**：重建必须还原 bf16 + fp32 cos/sin，违反则码差超步。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |
