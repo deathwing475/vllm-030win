@@ -365,12 +365,17 @@ class KVMemWorkspaceScheduler:
                     end=start + num_tokens,
                     window=plan["window"],
                 )
+            is_prefill = True
+            prompt_now = len(getattr(request, "prompt_token_ids", ()) or ())
+            if prompt_now:
+                is_prefill = start < prompt_now
             meta.spans.append(
                 KVMemStepSpan(
                     trajectory=trajectory,
                     start=start,
                     num_tokens=num_tokens,
                     viewport=plan is not None,
+                    prefill=is_prefill,
                 )
             )
             # The step that completes the prompt is the one where retrieval

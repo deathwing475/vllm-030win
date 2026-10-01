@@ -47,6 +47,16 @@ was re-measured:
 The one thing that must stay out of the body is a host synchronisation. The
 device-to-host copies live in :func:`drain`, which the connector worker calls
 after the forward has finished.
+
+Step 075 (speculative decode on the arm) changed the second property: with
+``num_spec_tokens=2`` a decode step verifies 3 tokens, so it is both larger than
+one token *and* captured into a CUDA graph -- the ``num_tokens <= 1`` guard alone
+let it into the body, whose clone and M-RoPE ``torch.equal`` then abort the
+capture (``cudaErrorStreamCaptureInvalidated``, observed on the first 075 boot).
+Recording is therefore armed explicitly: the worker calls :func:`arm` with the
+token counts of the step's *prefill* spans when it binds the step's metadata
+(before the forward) and :func:`disarm` afterwards, so a step the connector does
+not expect prompt tokens from records nothing, whatever its size.
 """
 
 from __future__ import annotations
@@ -63,13 +73,41 @@ _STASH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _GEOMETRY: tuple[int, int, int] | None = None
 _LOGGED = False
 _SKIPPED_DECODE = 0
+_SKIPPED_UNARMED = 0
 _MROPE_AXES_DIFFER = 0
+# Step 075: the token counts the connector expects to compute in the step about
+# to run (its prefill spans). None = the connector has not armed this step, so
+# nothing is recorded. An explicit allow-list is the only rule that survives
+# speculative decode, where a verify step is 1 + num_spec_tokens tokens and runs
+# inside a CUDA graph.
+_ARMED: set[int] | None = None
 
 
 def enabled() -> bool:
     from vllm import envs
 
     return envs.VLLM_KVMEM_RAWK
+
+
+def arm(counts: set[int]) -> None:
+    """Allow recording for a step of exactly these token counts (step 075).
+
+    Called by the connector worker when it binds the step's metadata, i.e.
+    before the forward. Passing an empty set means "this step computes no prompt
+    tokens" -- a decode/verify step -- and nothing is recorded.
+    """
+    global _ARMED
+    _ARMED = set(counts)
+
+
+def disarm() -> None:
+    """Forget the allow-list: an unbound step records nothing."""
+    global _ARMED
+    _ARMED = None
+
+
+def armed() -> set[int] | None:
+    return _ARMED
 
 
 def _query_span() -> int:
@@ -93,11 +131,19 @@ def _record_impl(
     between ``k_norm`` and ``self.rotary_emb``. Must stay cheap and
     allocation-only: it runs inside the forward.
     """
-    global _GEOMETRY, _SKIPPED_DECODE, _MROPE_AXES_DIFFER
+    global _GEOMETRY, _SKIPPED_DECODE, _SKIPPED_UNARMED, _MROPE_AXES_DIFFER
 
     num_tokens = k.shape[0]
     if num_tokens <= 1:
         _SKIPPED_DECODE += 1
+        return
+    # Step 075: with speculation a verify step is more than one token and IS
+    # captured into a CUDA graph, so the token count alone cannot tell prefill
+    # from decode. Only the connector knows, and it says so through ``arm``
+    # before the forward; anything outside that allow-list records nothing.
+    # (A draft step of the drafter's own model never reaches this module.)
+    if _ARMED is None or num_tokens not in _ARMED:
+        _SKIPPED_UNARMED += 1
         return
 
     if _GEOMETRY is None:
@@ -169,15 +215,30 @@ def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     forward so that no synchronising copy can land inside a compiled or
     graphed region.
     """
-    global _STASH, _LOGGED, _SKIPPED_DECODE
+    global _STASH, _LOGGED, _SKIPPED_DECODE, _SKIPPED_UNARMED
+    # The counters flush even on a step that recorded nothing: with the step 075
+    # allow-list a decode/verify step leaves an empty stash, and "0 calls
+    # outside the armed sizes since the last drain" is the read that the graphed
+    # step never re-entered the body (067's judge, generalised to speculation).
+    skipped, _SKIPPED_DECODE = _SKIPPED_DECODE, 0
+    unarmed, _SKIPPED_UNARMED = _SKIPPED_UNARMED, 0
     if not _STASH:
+        if skipped or unarmed:
+            logger.info(
+                "vllm-030win patch (step 075): KVMem capture drain: nothing "
+                "recorded this step (%d single-token call(s), %d call(s) "
+                "outside armed sizes %s; 0/0 = decode ran on the CUDA graph "
+                "without touching the capture body)",
+                skipped,
+                unarmed,
+                sorted(_ARMED) if _ARMED else _ARMED,
+            )
         return {}
     stash, _STASH = _STASH, {}
     # Step 067 health check. The op body is not re-entered when its node replays
-    # from a CUDA graph, so the number of single-token calls since the previous
-    # drain is a direct read on whether decode is actually running inside the
-    # FULL graph: 0 means graphed, anything else means it fell back to eager.
-    skipped, _SKIPPED_DECODE = _SKIPPED_DECODE, 0
+    # from a CUDA graph, so the number of calls the allow-list rejected is a
+    # direct read on whether decode is actually running inside the FULL graph:
+    # 0 means graphed, anything else means it fell back to eager.
     out: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
     for layer_idx, (positions, q_tail, k) in stash.items():
         out[layer_idx] = (
@@ -202,11 +263,14 @@ def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
         )
     logger.info(
         "vllm-030win patch (step 067): KVMem capture drain: %d layer(s), "
-        "%d token(s), %d single-token call(s) since the last drain "
-        "(0 = decode replayed from a CUDA graph, >0 = decode ran the op body)",
+        "%d token(s), %d single-token call(s) + %d call(s) outside armed sizes "
+        "%s since the last drain (0 + 0 = decode replayed from a CUDA graph, "
+        ">0 = decode ran the op body)",
         len(out),
         next(iter(out.values()))[2].shape[0] if out else 0,
         skipped,
+        unarmed,
+        sorted(_ARMED) if _ARMED else _ARMED,
     )
     return out
 
@@ -216,15 +280,20 @@ def stats() -> dict:
         "armed": enabled(),
         "layers_stashed": len(_STASH),
         "skipped_decode_steps": _SKIPPED_DECODE,
+        "skipped_unarmed_steps": _SKIPPED_UNARMED,
+        "armed_counts": sorted(_ARMED) if _ARMED else _ARMED,
         "mrope_axes_differ": _MROPE_AXES_DIFFER,
         "geometry": _GEOMETRY,
     }
 
 
 def reset() -> None:
-    global _STASH, _GEOMETRY, _LOGGED, _SKIPPED_DECODE, _MROPE_AXES_DIFFER
+    global _STASH, _GEOMETRY, _LOGGED, _SKIPPED_DECODE, _SKIPPED_UNARMED
+    global _MROPE_AXES_DIFFER, _ARMED
     _STASH = {}
     _GEOMETRY = None
     _LOGGED = False
     _SKIPPED_DECODE = 0
+    _SKIPPED_UNARMED = 0
     _MROPE_AXES_DIFFER = 0
+    _ARMED = None

@@ -121,6 +121,14 @@ class KVMemStepSpan:
     # the recent tail), so they must not reach the retrieval index or the
     # authority -- only the query tail is extracted, for scoring.
     viewport: bool = False
+    # Step 075: this span computes prompt tokens (``start`` sits inside the
+    # request's *current* prompt, which for a rewritten window request is the
+    # window length). The worker arms the raw-K capture with exactly these token
+    # counts, because a speculative verify step is ``1 + num_spec_tokens`` tokens
+    # -- more than one, so the old "decode is the 1-token step" rule records it,
+    # and it runs inside a CUDA graph, where the capture body's clone and
+    # M-RoPE ``torch.equal`` invalidate the capture.
+    prefill: bool = True
 
 
 @dataclass

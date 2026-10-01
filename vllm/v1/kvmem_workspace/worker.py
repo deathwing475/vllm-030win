@@ -763,9 +763,24 @@ class KVMemWorkspaceWorker:
         if isinstance(metadata, KVMemConnectorMetadata):
             self._pending = metadata
             self._loads_issued = False
+            # Step 075: tell the raw-K capture which token counts belong to this
+            # step's prefill spans *before* the forward runs. Speculative decode
+            # makes a verify step 1 + num_spec_tokens tokens, so "more than one
+            # token" no longer means prefill -- and a verify step is graphed,
+            # where the capture body's clone plus M-RoPE torch.equal would
+            # invalidate the CUDA graph capture.
+            if capture.enabled():
+                capture.arm(
+                    {
+                        span.num_tokens
+                        for span in metadata.spans
+                        if span.prefill
+                    }
+                )
 
     def clear_connector_metadata(self) -> None:
         self._pending = None
+        capture.disarm()
 
     def start_load_kv(self) -> None:
         """Issue this step's prefix-assembly copies.

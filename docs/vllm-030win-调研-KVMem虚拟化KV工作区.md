@@ -1148,6 +1148,39 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 - **仍未做**：N/R 预算扫描、recent 段滚动重烘焙、多轮 ΔP、GPU 化烘焙、多轨迹与长稳、`VIEWPORT=0` 的同臂对照。
 - **证据目录**：`kvmem_k9a`（074 boot1）、`kvmem_k9b`（074 boot2）、`kvmem_k9c`（装配回归）。装配臂的默认 dump 已从 `kvmem_k5a` 改指 `kvmem_k9c` —— **k5a 是 066/067 的证据，复跑不得覆盖**。
 
+## 12.17 步骤 075：把投机（DFlash2 N=2）接进 KVMem 臂 —— **判据 INCOMPLETE**，但定死两件事
+
+> 用户 2026-10-01 在 074 收尾时拍板"先给 KVMem 臂加投机"。今晚的结论是**这条路还没打通**（8k decode 一次都没测到），但拿到了两条可长期复用的硬事实。**本节所有速度判据均未达成，勿当已验。**
+
+### 12.17.1 ⭐容量互斥（实测，非推演）：投机与 `W=163,072` 视窗在池值 3.4e9 下装不下
+
+- `tools/serve_gsq_kvmem_viewport075_spec.cmd` = 074 视窗臂 + 生产投机三行 + `--cudagraph-capture-sizes 3`，其余逐字节相同。第一次 boot 即被引擎拒绝：`3.24 GiB KV cache is needed ... larger than the available KV cache memory (3.15 GiB) ... estimated maximum model length is 160160`。
+- **降 `--max-model-len`（262,144 → 200,704）需求量一字不变** ⇒ 每请求需求由**滑窗**（`VLLM_KVMEM_SW_WINDOW`）钉住，不由 L 钉住；引擎那句"估算最大长度 160,160"是线性外推的读数，不是可用杠杆。
+- **降滑窗到 131,072** 才通过容量检查（`Maximum concurrency for 200,704: 1.17x`、K2 `needs 188 / pool has 253`）。代价有两条：①**页长从 1424 变 1456**（引擎给的 `block_size=[1456,1456]`）⇒ `--max-num-batched-tokens` 必须同步钉 1456，而 066 装配线的"步尾必须落在页边界才抓 mamba 快照"口径要按 1456 重验；②KVMem 设计的 **262,144 上下文上限在本臂不可达**（L 只能 ≤ 200,704）。
+- 池值 3.4e9 是 必守 6 的硬上限（上探打死 prefill），所以**"投机 + 大视窗"要同时成立就得先解决这 0.09 GiB 的缺口**，而缺口只能从窗口/页长/生成预留里出。
+
+### 12.17.2 ⭐"token 数"在投机下不再能区分 prefill 与 decode（capture allow-list）
+
+- 第二次失败在图捕获：`torch.AcceleratorError: CUDA error: operation failed due to a previous error during capture (cudaErrorStreamCaptureInvalidated)`，栈 = `qwen3_next.forward → compilation/cuda_graph.py → torch.cuda.graph/capture_end`。
+- 机制：`capture._record_impl` 认 decode 的唯一依据是 `num_tokens <= 1`（061 立的规则、067 靠它保证"图里没有我们的 device 工作"）。**N=2 投机把 decode 变成 verify 步 = 3 token** ⇒ 它被当成 prefill 录制，于是在**图捕获期间**执行 `clone` 与 M-RoPE 的 `torch.equal`（host 同步）⇒ 捕获作废。
+- 修法 = **让连接器说了算**：`KVMemStepSpan.prefill` 新标志（`_emit_spans` 用请求**当前** prompt 长度判定；视窗请求用改写后的窗口长度，因为它 `_req_prompt_len` 仍是原长）；worker `bind_connector_metadata`（forward 之前）`capture.arm({本步各 prefill span 的 num_tokens})`，`clear_connector_metadata` `capture.disarm()`；`_record_impl` 只录 allow-list 内的步，**未授权 = 不录**（连 boot 的 warmup/profiling 步也不录，比 067 的"靠大小猜"更严）。
+- 判据升级：`drain` 现在报「单 token 调用数 **+** 落在 allow-list 之外的调用数」，**两个都 0 ⇒ decode 真在 CUDA 图上**（067 判据的推广）。
+- **副作用检查（必做）**：无投机 074 臂回归（`kvmem_k9g`）140 步全录、每步 `0 + 0 outside armed sizes [1424]`、打分里**针页 88 仍排第 4**、`evicted=48 stored=326 dropped=0`、视窗 `stage-in plan: 55 slot(s) x 2 group(s) = 110 block(s)` → `baked 880 layer-page copies` → **serve `text="\n\n77349"`、TTFT 92.764 s、needle_hit=True** ⇒ §12.16 的成果未被本步改动破坏。
+
+### 12.17.3 ⭐未定罪的活锁：投机 + KVMem 连接器 ⇒ 调度器一步都不推进
+
+- 现象：boot4（修复后可正常捕获并 ready）上 198,184 ingest 从 21:59:09 到 22:10:29 刷 **43.5 万行** `decline:no-store`、`computed=0`、**0 前向步、0 次 capture drain、GPU util 0%**；boot5 上 8,153 token 小请求同样（`decline:no-mid`、0 前向）。连接器一侧只被反复询问，返回的是正常的 `(0, False)`。
+- **判别实验**（`tools/serve_gsq_kvmem_ws075_spec.cmd` = 仅 `VLLM_KVMEM_VIEWPORT=0`，dump `kvmem_k9f`）：请求 22:20:45 进、22:26:00 客户端超时出，`evicted=0 stored=0`、0 drain、0% GPU、**无 decline 噪声** ⇒ **与压缩视窗无关，是"投机 × KVMem 连接器"这个组合让请求无法被调度**。
+- 与"每请求块分配失败 ⇒ 留在 waiting 队列反复重问"同向，但引擎自报 `Maximum concurrency 1.17x` 与之矛盾 ⇒ **今晚不作定罪**（判据未达成的部分一律写 INCOMPLETE）。
+- **076 的定罪手段（按代价排序）**：①给 `has_pending_stores` / `WAITING_FOR_REMOTE_KVS` / 每请求块需求各加**一次性计数日志**后跑一次 boot，直接看调度器卡在哪一步；②对照臂 = **生产配方（无 `VLLM_KVMEM_*`）+ 同投机**跑 8k，先排除 drafter 自身；③按 `WORKSPACE=1 / RAWK=0 / AUTHORITY=0 / SWEEP=0 / VIEWPORT=0` 逐层剥，看剥到哪一层请求开始动。
+
+### 12.17.4 本步的边界（勿误读）
+
+- **本节没有任何速度结论**。8k decode 在带投机的 KVMem 臂上**一次都没测到**；69.16（无投机、W=163,072）仍是唯一有效的臂内 decode 读数。
+- capture allow-list 是**机制级修复**（GO），但它只证明"能捕获、能 ready、无投机路径零回归"，**不**等于"投机可用"。
+- 页长 1424 ↔ 1456 的切换会换 **AOT 缓存键**（boot4 `compilation 64.26 s` 首编、boot5 命中缓存 0.024 s）⇒ 任何窗口/页长变更都要按 必守 17 双 boot 或走 watchdog。
+- 生产默认**未动**，且生产服务自 073 起一直未起（恢复 = 用户发话）。
+
 ---
 
 ## 11. 参考索引
