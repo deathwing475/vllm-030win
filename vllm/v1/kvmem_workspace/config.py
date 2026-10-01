@@ -283,6 +283,17 @@ def recent_tokens() -> int:
     return _env_int("VLLM_KVMEM_RECENT", DEFAULT_RECENT_TOKENS)
 
 
+def debug_enabled() -> bool:
+    """One-shot observation of the window request's engine-side state.
+
+    Step 073 diagnostic only (the N=55 empty-output fault): it prints what the
+    scheduler actually did to a rewritten request -- how many tokens it adopted
+    as computed, how many block hashes it carries, what its status and sampled
+    tokens were at finish. Nothing about behaviour changes.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_DEBUG", "0")))
+
+
 def viewport_enabled() -> bool:
     """Rewrite a long request onto the fixed-slot compressed window (step 072).
 

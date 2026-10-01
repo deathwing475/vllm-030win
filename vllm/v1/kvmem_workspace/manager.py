@@ -118,6 +118,9 @@ class KVMemWorkspaceScheduler:
         )
         self.viewport_recent_tokens = config.viewport_recent_tokens()
         self.viewport_retrieval_pages = config.viewport_retrieval_pages()
+        # Step 073: read-only observation of what the scheduler does to a
+        # rewritten request (see config.debug_enabled). Off by default.
+        self.debug = config.debug_enabled()
         # The window plus the request's own generation must fit the sliding
         # window the pool was sized for: the rewritten request is an ordinary
         # request as far as the engine is concerned, and it must never need
@@ -135,6 +138,8 @@ class KVMemWorkspaceScheduler:
         # fixed before the request first runs (design §5.1's core invariant --
         # the query position never depends on which pages get selected).
         self._req_viewport: dict[str, dict] = {}
+        # step 073 debug only: forward steps counted per window request.
+        self._debug_window_steps: dict[str, int] = {}
         self.viewports_rewritten = 0
         self.viewports_declined = 0
         self.stage_ins_emitted = 0
@@ -285,6 +290,23 @@ class KVMemWorkspaceScheduler:
                 num_external_tokens,
                 self._req_trajectory[request.request_id],
             )
+        if request.request_id in self._req_viewport:
+            # The state the window request really starts from: how much of the
+            # rewritten sequence the engine adopted as already computed.
+            group_id = self.group_ids[0]
+            block_ids = blocks.get_block_ids()
+            rows = (
+                len(block_ids[group_id])
+                if block_ids and group_id < len(block_ids)
+                else -1
+            )
+            self._debug_window(
+                "adopted",
+                request,
+                external=num_external_tokens,
+                rows=rows,
+                window=self._req_viewport[request.request_id]["window"],
+            )
 
     # ------------------------------------------------------------------
     # eviction hand-off
@@ -333,6 +355,16 @@ class KVMemWorkspaceScheduler:
                 continue
             start = request.num_computed_tokens
             plan = self._req_viewport.get(req_id)
+            if plan is not None and self.debug:
+                step = self._debug_window_steps.get(req_id, 0) + 1
+                self._debug_window_steps[req_id] = step
+                self._debug_window(
+                    f"forward{step}",
+                    request,
+                    num=num_tokens,
+                    end=start + num_tokens,
+                    window=plan["window"],
+                )
             meta.spans.append(
                 KVMemStepSpan(
                     trajectory=trajectory,
@@ -1030,6 +1062,49 @@ class KVMemWorkspaceScheduler:
     # step 072: the fixed-slot compressed window
     # ------------------------------------------------------------------
 
+    def _debug_window(self, where: str, request, **fields) -> None:
+        """One compact observation line (VLLM_KVMEM_DEBUG, step 073).
+
+        Records what the engine really did to a window request, which is the
+        only way to tell "the model sampled EOS" from "the request ended before
+        a sample" and "a sample happened but was dropped downstream".
+        """
+        if not self.debug:
+            return
+        hashes = getattr(request, "block_hashes", None)
+        outputs = getattr(request, "_output_token_ids", ()) or ()
+        extra = " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.info(
+            "vllm-030win KVMem window-debug (%s): req=%s computed=%d "
+            "num_tokens=%d prompt_len=%d hashes=%d outputs=%d first_ids=%s "
+            "status=%s %s",
+            where,
+            request.request_id,
+            request.num_computed_tokens,
+            request.num_tokens,
+            request.num_prompt_tokens,
+            len(hashes) if hashes is not None else -1,
+            len(outputs),
+            list(outputs[:3]),
+            getattr(request.status, "name", request.status),
+            extra,
+        )
+
+    def _decline_window(self, request, num_computed_tokens: int, reason: str):
+        """Count a window decline, and (under debug) say which guard fired."""
+        self.viewports_declined += 1
+        if self.debug:
+            logger.info(
+                "vllm-030win KVMem window-debug (decline:%s): req=%s "
+                "computed=%d prompt_len=%d hashes=%d",
+                reason,
+                request.request_id,
+                num_computed_tokens,
+                len(getattr(request, "prompt_token_ids", ()) or ()),
+                len(getattr(request, "block_hashes", ()) or ()),
+            )
+        return False
+
     def _viewport_layout(self, prompt_len: int) -> tuple[int, int, int, int] | None:
         """(S, N tokens, R, B) for a prompt of this length, or None.
 
@@ -1087,28 +1162,25 @@ class KVMemWorkspaceScheduler:
         tail.
         """
         if num_computed_tokens > self.block_size[self.group_ids[0]]:
-            self.viewports_declined += 1
-            return False
+            return self._decline_window(
+                request, num_computed_tokens, "hit-above-sink"
+            )
         token_ids = getattr(request, "prompt_token_ids", None)
         if not token_ids:
-            self.viewports_declined += 1
-            return False
+            return self._decline_window(request, num_computed_tokens, "no-tokens")
         prompt_len = len(token_ids)
         layout = self._viewport_layout(prompt_len)
         if layout is None:
-            self.viewports_declined += 1
-            return False
+            return self._decline_window(request, num_computed_tokens, "no-mid")
         trajectory = self.trajectory_key(token_ids, self.trajectory_prefix_tokens)
         if self._trajectory_page_count(trajectory) == 0:
             # Nothing stored for this trajectory: the slots would stay
             # placeholders, which is a pure truncation of the prompt.
-            self.viewports_declined += 1
-            return False
+            return self._decline_window(request, num_computed_tokens, "no-store")
         sink, retrieval, recent, window = layout
         new_len = sink + retrieval + recent
         if new_len + request.max_tokens > self.max_window_tokens:
-            self.viewports_declined += 1
-            return False
+            return self._decline_window(request, num_computed_tokens, "too-wide")
         # The rewrite keeps the leading 512 tokens verbatim, so the trajectory
         # key computed by update_state_after_alloc stays the same key.
         token_ids[:] = token_ids[:sink + retrieval] + token_ids[prompt_len - recent:]
@@ -1137,16 +1209,40 @@ class KVMemWorkspaceScheduler:
             prompt_len,
             self._trajectory_page_count(trajectory),
         )
+        digest = hashlib.blake2b(
+            np.asarray(token_ids, dtype=np.int64).tobytes(), digest_size=8
+        ).hexdigest()
+        self._debug_window(
+            "rewrite",
+            request,
+            orig=prompt_len,
+            window=new_len,
+            max_tokens=request.max_tokens,
+            sha=digest,
+        )
         return True
 
     def request_finished(self, request, block_ids):
         del block_ids
+        plan = self._req_viewport.get(request.request_id)
+        if plan is not None:
+            # How the window request really left: sampled ids, status, and the
+            # computed total. Empty outputs with a computed total short of the
+            # window is a scheduler fault, not a model one.
+            self._debug_window(
+                "finish",
+                request,
+                window=plan["window"],
+                orig=plan["orig_len"],
+                scored=request.request_id in self._req_scored,
+            )
         self._req_trajectory.pop(request.request_id, None)
         self._req_object.pop(request.request_id, None)
         self._req_prompt_len.pop(request.request_id, None)
         self._req_scored.discard(request.request_id)
         self._pending_loads.pop(request.request_id, None)
         self._req_viewport.pop(request.request_id, None)
+        self._debug_window_steps.pop(request.request_id, None)
         base = self._req_baseline.pop(request.request_id, None)
         if base is None:
             base = (0, 0, 0)
@@ -1212,4 +1308,5 @@ class KVMemWorkspaceScheduler:
         self._page_hashes.clear()
         self._pending_loads.clear()
         self._req_viewport.clear()
+        self._debug_window_steps.clear()
         self.slots_used = 0

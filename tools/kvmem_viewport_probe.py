@@ -57,9 +57,9 @@ from kvmem_k3_probe import build, tokenizer  # noqa: E402
 def run(args) -> dict:
     base = args.base
     ingest_prompt, needle_char = build(args.tokens, args.depth, args.nonce,
-                                       True, "summary")
+                                       True, args.question_style)
     flush_prompt, _ = build(args.tokens, args.depth, args.nonce + "-flush",
-                            False, "summary")
+                            False, args.question_style)
     tok = tokenizer()
     n_ingest = len(tok.encode(ingest_prompt, add_special_tokens=False))
     needle_token = tok.encode(ingest_prompt[:needle_char],
@@ -74,11 +74,18 @@ def run(args) -> dict:
 
     print(f"[ingest] ~{n_ingest} tokens, needle at token {needle_depth_tokens} "
           f"(depth {args.depth}, in-window={in_window})")
-    r1 = post(base, ingest_prompt, args.ingest_max_tokens, ignore_eos=True)
-    time.sleep(1.0)
-    print(f"[flush ] ~{n_ingest} tokens (different nonce, overwrites the pool)")
-    r2 = post(base, flush_prompt, 1, ignore_eos=True)
-    time.sleep(1.0)
+    if args.stages != "serve":
+        r1 = post(base, ingest_prompt, args.ingest_max_tokens, ignore_eos=True)
+        time.sleep(1.0)
+        print(f"[flush ] ~{n_ingest} tokens (different nonce, overwrites the pool)")
+        r2 = post(base, flush_prompt, 1, ignore_eos=True)
+        time.sleep(1.0)
+    else:
+        # Re-send only the serve against a trajectory this boot already stored
+        # (the ingest + flush pair costs ~8 minutes; a declined or crashed serve
+        # attempt should not force the whole sequence again).
+        print("[stages=serve] skipping ingest and flush, reusing the stored pages")
+        r1 = r2 = {}
     print(f"[serve ] ~{n_ingest} tokens (same prompt; the window path runs)")
     r3 = post(base, ingest_prompt, args.max_tokens,
               ignore_eos=args.serve_ignore_eos)
@@ -136,9 +143,21 @@ def main():
                    help="S+N of the arm's window (one sink page + 55 pages)")
     p.add_argument("--recent-tokens", type=int, default=16384)
     p.add_argument("--nonce", default="vp")
+    p.add_argument("--question-style", default="summary",
+                   choices=("summary", "focused"),
+                   help="focused asks for the number only, so a working window "
+                        "can answer inside a short budget instead of writing a "
+                        "200-word summary first")
     p.add_argument("--ingest-max-tokens", type=int, default=16)
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--tag", default="run")
+    p.add_argument("--stages", default="all", choices=("all", "serve"),
+                   help="serve = re-send only the window request against a "
+                        "trajectory this boot already stored")
+    p.add_argument("--serve-ignore-eos", action="store_true",
+                   help="force the serve request to generate past EOS, which "
+                        "separates 'the model sampled EOS' from 'the request "
+                        "ended without a usable sample'")
     p.add_argument("--out", default=r"G:\qwen3.8model\prod029_logs\kvmem_k7a\vp.json")
     p.set_defaults(func=run)
 

@@ -1061,6 +1061,49 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 - 烘焙在 host CPU 同步做，TTFT 尾部加烘焙耗时（55 页 × 16 层 3.42 s）；阶段 1 不判性能。
 - 检索槽**只覆盖 55 页**（78K token）；needle 落在未被选中的页上仍答不出（检索质量本身是 061 的判据，本步判据是"选中的页真能被读到"）。
 - **`block_hashes` 陈旧**（已知未修）：改写后 `request.block_hashes` 仍是原 prompt 的哈希（长 140 vs 现 68 块）——本次运行未观察到越界命中（日志 `Prefix cache hit rate: 0.0%`），但属正确性隐患，下一步一并核。
+- **⭐⭐本节两处结论已被步骤 073 推翻/更正（见 §12.15）**：①"N=55 空输出怀疑落在视窗结构/长度本身" = **错**，实测为**模型首 token 采出 EOS**（同 boot 只换 nonce 即复现或消失；同一视窗 token 序列当**普通 prompt** 发也照样在 im_end 与换行间近并列；`ignore_eos` 后立刻连贯）⇒ 机制侧 B/C 已排除。②"阳性对照（深度 0.30）给出连贯输出但路径未定性" = **该请求根本没走视窗**（`kvmem_retrieval_*.json` 的 `recent_tokens=32768` 是原生分支指纹，16384 才是视窗）。③"针页排在 top-64、55 页全烘焙"仍成立，且由此把真卡点重定为**窗外 needle 读不出**（同 prompt 原生全量能答出 77349）。
+
+---
+
+## 12.15 步骤 073：072 卡点定性 —— **「N=55 输出为空」不是机制故障，是模型首 token 采出 EOS**；卡点重定为**窗外 needle 读不出**（原生全量能答出 77349，视窗请求答不出）
+
+> 接手先读本节。它推翻 12.14.6/12.14.7 里两处结论（"根因未定，怀疑落在视窗结构/长度"与"阳性对照给出连贯输出"），并把头名从"修 EOS"改成"修检索槽读不到"。
+
+### 12.15.1 归因口径：**A/B/C 三分 + 一条分支指纹**
+
+- **A/B/C**：A = 模型真采 EOS；B = 请求在采样前被引擎结束；C = 采样到但被 stop/流式丢弃。判 A 的最便宜手段是 **同一请求加 `ignore_eos`**（A ⇒ 立刻有输出；B/C ⇒ 仍 0 chunk）。
+- **⭐分支指纹 `recent_tokens`**：`kvmem_retrieval_*.json` 里 `recent_tokens` = **16,384 ⇒ 该请求走了视窗**（`_emit_spans` 传 `plan["recent"]`），= **32,768 ⇒ 原生请求**（传 `self.recent_tokens`）。**判"某请求是否走视窗"只能用这个（或 `rewritten onto the compressed window` 的 req id），不能用 TTFT 或"输出是否连贯"反推**——072 就是这么误判的。
+
+### 12.15.2 实测（5 boot，`tools/serve_gsq_kvmem_viewport073.cmd` = 072 臂 + `VLLM_KVMEM_DEBUG=1`）
+
+| 实验 | 结果 |
+|---|---|
+| **原生 window**（同一视窗 token 序列当普通 prompt 发，96,128） | **正常生成**，首 token 换行 -0.63、im_end -1.01 ⇒ 长度/形状本身不坏 |
+| **原生 tail**（只发尾部 16,384，summary 问题） | **首 token = im_end**（-0.37，P=0.69），只出 1 token ⇒ EOS 可在完全无机制参与时发生 |
+| **原生 tail 8,192** | 正常生成（think -0.72 / im_end -1.22）⇒ 尾部截断形状敏感，非长度阈值 |
+| 视窗 serve，nonce `vp073a`（198,207） | 改写→**68 步 prefill**→打分→**baked 55（3.2 s、688.4 MiB、0 缺页）**→**decode 32 chunk 连贯** |
+| 视窗 serve，**与 072 逐字同参数** nonce `vp`（198,203） | **0 chunk、finish=stop（EOS）复现** ⇒ 同臂同 boot 只换 nonce 就能复现/消失 |
+| 视窗 serve，nonce `vpi` + **`ignore_eos`** | **94 chunk 连贯**（准确列出文档内容）⇒ **B/C 排除，判 A** |
+| 视窗 serve，**focused 窄问题**（只要数字），max_tokens 512 | **340 chunk、推理完整**、逐条点名文档内容后答"没有 secret access code" ⇒ **窗外 needle MISS** |
+| **原生 full**（同一 prompt 198,181 走原生，focused） | **答出 77349 ⇒ needle HIT** ⇒ 基准与判据有效 |
+
+**debug 读数要点**：`rewrite computed=0` → `adopted external=0 computed=0` ⇒ **flush 真打掉池块时，072 担心的陈旧 `block_hashes`（全程 139 哈希 vs 68 块）没有造成误命中**（隐患仍在，未修）；`forward1..68` 每步 num=1424；`finish outputs=32/341 status=FINISHED_LENGTH_CAPPED first_ids=[271, 248068, 198]`。
+
+### 12.15.3 ⭐剩余卡点与首要嫌疑（未测，074 的靶子）
+
+针在 token 125,367 = **页 88**，`top_pages` 里排 **3-9**，`selected = sorted(top_pages)[:55]` **含 88** ⇒ **针页确实被选中并烘焙进了某个检索槽**，但模型读不出。同一内容走原生全量能答 ⇒ 差别只在"烘焙进槽"与"原样在窗内"。
+
+- **嫌疑 1（读码所得，未测）＝组覆盖不全**：`_emit_stage_request` 只取 `tables[group_ids[0]]`（**组 6**）的块表行作为 55 个槽块，而 16 个 full_attention 层被 G=8 分在**组 6 与组 7 两个组**里、同一请求在两组用的是**不同物理块** ⇒ 若如此，**组 7 的 8 层从未被烘焙**，检索区一半层仍是占位段 KV。`baked ... 16 layer(s)` 那行是**层迭代计数**，不证明两组物理块都被覆盖。
+- **嫌疑 2＝写了但落点不对**：缺"烘焙后读回"校验（目标块 dequant 回来与重建字节比对 + 按组打印 `(group, block_id)` 覆盖集合）。离线单测只证"槽位位置的字节 == 引擎 writer 在该位置写的页"，**没证"引擎真的把那块当作该请求在该位置的 KV 来读"**。
+- **074 做法**：先加读回与逐组覆盖观测（一次 boot 即可判定嫌疑 1），再按结论最小修复；判据不变 = **窗外 needle 命中 + 输出连贯 + 装配链不回归 + 双 boot**。
+
+### 12.15.4 本步的边界（勿误读）
+
+- 本步**没有**改任何机制：改动 = 只读观测（`VLLM_KVMEM_DEBUG` 默认关）+ 工具。072 的代码路径一字未动。
+- "EOS 不是机制故障" **不等于**"视窗已经能用"：窗外 needle 仍答不出，**阶段 1 正确性出口仍未达成**。
+- EOS 属**采样边界**（im_end 与 换行/空格 差 0.3-0.5 nat），换 nonce/换问题就翻转 ⇒ **不要用"某次有没有输出"判机制好坏**，要用分支指纹 + debug 的 outputs/status。
+- **证据管理纪律**：worker 的 `kvmem_retrieval_%03d` **每 boot 从 001 重号**，同一 dump 目录会被后一 boot 覆盖 ⇒ **每个 boot 一个新 dump 目录**（本轮 `kvmem_k8a/b/c`，boot1-3 已存 `kvmem_k8a_boot3keep/`）。
+- **工具可用性**：committed 的 `tools/kvmem_viewport_probe.py` 曾引用未定义的 `args.serve_ignore_eos` ⇒ **serve 步骤必崩**（072 实测用的不是这份文件）；本步补齐并加 `--stages serve`（只重发视窗请求，省一次 8 分钟 ingest+flush）与 `--question-style`。
 
 ---
 
