@@ -117,6 +117,17 @@ class KVMemWorkspaceWorker:
         self._retrieval_reports: list[dict] = []
         self._score_seconds = 0.0
 
+        # Step 072: stage-in (bake the scored pages into the retrieval slots)
+        # and the finish sweep's completion bookkeeping.
+        self.stage_ins_served = 0
+        self.stage_in_pages = 0
+        self.stage_in_seconds = 0.0
+        # store job id -> the finished request whose sweep it carries
+        self._sweep_req_by_job: dict[int, str] = {}
+        # sweep requests whose copies have landed: reported through
+        # get_finished()'s finished-sending set, which releases their blocks.
+        self._finished_sweeps: set[str] = set()
+
         # K3 second half (step 064): the pre-RoPE rotary prefix kept as the
         # rematerialisation authority. trajectory -> layer -> fp16
         # (authority_tokens, num_kv_heads * rotary_dim).
@@ -798,6 +809,13 @@ class KVMemWorkspaceWorker:
         workspace itself uses, so a prefix-cache hit (a step whose positions do
         not start where the previous one ended) needs no special case: the rows
         that fall inside a span are exactly that span's.
+
+        A *viewport* span (step 072) is excluded: a rewritten window request
+        re-uses the trajectory's leading positions for tokens the window put
+        there (sink, placeholder section) and displaces the recent tail, so
+        its rows are not the trajectory's rows at those positions -- they must
+        not reach the index or the authority. Only the query tail is kept, for
+        scoring.
         """
         step = capture.drain()
         if not step:
@@ -815,15 +833,6 @@ class KVMemWorkspaceWorker:
             if not mask.any():
                 continue
             span_positions = positions[mask]
-            k_by_layer = {layer: k[mask] for layer, (_, _, k) in step.items()}
-            self._index.add(span.trajectory, span_positions, k_by_layer)
-            if config.authority_enabled():
-                self._authority_store(span.trajectory, span_positions, k_by_layer)
-            # The query span is the tail of the step, and the last prefill step
-            # is the one that holds the tail of the prompt, so overwriting here
-            # leaves exactly the right query behind. Rows are ordered, so the
-            # last `width` of the masked positions line up with the last
-            # `width` rows of q.
             q_by_layer = {
                 layer: q for layer, (_, q, _) in step.items() if q.size
             }
@@ -834,11 +843,20 @@ class KVMemWorkspaceWorker:
                         span_positions[-width:],
                         {layer: q[-width:] for layer, q in q_by_layer.items()},
                     )
+            if span.viewport:
+                continue
+            k_by_layer = {layer: k[mask] for layer, (_, _, k) in step.items()}
+            self._index.add(span.trajectory, span_positions, k_by_layer)
+            if config.authority_enabled():
+                self._authority_store(span.trajectory, span_positions, k_by_layer)
 
     def _score(self, metadata: KVMemConnectorMetadata) -> None:
         if self._index is None:
             return
         started = time.monotonic()
+        stage_by_req = {
+            stage.request_id: stage for stage in metadata.stage_requests
+        }
         for request in metadata.score_requests:
             entry = self._last_query.get(request.trajectory)
             if entry is None:
@@ -883,7 +901,128 @@ class KVMemWorkspaceWorker:
                 report["topn"],
                 report["top_pages"],
             )
+            stage = stage_by_req.get(request.request_id)
+            if stage is not None:
+                self._stage_in(stage, report)
         self._score_seconds += time.monotonic() - started
+
+    def _stage_in(self, stage, report: dict) -> None:
+        """Bake the scored pages into the request's retrieval slots (step 072).
+
+        For each slot, in time order, the stored page's bytes are copied to a
+        host rebuild buffer (V and the non-rotary K prefix are
+        position-independent and keep their bytes), and the rotary prefix is
+        rebuilt *at the slot's window position* from the raw-K authority -- one
+        rebuild, from the pre-RoPE rows, never from a previously rotated copy
+        (design §5.3; the precision contract is the step 065 one: bf16 restore,
+        fp32 cos/sin).
+
+        The copies are issued on the current stream and the method returns only
+        after issuing all of them; the decode step that follows observes the
+        baked slots because it runs on the same stream. Runs synchronously
+        inside ``wait_for_save``, so there is no race with the first decode.
+        """
+        if not stage.blocks:
+            return
+        top_pages = report.get("top_pages") or []
+        if not top_pages:
+            logger.warning(
+                "vllm-030win KVMem viewport (req=%s): scoring produced no "
+                "pages; every retrieval slot stays placeholder",
+                stage.request_id,
+            )
+            return
+        # Slots fill in time order (design §5.3: the model sees a time-ordered
+        # window); the highest-scoring pages win the earliest slots.
+        selected = sorted(top_pages)[: len(stage.blocks)]
+        started = time.monotonic()
+        try:
+            rotary = self._rotary_embedding()
+        except Exception as exc:  # noqa: BLE001 - report, never break the run
+            logger.error(
+                "vllm-030win KVMem viewport (req=%s): could not obtain the "
+                "model's rotary embedding (%r); retrieval slots stay placeholder",
+                stage.request_id,
+                exc,
+            )
+            return
+        missing_rows = 0
+        missing_pages = 0
+        baked_pages = 0
+        # The full fp32 cache goes to the bake; it indexes the slot rows
+        # itself (an already-indexed slice would be indexed a second time).
+        cos_sin_cache_cpu = rotary.cos_sin_cache.to(device="cpu")
+        for slot_j, (group_id, gpu_block_id) in enumerate(stage.blocks):
+            if slot_j >= len(selected):
+                break
+            page_index = selected[slot_j]
+            slot = stage.pages.get(page_index)
+            if slot is None:
+                missing_pages += 1
+                continue
+            geom = self._geometry.get(group_id)
+            block = self._block_size.get(group_id)
+            if geom is None or not block:
+                continue
+            src_positions = np.arange(
+                page_index * stage.page_size,
+                page_index * stage.page_size + block,
+                dtype=np.int64,
+            )
+            slot_start = stage.slot_start + slot_j * stage.page_size
+            dst_positions = torch.arange(
+                slot_start, slot_start + block, dtype=torch.long
+            )
+            tokens = torch.arange(block, dtype=torch.long)
+            for layer_name in self._layers_per_group.get(group_id, ()):
+                rows = self._authority_rows(stage.trajectory, layer_name, src_positions)
+                if rows is None:
+                    missing_rows += 1
+                    continue
+                stored = self._host[(group_id, layer_name)][slot]
+                rebuilt = stored.view(torch.uint8).clone()
+                # Step 065 precision contract: the authority is fp16 (exact for
+                # bf16 values) and the engine rotates bf16 K against fp32
+                # cos/sin -- restore both before the bake.
+                raw = torch.from_numpy(
+                    np.ascontiguousarray(rows).reshape(
+                        block, geom.num_heads, geom.rotary_dim
+                    )
+                ).to(torch.bfloat16)
+                remat.rematerialize_page(
+                    rebuilt,
+                    geom,
+                    raw,
+                    tokens,
+                    dst_positions,
+                    cos_sin_cache_cpu,
+                    is_neox_style=bool(rotary.is_neox_style),
+                    mrope_section=getattr(rotary, "mrope_section", None),
+                )
+                dst = self._gpu_views[(group_id, layer_name)][gpu_block_id]
+                dst.copy_(rebuilt.view(torch.int8))
+            baked_pages += 1
+        self.stage_in_seconds += time.monotonic() - started
+        self.stage_ins_served += 1
+        self.stage_in_pages += baked_pages
+        logger.info(
+            "vllm-030win KVMem viewport (req=%s): baked %d page(s) into the "
+            "retrieval slots in %.2f s (%d slot(s) offered, %d without a "
+            "stored page, %d layer-row(s) without authority rows); %.1f MiB "
+            "written",
+            stage.request_id,
+            baked_pages,
+            self.stage_in_seconds,
+            len(stage.blocks),
+            missing_pages,
+            missing_rows,
+            baked_pages
+            * sum(
+                self.page_bytes.get(g, 0) * len(self._layers_per_group.get(g, ()))
+                for g, _ in stage.blocks
+            )
+            / (1024 * 1024),
+        )
 
     def _write_report(self, report: dict) -> None:
         directory = config.dump_dir()
@@ -945,6 +1084,10 @@ class KVMemWorkspaceWorker:
                     self._run_selftest(job)
                 if config.authority_enabled() and config.roundtrip_selftest():
                     self._run_remat_selftest(job)
+                if job.sweep_req_id:
+                    # The sweep's blocks stay alive until the request id comes
+                    # back through finished-sending; remember who to report.
+                    self._sweep_req_by_job[job.job_id] = job.sweep_req_id
                 event = torch.cuda.Event()
                 event.record()
                 self._events[job.job_id] = event
@@ -1187,6 +1330,9 @@ class KVMemWorkspaceWorker:
             if event.query():
                 del self._events[job_id]
                 self._completed.append(job_id)
+                sweep_req = self._sweep_req_by_job.pop(job_id, None)
+                if sweep_req is not None:
+                    self._finished_sweeps.add(sweep_req)
         # Step 066: a request whose assembly copy has fired is reported as
         # finished *recving*, which is what promotes it out of
         # WAITING_FOR_REMOTE_KVS. The set is kept until
@@ -1201,7 +1347,11 @@ class KVMemWorkspaceWorker:
             if event.query():
                 del self._snapshot_events[key]
                 self._completed_snapshots.append(key)
-        return set(), set(self._finished_loads)
+        # The first return value is finished-*sending* (the mixin unpacks it
+        # that way): a swept request's id there releases its blocks.
+        finished_sweeps = set(self._finished_sweeps)
+        self._finished_sweeps.clear()
+        return finished_sweeps, set(self._finished_loads)
 
     def build_connector_worker_meta(self) -> KVMemWorkerMetadata | None:
         if not (

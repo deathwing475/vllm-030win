@@ -283,6 +283,64 @@ def recent_tokens() -> int:
     return _env_int("VLLM_KVMEM_RECENT", DEFAULT_RECENT_TOKENS)
 
 
+def viewport_enabled() -> bool:
+    """Rewrite a long request onto the fixed-slot compressed window (step 072).
+
+    This is the design §5.1 *re-bake* route, and it is single-coordinate: the
+    request's prefill token sequence *is* the compressed window
+    (``prompt[:S+N] + prompt[L-R:]``), so positions/slot_mapping/block table all
+    stay in engine-native window coordinates. No frame translation, no
+    scheduler jump, no mamba snapshot restore -- the window's own prefill runs
+    the GDN recurrence over real history tokens, and the only post-processing
+    is baking the scored pages into the retrieval slots from the raw-K
+    authority.
+
+    Requires ``VLLM_KVMEM_RAWK`` (the capture) and ``VLLM_KVMEM_AUTHORITY``
+    (the pre-RoPE rotary prefix) -- without them the slots have nothing to
+    rebuild from. Independent of ``VLLM_KVMEM_LOAD`` (the step 066 in-place
+    assembly): the two routes never mix inside one request.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_VIEWPORT", "0")))
+
+
+def viewport_recent_tokens() -> int:
+    """Tail length R of the compressed window (design §7.1: [16K, 64K]).
+
+    The window is ``S + N + R`` tokens: one sink page, N retrieval pages, then
+    the prompt's last R tokens. R is what keeps the question (and the nearest
+    context) verbatim; the mid-section it displaces is what retrieval has to
+    re-represent.
+    """
+    return _env_int("VLLM_KVMEM_VIEWPORT_RECENT", 16384)
+
+
+def viewport_retrieval_pages() -> int:
+    """Number N of retrieval slots, in whole pages (design §5.1: time-ordered).
+
+    55 pages x 1424 = 78,320 tokens of retrieval budget: with S=1456 and
+    R=16384 the window is 96,160 tokens, which alongside a 32,768 generation
+    reserve fits the 163,072 pool with room to spare. Every slot is rewritten
+    from the authority on every scored request, so N is also the per-request
+    bake volume.
+    """
+    return _env_int("VLLM_KVMEM_VIEWPORT_PAGES", 55)
+
+
+def sweep_enabled() -> bool:
+    """Store the pages a finished request still holds (step 072).
+
+    K1 copies pages the sliding window *evicted*, so a 200K ingest ends with
+    only the ~25 out-of-window pages stored; the ~114 in-window pages (the
+    mid-section the retrieval slots need V/non-rotary bytes from) are freed
+    with the request. The sweep stores those remaining pages at
+    ``request_finished`` -- the blocks are kept alive until the copies land
+    (the connector claims them, and the scheduler frees them once the request
+    id comes back through ``get_finished``), which is the same
+    copy-before-free discipline as K1.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_SWEEP", "0")))
+
+
 SCORE_MODES = ("dot", "cosine")
 
 

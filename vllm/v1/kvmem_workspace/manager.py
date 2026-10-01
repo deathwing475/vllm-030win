@@ -29,6 +29,7 @@ from vllm.v1.kvmem_workspace.metadata import (
     KVMemPageTransfer,
     KVMemScoreRequest,
     KVMemSnapshotRequest,
+    KVMemStageInRequest,
     KVMemStepSpan,
     KVMemStoreJob,
 )
@@ -108,6 +109,46 @@ class KVMemWorkspaceScheduler:
         # only valid if the recurrent state at its boundary is restored too, so
         # the worker snapshots those slots at page-aligned boundaries.
         self.load_enabled = config.load_enabled() and bool(self.group_ids)
+        # Step 072: the fixed-slot compressed window (design §5.1 re-bake).
+        self.viewport_enabled = (
+            config.viewport_enabled()
+            and config.rawk_enabled()
+            and config.authority_enabled()
+            and bool(self.group_ids)
+        )
+        self.viewport_recent_tokens = config.viewport_recent_tokens()
+        self.viewport_retrieval_pages = config.viewport_retrieval_pages()
+        # The window plus the request's own generation must fit the sliding
+        # window the pool was sized for: the rewritten request is an ordinary
+        # request as far as the engine is concerned, and it must never need
+        # eviction (its pages are not the trajectory's pages at those
+        # positions).
+        self.max_window_tokens = min(
+            (
+                self.kv_cache_config.kv_cache_groups[g].kv_cache_spec.sliding_window
+                for g in self.group_ids
+            ),
+            default=0,
+        )
+        self.sweep_enabled = config.sweep_enabled() and bool(self.group_ids)
+        # request_id -> window plan for a rewritten request: the layout is
+        # fixed before the request first runs (design §5.1's core invariant --
+        # the query position never depends on which pages get selected).
+        self._req_viewport: dict[str, dict] = {}
+        # request_id -> the request's full KVCacheBlocks, so the stage-in can
+        # name the retrieval slots' physical blocks.
+        self._req_blocks: dict[str, object] = {}
+        self.viewports_rewritten = 0
+        self.viewports_declined = 0
+        self.stage_ins_emitted = 0
+        self.sweep_requests = 0
+        self.sweep_pages_stored = 0
+        self.sweep_pages_dropped = 0
+        # Finish-sweep jobs waiting for the next build_connector_meta: the
+        # request_finished hook runs after that step's meta was already built,
+        # and the blocks it claims are only freed once the copies have landed.
+        self._pending_sweep_jobs: list[KVMemStoreJob] = []
+        self._sweep_jobs: dict[int, str] = {}
         self.snapshot_every_pages = config.snapshot_every_pages()
         self.mamba_group_ids = [
             group_id
@@ -212,7 +253,17 @@ class KVMemWorkspaceScheduler:
         return hashlib.blake2b(tokens.tobytes(), digest_size=16).digest()
 
     def update_state_after_alloc(self, request, blocks, num_external_tokens) -> None:
-        if request.request_id in self._req_trajectory:
+        if request.request_id in self._req_viewport:
+            # A rewritten (window) request: refresh the block reference on
+            # every admission -- the stage-in names its retrieval slots
+            # through it -- and fall through to the common bookkeeping, whose
+            # trajectory key is unchanged (the rewrite keeps the leading
+            # tokens) and whose prompt length is the window length the score
+            # trigger needs.
+            self._req_blocks[request.request_id] = blocks
+            if request.request_id in self._req_trajectory:
+                return
+        elif request.request_id in self._req_trajectory:
             # A repeated call for an in-flight request (preemption replay):
             # only the assembly plan needs refreshing, and only for a fresh
             # external allocation.
@@ -293,9 +344,13 @@ class KVMemWorkspaceScheduler:
             if trajectory is None or request is None or num_tokens <= 0:
                 continue
             start = request.num_computed_tokens
+            plan = self._req_viewport.get(req_id)
             meta.spans.append(
                 KVMemStepSpan(
-                    trajectory=trajectory, start=start, num_tokens=num_tokens
+                    trajectory=trajectory,
+                    start=start,
+                    num_tokens=num_tokens,
+                    viewport=plan is not None,
                 )
             )
             # The step that completes the prompt is the one where retrieval
@@ -310,17 +365,94 @@ class KVMemWorkspaceScheduler:
                 and start + num_tokens >= prompt_len
             ):
                 self._req_scored.add(req_id)
-                meta.score_requests.append(
-                    KVMemScoreRequest(
-                        trajectory=trajectory,
-                        request_id=req_id,
-                        num_tokens=prompt_len,
-                        block_size=block_size,
-                        sink_tokens=block_size,
-                        recent_tokens=self.recent_tokens,
+                if plan is not None:
+                    # A window request scores against its *original* prompt
+                    # length: the stored pages are keyed by the original
+                    # trajectory's page indices, so the eligible range
+                    # (everything strictly between the original sink and the
+                    # original recent tail) is what retrieval may pick from.
+                    meta.score_requests.append(
+                        KVMemScoreRequest(
+                            trajectory=trajectory,
+                            request_id=req_id,
+                            num_tokens=plan["orig_len"],
+                            block_size=block_size,
+                            sink_tokens=plan["sink"],
+                            recent_tokens=plan["recent"],
+                        )
                     )
-                )
+                    self._emit_stage_request(meta, req_id, plan)
+                else:
+                    meta.score_requests.append(
+                        KVMemScoreRequest(
+                            trajectory=trajectory,
+                            request_id=req_id,
+                            num_tokens=prompt_len,
+                            block_size=block_size,
+                            sink_tokens=block_size,
+                            recent_tokens=self.recent_tokens,
+                        )
+                    )
                 self.scores_emitted += 1
+
+    def _emit_stage_request(
+        self, meta: KVMemConnectorMetadata, req_id: str, plan: dict
+    ) -> None:
+        """Hand the worker everything the bake needs except the page choice.
+
+        The scoring report picks the pages; this carries the fixed side: the
+        retrieval slots' physical blocks (rows S//block_size .. of the request's
+        block table), the slot start, and the trajectory's page table so the
+        worker can find the V / non-rotary bytes of whichever pages won.
+        """
+        blocks = self._req_blocks.get(req_id)
+        if blocks is None:
+            logger.error(
+                "vllm-030win KVMem viewport (req=%s): no block table captured; "
+                "the retrieval slots cannot be baked",
+                req_id,
+            )
+            return
+        group_id = self.group_ids[0]
+        block_size = self.block_size[group_id]
+        group_blocks = getattr(blocks, "blocks", {}).get(group_id, ())
+        first_row = plan["sink"] // block_size
+        num_rows = self.viewport_retrieval_pages
+        slot_blocks: list[tuple[int, int]] = []
+        for j in range(num_rows):
+            row = first_row + j
+            if row >= len(group_blocks) or group_blocks[row].is_null:
+                logger.error(
+                    "vllm-030win KVMem viewport (req=%s): retrieval slot row "
+                    "%d (logical page %d) has no real block; slots beyond it "
+                    "stay placeholder",
+                    req_id,
+                    row,
+                    row,
+                )
+                break
+            slot_blocks.append((group_id, group_blocks[row].block_id))
+        if not slot_blocks:
+            return
+        trajectory = plan["trajectory"]
+        page_table = {
+            # Keyed by page index; the token offset form of the table is
+            # (trajectory, offset) with offset = page_index * block_size.
+            offset // block_size: slot
+            for (traj, offset), slot in self._page_table.items()
+            if traj == trajectory
+        }
+        meta.stage_requests.append(
+            KVMemStageInRequest(
+                trajectory=trajectory,
+                request_id=req_id,
+                blocks=slot_blocks,
+                slot_start=plan["sink"],
+                page_size=block_size,
+                pages=page_table,
+            )
+        )
+        self.stage_ins_emitted += 1
 
     @staticmethod
     def _page_token_hash(token_ids, start: int, size: int) -> bytes:
@@ -430,6 +562,9 @@ class KVMemWorkspaceScheduler:
         self._emit_spans(meta, scheduler_output)
         self._emit_snapshots(meta, scheduler_output)
         self._emit_load_jobs(meta)
+        if self._pending_sweep_jobs:
+            meta.store_jobs.extend(self._pending_sweep_jobs)
+            self._pending_sweep_jobs.clear()
         block_state = getattr(scheduler_output, "kv_connector_block_state", None)
         evictions = block_state.workspace_evictions if block_state else None
         if evictions:
@@ -545,6 +680,18 @@ class KVMemWorkspaceScheduler:
                 # Exactly one free per retained page: their ref count was never
                 # decremented when the window evicted them.
                 self.block_pool.free_blocks(status.retained)
+            sweep_req = self._sweep_jobs.pop(job_id, None)
+            if sweep_req is not None:
+                # The blocks themselves are freed by the scheduler: the sweep
+                # claimed them in request_finished and the request id came
+                # back through get_finished()'s finished-sending set.
+                logger.info(
+                    "vllm-030win KVMem sweep: job %d of request %s landed; "
+                    "its blocks now return to the pool",
+                    job_id,
+                    sweep_req,
+                )
+                continue
             logger.info(
                 "vllm-030win KVMem workspace: job %d stored %d entry(ies) of "
                 "trajectory %s, released %d block(s); cumulative evicted=%d "
@@ -753,6 +900,20 @@ class KVMemWorkspaceScheduler:
         return boundary
 
     def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        # Step 072: the compressed-window route. Only the first scheduling
+        # look at a request reaches this with the *original* prompt; the
+        # rewrite below changes the prompt and defers the request one step, so
+        # the scheduler re-runs its prefix lookup on the rewritten sequence.
+        if request.request_id in self._req_viewport:
+            return 0, False
+        if self.viewport_enabled and self._viewport_rewrite(
+            request, num_computed_tokens
+        ):
+            # Returning None parks the request back on the waiting queue for
+            # this step (scheduler.py: the request "cannot be scheduled
+            # because the KVConnector couldn't determine the number of matched
+            # tokens"); the next pass sees the rewritten prompt.
+            return None, False
         if not self.load_enabled:
             # Stage 1 K1 stores pages only; retrieval/rematerialisation is K3.
             return 0, False
@@ -768,13 +929,128 @@ class KVMemWorkspaceScheduler:
         )
         return boundary, True
 
+    # ------------------------------------------------------------------
+    # step 072: the fixed-slot compressed window
+    # ------------------------------------------------------------------
+
+    def _viewport_layout(self, prompt_len: int) -> tuple[int, int, int, int] | None:
+        """(S, N tokens, R, B) for a prompt of this length, or None.
+
+        S is one page (the sink), N is the fixed retrieval budget, R the
+        recent tail. The layout is a pure function of the configuration and
+        the prompt length -- never of what retrieval later selects, which is
+        what keeps every window position independent of the scoring (design
+        §5.1's key invariant).
+        """
+        block_size = self.block_size[self.group_ids[0]]
+        sink = block_size
+        retrieval = self.viewport_retrieval_pages * block_size
+        recent = self.viewport_recent_tokens
+        window = sink + retrieval + recent
+        if prompt_len <= window:
+            # No mid-section to re-represent: the window would be a pure
+            # truncation, and identity (native prefill) is both simpler and
+            # exactly correct.
+            return None
+        return sink, retrieval, recent, window
+
+    def _trajectory_page_count(self, trajectory: bytes) -> int:
+        return sum(1 for traj, _ in self._page_table if traj == trajectory)
+
+    def _viewport_rewrite(self, request, num_computed_tokens: int) -> bool:
+        """Rewrite the request's prompt onto the compressed window, or not.
+
+        The rewrite is the whole trick: the window's prefill token sequence is
+
+            prompt[:S+N] + prompt[L-R:]
+
+        i.e. the head (sink + the placeholder section that the retrieval slots
+        will overwrite) followed by the prompt's own tail. Three properties
+        fall out of that shape:
+
+        * the sink and placeholder sections keep their *original* positions,
+          so their prefilled KV is correct as-is and a native prefix-cache hit
+          inside them is genuinely theirs;
+        * the recent tail is prefilled at window positions, which is what the
+          attention needs -- no re-bake;
+        * the GDN recurrence runs over real history tokens (head + tail), so
+          no recurrent state needs restoring (hard constraint §3.2 is bypassed,
+          exactly as §5.1 promised).
+
+        Only the retrieval slots need baking afterwards.
+
+        Guard on the local prefix hit: a hit beyond the sink section means the
+        first request's blocks are still alive, i.e. the native prefix cache is
+        already rescuing the prompt and the window has nothing to add -- and a
+        hit reaching into the recent tail would adopt original-position blocks
+        that the window must not use. Both are declined: the request runs
+        natively. When the hit is within the sink, the block-hash chain breaks
+        right after it (the rewritten tail cannot hash to the original blocks),
+        so an adopted block can never reach the retrieval slots or the recent
+        tail.
+        """
+        if num_computed_tokens > self.block_size[self.group_ids[0]]:
+            self.viewports_declined += 1
+            return False
+        token_ids = getattr(request, "prompt_token_ids", None)
+        if not token_ids:
+            self.viewports_declined += 1
+            return False
+        prompt_len = len(token_ids)
+        layout = self._viewport_layout(prompt_len)
+        if layout is None:
+            self.viewports_declined += 1
+            return False
+        trajectory = self.trajectory_key(token_ids, self.trajectory_prefix_tokens)
+        if self._trajectory_page_count(trajectory) == 0:
+            # Nothing stored for this trajectory: the slots would stay
+            # placeholders, which is a pure truncation of the prompt.
+            self.viewports_declined += 1
+            return False
+        sink, retrieval, recent, window = layout
+        new_len = sink + retrieval + recent
+        if new_len + request.max_tokens > self.max_window_tokens:
+            self.viewports_declined += 1
+            return False
+        # The rewrite keeps the leading 512 tokens verbatim, so the trajectory
+        # key computed by update_state_after_alloc stays the same key.
+        token_ids[:] = token_ids[:sink + retrieval] + token_ids[prompt_len - recent:]
+        request._all_token_ids[:] = token_ids
+        request.num_prompt_tokens = len(token_ids)
+        self._req_viewport[request.request_id] = {
+            "trajectory": trajectory,
+            "sink": sink,
+            "retrieval": retrieval,
+            "recent": recent,
+            "window": new_len,
+            "orig_len": prompt_len,
+        }
+        self.viewports_rewritten += 1
+        logger.info(
+            "vllm-030win KVMem viewport: request %s rewritten onto the "
+            "compressed window: %d -> %d token(s) (sink %d + %d retrieval "
+            "page(s) + recent %d; orig prompt %d, stored page(s) %d); "
+            "deferring one scheduling pass",
+            request.request_id,
+            prompt_len,
+            len(token_ids),
+            sink,
+            self.viewport_retrieval_pages,
+            recent,
+            prompt_len,
+            self._trajectory_page_count(trajectory),
+        )
+        return True
+
     def request_finished(self, request, block_ids):
-        del block_ids
+        claimed = self._emit_finish_sweep(request, block_ids)
         self._req_trajectory.pop(request.request_id, None)
         self._req_object.pop(request.request_id, None)
         self._req_prompt_len.pop(request.request_id, None)
         self._req_scored.discard(request.request_id)
         self._pending_loads.pop(request.request_id, None)
+        self._req_viewport.pop(request.request_id, None)
+        self._req_blocks.pop(request.request_id, None)
         base = self._req_baseline.pop(request.request_id, None)
         if base is None:
             base = (0, 0, 0)
@@ -804,7 +1080,106 @@ class KVMemWorkspaceScheduler:
             self.num_slots,
             len(self._jobs),
         )
-        return False, None
+        return claimed, None
+
+    def _emit_finish_sweep(self, request, block_ids) -> bool:
+        """Store the pages a finished request still holds (step 072).
+
+        K1 only ever sees pages the sliding window evicted; everything the
+        request holds at completion -- the whole mid-section of a long ingest
+        prompt, which is exactly where retrieval-slot content comes from --
+        would be freed back to the pool unstored. This sweeps those remaining
+        pages into the workspace with the same copy-before-free discipline:
+        the job owns the blocks (a sweep job is registered in ``_jobs`` like
+        any other) and the request is reported as finished *sending* only once
+        the copies have landed, which is when the scheduler finally frees the
+        blocks. Returns True when blocks were claimed.
+        """
+        if not (self.sweep_enabled and block_ids):
+            return False
+        if request.request_id in self._req_viewport:
+            # A window request's pages are NOT the trajectory's pages at those
+            # offsets (the recent tail is baked at window positions), so they
+            # must never enter the store. It has no evictions either -- the
+            # window fits inside W by construction.
+            return False
+        if not isinstance(block_ids, tuple):
+            # The per-group form (HMA path) is what carries every sliding
+            # window group; a flat list would be a single group's ids.
+            block_ids = (block_ids,)
+        trajectory = self._req_trajectory.get(request.request_id)
+        if trajectory is None:
+            return False
+        token_ids = getattr(request, "all_token_ids", None) or ()
+        if not token_ids:
+            return False
+        block_size = self.block_size[self.group_ids[0]]
+        prompt_len = self._req_prompt_len.get(request.request_id) or len(token_ids)
+        pages: list[KVMemPageTransfer] = []
+        claimed_any = False
+        for group_id in self.group_ids:
+            if group_id >= len(block_ids):
+                continue
+            for page_index, block_id in enumerate(block_ids[group_id]):
+                offset = page_index * block_size
+                if offset >= prompt_len:
+                    # A block whose tokens are all generation-tail padding:
+                    # never part of the trajectory's prompt content.
+                    continue
+                if (trajectory, offset) in self._page_table:
+                    continue
+                slot = self._allocate_slot(group_id, trajectory, offset)
+                if slot is None:
+                    self.sweep_pages_dropped += 1
+                    self.pages_dropped += 1
+                    logger.warning(
+                        "vllm-030win KVMem sweep: workspace is full, page %d "
+                        "of trajectory %s (group %d) not stored",
+                        page_index,
+                        trajectory.hex()[:12],
+                        group_id,
+                    )
+                    continue
+                pages.append(
+                    KVMemPageTransfer(
+                        group_id=group_id,
+                        block_id=block_id,
+                        page_index=page_index,
+                        slot=slot,
+                    )
+                )
+                claimed_any = True
+        if not pages:
+            return False
+        job_id = self._next_job_id
+        self._next_job_id += 1
+        self._jobs[job_id] = _JobStatus(
+            job_id=job_id,
+            trajectory=trajectory,
+            retained=[],
+            pages=[(p.group_id, p.page_index) for p in pages],
+        )
+        self._sweep_jobs[job_id] = request.request_id
+        self.sweep_requests += 1
+        self.sweep_pages_stored += len(pages)
+        logger.info(
+            "vllm-030win KVMem sweep: request %s finished with %d unstored "
+            "page(s); storing before the blocks return to the pool "
+            "(cumulative sweep stored=%d dropped=%d)",
+            request.request_id,
+            len(pages),
+            self.sweep_pages_stored,
+            self.sweep_pages_dropped,
+        )
+        self._pending_sweep_jobs.append(
+            KVMemStoreJob(
+                job_id=job_id,
+                trajectory=trajectory,
+                pages=pages,
+                sweep_req_id=request.request_id,
+            )
+        )
+        return claimed_any
 
     def has_pending_stores(self) -> bool:
         return bool(self._jobs)
@@ -820,6 +1195,11 @@ class KVMemWorkspaceScheduler:
             "jobs_in_flight": len(self._jobs),
             "rawk": self.rawk,
             "scores_emitted": self.scores_emitted,
+            "viewports_rewritten": self.viewports_rewritten,
+            "viewports_declined": self.viewports_declined,
+            "stage_ins_emitted": self.stage_ins_emitted,
+            "sweep_requests": self.sweep_requests,
+            "sweep_pages_stored": self.sweep_pages_stored,
         }
 
     def reset(self) -> None:
@@ -835,4 +1215,8 @@ class KVMemWorkspaceScheduler:
         self._snapshot_sent.clear()
         self._page_hashes.clear()
         self._pending_loads.clear()
+        self._req_viewport.clear()
+        self._req_blocks.clear()
+        self._pending_sweep_jobs.clear()
+        self._sweep_jobs.clear()
         self.slots_used = 0

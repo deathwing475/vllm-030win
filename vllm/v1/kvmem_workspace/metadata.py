@@ -39,6 +39,12 @@ class KVMemStoreJob:
     # (group_id, gpu_block_id, page_index); the host destination is the
     # worker's snapshot region, keyed by (trajectory, boundary).
     mamba_snapshots: list[tuple[int, int, int]] = field(default_factory=list)
+    # Step 072 (finish sweep): the finished request whose still-resident pages
+    # this job stores. Its blocks are *not* freed by the scheduler (the
+    # connector claimed them in request_finished); once the copies land the
+    # request id goes back through get_finished()'s finished-sending set,
+    # which is what releases the blocks to the pool.
+    sweep_req_id: str | None = None
 
 
 @dataclass
@@ -115,6 +121,12 @@ class KVMemStepSpan:
     trajectory: bytes
     start: int
     num_tokens: int
+    # Step 072: the span belongs to a compressed-window request. Its captured
+    # K rows are *not* the trajectory's rows at those positions (the window
+    # re-uses original positions for the sink/placeholder sections and displaces
+    # the recent tail), so they must not reach the retrieval index or the
+    # authority -- only the query tail is extracted, for scoring.
+    viewport: bool = False
 
 
 @dataclass
@@ -130,12 +142,37 @@ class KVMemScoreRequest:
 
 
 @dataclass
+class KVMemStageInRequest:
+    """Bake the scored pages into one request's retrieval slots (step 072).
+
+    Emitted together with the request's :class:`KVMemScoreRequest`: the worker
+    scores first, then rebuilds each selected page's rotary prefix *at its slot
+    position* from the raw-K authority and copies the page into the request's
+    retrieval-slot block. ``pages`` maps trajectory page index -> workspace
+    host slot (the manager's page table, so the worker needs no page bookkeeping
+    of its own); a page the table lost is simply not eligible. ``slot_start``
+    is the window position of the first retrieval slot (S of design §5.1).
+    """
+
+    trajectory: bytes
+    request_id: str
+    # (group_id, gpu_block_id) per retrieval slot, in slot order: slot j is
+    # logical block row S // block_size + j of this request's block table.
+    blocks: list[tuple[int, int]] = field(default_factory=list)
+    slot_start: int = 0
+    page_size: int = 0
+    # trajectory page index -> workspace host slot, for V / non-rotary K.
+    pages: dict[int, int] = field(default_factory=dict)
+
+
+@dataclass
 class KVMemConnectorMetadata(KVConnectorMetadata):
     store_jobs: list[KVMemStoreJob] = field(default_factory=list)
     load_jobs: list[KVMemLoadJob] = field(default_factory=list)
     snapshot_requests: list[KVMemSnapshotRequest] = field(default_factory=list)
     spans: list[KVMemStepSpan] = field(default_factory=list)
     score_requests: list[KVMemScoreRequest] = field(default_factory=list)
+    stage_requests: list[KVMemStageInRequest] = field(default_factory=list)
 
 
 @dataclass
