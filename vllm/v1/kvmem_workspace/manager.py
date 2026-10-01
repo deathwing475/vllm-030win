@@ -173,6 +173,7 @@ class KVMemWorkspaceScheduler:
         self.pages_evicted = 0
         self.pages_stored = 0
         self.pages_dropped = 0
+        self.pages_nonstore = 0
         self.slots_used = 0
 
         logger.info(
@@ -767,6 +768,23 @@ class KVMemWorkspaceScheduler:
             for req_id, entries in evictions.items():
                 trajectory = self._req_trajectory.get(req_id)
                 request = self._req_object.get(req_id)
+                if self.group_ids:
+                    # Step 077: with speculation armed the drafter owns its own
+                    # sliding-window group, so its pages scroll out through this
+                    # hook too. They are not workspace pages -- `self.block_size`
+                    # only covers the stored groups, and copying them would burn
+                    # host slots -- so hand each one back to the pool (the core
+                    # manager deliberately left it retained) and keep our groups.
+                    keep: list[tuple[int, int, int]] = []
+                    for group_id, block_id, page_index in entries:
+                        if group_id in self.group_ids:
+                            keep.append((group_id, block_id, page_index))
+                            continue
+                        block = self._retained_by_block_id.pop(block_id, None)
+                        if block is not None and self.block_pool is not None:
+                            self.block_pool.free_blocks([block])
+                        self.pages_nonstore += 1
+                    entries = keep
                 # Step 066: pin each stored page's tokens. An assembled prefix
                 # must be the *same tokens* the assembling request carries; the
                 # trajectory key alone only pins the leading prefix tokens.
@@ -879,7 +897,7 @@ class KVMemWorkspaceScheduler:
             logger.info(
                 "vllm-030win KVMem workspace: job %d stored %d entry(ies) of "
                 "trajectory %s, released %d block(s); cumulative evicted=%d "
-                "stored=%d dropped=%d slots=%d/%d",
+                "stored=%d dropped=%d nonstore=%d slots=%d/%d",
                 job_id,
                 len(status.pages),
                 status.trajectory.hex()[:12] if status.trajectory else "-",
@@ -887,6 +905,7 @@ class KVMemWorkspaceScheduler:
                 self.pages_evicted,
                 self.pages_stored,
                 self.pages_dropped,
+                self.pages_nonstore,
                 self.slots_used,
                 self.num_slots,
             )

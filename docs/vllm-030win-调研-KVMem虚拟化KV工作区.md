@@ -1212,6 +1212,55 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 ---
 
+## 12.19 步骤 077：投机 × KVMem 活锁的**机制**（抓到那一行）+ 解锁后暴露的 draft 组缺陷
+
+> §12.18 只给了"什么组合会死"；本节给根因、修法口径、以及修好准入后立刻撞出的第二个 bug。**逐 boot 数据在《实验步骤文档.md》步骤 077**，本节只留机制与边界。
+
+### 12.19.1 ⭐ 机制：`draft_slots` 从预算里扣走，但 align 裁块的保护条件不看它
+
+四行算术（全部有日志实证，配置 = `mbt = 1456`、页长 1456、DFlash2 N=2）：
+
+| 步 | 代码 | 值 |
+|---|---|---|
+| ① | `scheduler.py:954` `request_token_budget = min(token_budget, input_budget − draft_slots)` | `min(1456, 1456 − 2) = ` **1454** |
+| ② | `speculative.py:1806` DFlash ⇒ `max_num_new_slots_for_drafting = K` | **2** |
+| ③ | `scheduler.py:431-438` 裁块保护 `aligned_end > start or block_size <= max_prefill_tokens`，其中 `max_prefill_tokens = max_num_scheduled_tokens`（**未扣 draft_slots**，日志 `set to 1456`） | `1456 <= 1456` ⇒ **成立** ⇒ `end = 1454 // 1456 × 1456 = ` **0** |
+| ④ | `scheduler.py:1000` `if num_new_tokens == 0: break` | 静默 break，跳出整个 waiting 循环 ⇒ **每步 0 token** |
+
+⇒ **死条件不是"mbt = 页长"，而是"分块 prefill 的 prompt 长过 `mbt − draft_slots`"**：boot4（mbt=1457，预算 1455）里 62-token 短请求正常完成、8,153-token 请求永不准入。076 的候选①（mbt 非 128 倍数）被 boot2（1458 活）+ boot4（1457 死）否掉——1458 同样非 128 倍数；候选③④（SWA 块分配 / `long_prefill_threshold`·`max_in_flight`）由计数器直接排除（`alloc_none` / `lookahead_zero` / `pad_break` / `wait_budget_break` 各 0 次，只有 `mamba_align_zero` 涨了 **162,151** 次）。
+
+**这是上游缺陷**：`_mamba_block_aligned_split` 用"块能否塞进一个 chunk"来决定"允许塞不进去就子块推进"，但它比的是 `max_num_scheduled_tokens`，而准入用的是扣掉 draft slots 之后的预算 ⇒ 任何 `mbt ∈ [页长, 页长 + num_spec)` 的配置都会把首块裁成 0，且**没有任何日志**。本战役按用户 2026-10-02 拍板**只在臂参数上绕**，引擎侧补丁未做。
+
+### 12.19.2 修法口径：**`mbt ≥ 页长 + num_spec`**（不是"钉页长"）
+
+`mbt = 1458`（页 1456 + K 2）⇒ 预算 = 1456 = **正好一页** ⇒ 裁块不触发（`aligned_end == end`），步尾仍精确落页边界：**实测 `capture drain: 16 layer(s), 1456 token(s), 0 single-token call(s) + 0 call(s) outside armed sizes [1456]`** ⇒ §12.12/必守 22① 的 mamba 边界快照口径与 072 的逐页滚动入库**都不破**。无投机的臂 `draft_slots = 0`，"mbt = 页长"仍是对的（074 臂 1424 未动）。
+
+| 配置 | 准入 | 读数 |
+|---|---|---|
+| peel E（mbt=1456 + 投机） | **死** | 0 前向、162,151 次裁零 |
+| 1457 + 投机 | **死**（预测成立） | 同上；同 boot 短请求可跑 |
+| **1458 + 投机（peel 形）** | **活** | boot2 首次 18.03/16.95（该档冷 boot 退化态）→ boot3 **108.73 / 103.45**、needle 3/3 |
+| **1458 + 投机 + 视窗臂** | **活** | boot6 8k **103.67 / 108.10**（075 一次都没测到）；但 ingest **~11 s/页步**（074 = ~1.7 s） |
+
+### 12.19.3 第二个 bug：投机的 draft 组被 §12.5 的 workspace 门误认领
+
+`single_type_kv_cache_manager.py:140` 的 060 判据是「`isinstance(滑窗管理器)`」⇒ 加上投机后**草稿模型自己的滑窗组（组 8，5 层）**也 arm 了 `_retain_for_workspace`；`kv_cache_manager.take_workspace_evictions()` 原样按 `mgr.kv_cache_group_id` 发出组 8，而连接器的存储组只有 `[6, 7]` ⇒ `manager.py:324 self.block_size[group_id]` **`KeyError: 8` 打死 EngineCore**（boot5，ingest 推进到 job 2 时）。修法（`kvmem_workspace/manager.py::build_connector_meta`）：**eviction 循环先按 `self.group_ids` 过滤**，非存储组的块**立刻 `block_pool.free_blocks([block])` 归还池**（060 故意没减它们的引用计数，不还就是**块泄漏**），并新增 `pages_nonstore` 计数进累计日志。boot6 实测 `stored=474 dropped=0 nonstore=134`、零 ERROR。
+
+**潜在第二处（本步未修，只登记）**：`_retained_by_block_id` 只按 `block_id` 索引、不带组号 ⇒ 不同组的同号块可能假命中"我保留的块"。boot5 崩在分配而非假命中，但多组并存（投机 / G=8 分组）时这条是真实风险，修 needle 判据之前应先把它改成 `(group_id, block_id)`。
+
+### 12.19.4 本步的边界（勿误读）
+
+1. **"准入通了" ≠ "判据通了"**：074 的**窗外 needle 判据在带投机的臂上未测**（`rewritten onto the compressed window` / `stage-in plan` / `baked` 各 0 次；唯一检索报告 `recent_tokens=32768` = 原生分支）。两条成因已记死：①探针的 `timeout 1500` 在 11 s/页下砍在 serve 之前（三请求需 ~50 分钟）；②`--stages serve` 复跑时**换了 nonce ⇒ 换了轨迹**，工作区里没有它的页，引擎直接原生 prefill。用 `--stages serve` 必须**沿用同一 boot 同一 `--nonce`**。
+2. **decode 读数只有单 boot**：103.67 / 108.10 是同一 boot 内 2 次重复，落在 boot 间连续谱（83-129）里，**不得**据此宣称"投机把臂拉到了生产级"；与 074 的 69.16 基线比也要注意两者页长不同（1424 vs 1456）。
+3. **ingest 6× 慢未定位**：这是新的头号性能卡点——KVMem 的卖点是"免全量重 prefill"，若入库本身慢 6×，收益会被吃回去。候选：draft 组每步的块分配与 `num_lookahead_tokens=3` 的额外预留、capture allow-list 在 1456 档的图/编译形态、`nonstore` 块的归还节奏与 K1 复制串行。
+4. **`mbt ≥ 页长 + num_spec` 只是绕开**：引擎里那条保护条件仍用错量（见 12.19.1）。任何"把 mbt 往页长上靠"的新臂（含装配臂换页长）都要按这条重算。
+
+### 12.19.5 未验证项（078 的靶子）
+
+①窗外 needle 判据在投机臂上跑通（同 nonce + flush + 指纹确认走视窗）；②ingest 6× 慢的归因与修复；③`_retained_by_block_id` 改组号键；④命中率统计（多深度 × 多 nonce）、`VIEWPORT_PAGES`/`_RECENT` 预算扫描、recent 滚动重烘焙、多轮 ΔP、GPU 化烘焙——**全部仍未做**。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |
