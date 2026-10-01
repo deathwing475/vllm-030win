@@ -294,6 +294,18 @@ def debug_enabled() -> bool:
     return bool(int(os.environ.get("VLLM_KVMEM_DEBUG", "0")))
 
 
+def bake_verify() -> int:
+    """Layer-pages read back after the retrieval-slot bake (step 074).
+
+    The bake log can only prove a copy was *issued*; this proves the bytes landed
+    in the physical block the decode step will read, per stored kv cache group.
+    ``VLLM_KVMEM_BAKE_VERIFY=n`` checks the first ``n`` layers of every slot of
+    every group (0 = off, the default: each check is a blocking device->host copy
+    of one page, so 55 slots x 2 groups x n layers is real time).
+    """
+    return _env_int("VLLM_KVMEM_BAKE_VERIFY", 0)
+
+
 def viewport_enabled() -> bool:
     """Rewrite a long request onto the fixed-slot compressed window (step 072).
 

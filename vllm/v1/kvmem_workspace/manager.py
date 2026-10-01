@@ -401,7 +401,9 @@ class KVMemWorkspaceScheduler:
                             recent_tokens=plan["recent"],
                         )
                     )
-                    self._emit_stage_request(meta, req_id, plan, block_state)
+                    self._emit_stage_request(
+                        meta, req_id, plan, block_state, request
+                    )
                 else:
                     meta.score_requests.append(
                         KVMemScoreRequest(
@@ -416,7 +418,12 @@ class KVMemWorkspaceScheduler:
                 self.scores_emitted += 1
 
     def _emit_stage_request(
-        self, meta: KVMemConnectorMetadata, req_id: str, plan: dict, block_state
+        self,
+        meta: KVMemConnectorMetadata,
+        req_id: str,
+        plan: dict,
+        block_state,
+        request,
     ) -> None:
         """Hand the worker everything the bake needs except the page choice.
 
@@ -438,23 +445,49 @@ class KVMemWorkspaceScheduler:
             return
         group_id = self.group_ids[0]
         block_size = self.block_size[group_id]
-        group_blocks = tables[group_id] if group_id < len(tables) else ()
         first_row = plan["sink"] // block_size
         num_rows = self.viewport_retrieval_pages
-        slot_blocks: list[tuple[int, int]] = []
+        slot_blocks: list[list[tuple[int, int]]] = []
+        # Every stored group owns a physical block for the same logical row; a
+        # slot is only offered once *all* of them are allocated, otherwise the
+        # bake would half-fill it (step 074: reading only group_ids[0] left the
+        # second group's layers on the placeholder prefill).
+        short_by_group: dict[int, int] = {}
         for j in range(num_rows):
             row = first_row + j
-            if row >= len(group_blocks) or not group_blocks[row]:
+            entries: list[tuple[int, int]] = []
+            for gid in self.group_ids:
+                rows = tables[gid] if gid < len(tables) else ()
+                if self.block_size[gid] != block_size:
+                    logger.error(
+                        "vllm-030win KVMem viewport (req=%s): stored group %d "
+                        "has block size %d, group %d has %d; the workspace page "
+                        "table is keyed in one page size, so retrieval slots "
+                        "cannot be baked across these groups",
+                        req_id,
+                        gid,
+                        self.block_size[gid],
+                        group_id,
+                        block_size,
+                    )
+                    return
+                if row >= len(rows) or not rows[row]:
+                    short_by_group[gid] = short_by_group.get(gid, 0) + 1
+                    entries = []
+                    break
+                entries.append((gid, rows[row]))
+            if not entries:
                 logger.error(
                     "vllm-030win KVMem viewport (req=%s): retrieval slot row "
-                    "%d (logical page %d) has no real block; slots beyond it "
-                    "stay placeholder",
+                    "%d (logical page %d) has no real block in group(s) %s; "
+                    "slots beyond it stay placeholder",
                     req_id,
                     row,
                     row,
+                    sorted(short_by_group) or self.group_ids,
                 )
                 break
-            slot_blocks.append((group_id, group_blocks[row]))
+            slot_blocks.append(entries)
         if not slot_blocks:
             return
         trajectory = plan["trajectory"]
@@ -465,21 +498,38 @@ class KVMemWorkspaceScheduler:
             for (traj, offset), slot in self._page_table.items()
             if traj == trajectory
         }
+        # Coverage is what step 073 could not read off the old line: "N slot
+        # block(s)" counted rows, not groups, so a half-covered bake looked
+        # complete. This states slots x groups and the distinct blocks.
+        covered = {gid for entries in slot_blocks for gid, _ in entries}
         logger.info(
-            "vllm-030win KVMem viewport (req=%s): stage-in plan: %d slot "
-            "block(s) from row %d, page table carries %d page(s) of this "
-            "trajectory (%d in store overall)",
+            "vllm-030win KVMem viewport (req=%s): stage-in plan: %d slot(s) x "
+            "%d group(s) = %d block(s), from row %d, stored group(s) %s "
+            "(covered %s), page table carries %d page(s) of this trajectory "
+            "(%d in store overall)",
             req_id,
             len(slot_blocks),
+            len(self.group_ids),
+            sum(len(entries) for entries in slot_blocks),
             first_row,
+            self.group_ids,
+            sorted(covered),
             len(page_table),
             len(self._page_table),
+        )
+        self._debug_window(
+            "stage",
+            request=request,
+            slots=len(slot_blocks),
+            groups=self.group_ids,
+            slot0=slot_blocks[0],
+            slotN=slot_blocks[-1],
         )
         meta.stage_requests.append(
             KVMemStageInRequest(
                 trajectory=trajectory,
                 request_id=req_id,
-                blocks=slot_blocks,
+                slots=slot_blocks,
                 slot_start=plan["sink"],
                 page_size=block_size,
                 pages=page_table,
@@ -1177,6 +1227,12 @@ class KVMemWorkspaceScheduler:
             # Nothing stored for this trajectory: the slots would stay
             # placeholders, which is a pure truncation of the prompt.
             return self._decline_window(request, num_computed_tokens, "no-store")
+        if len({self.block_size[g] for g in self.group_ids}) != 1:
+            # The page table, the slot rows and the bake are all keyed in one
+            # page size; a mixed set would silently half-bake the slots.
+            return self._decline_window(
+                request, num_computed_tokens, "mixed-page-size"
+            )
         sink, retrieval, recent, window = layout
         new_len = sink + retrieval + recent
         if new_len + request.max_tokens > self.max_window_tokens:
@@ -1186,6 +1242,16 @@ class KVMemWorkspaceScheduler:
         token_ids[:] = token_ids[:sink + retrieval] + token_ids[prompt_len - recent:]
         request._all_token_ids[:] = token_ids
         request.num_prompt_tokens = len(token_ids)
+        # The block hashes the engine computed describe the *original* prompt, so
+        # they are stale for everything past the sink page: left in place, a
+        # later prefix match could adopt an original-position block for a window
+        # position holding different tokens (step 073 measured hashes=139 against
+        # a 68-block rewritten prompt). Recompute the chain for the rewritten
+        # sequence; the leading sink blocks hash to the same value either way,
+        # because hashing is chained from token 0 over `all_token_ids`.
+        if getattr(request, "block_hashes", None):
+            request.block_hashes = []
+            request.update_block_hashes()
         self._req_viewport[request.request_id] = {
             "trajectory": trajectory,
             "sink": sink,

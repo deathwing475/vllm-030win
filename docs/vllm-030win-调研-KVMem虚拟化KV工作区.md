@@ -1091,6 +1091,8 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 ### 12.15.3 ⭐剩余卡点与首要嫌疑（未测，074 的靶子）
 
+> **已由 §12.16（步骤 074）结案**：嫌疑 1 成立并修好（改逐槽 × 逐组发射/烘焙），嫌疑 2 由读回校验排除；窗外 needle 双 boot 命中 77349。下面三条保留为当时的推理现场。
+
 针在 token 125,367 = **页 88**，`top_pages` 里排 **3-9**，`selected = sorted(top_pages)[:55]` **含 88** ⇒ **针页确实被选中并烘焙进了某个检索槽**，但模型读不出。同一内容走原生全量能答 ⇒ 差别只在"烘焙进槽"与"原样在窗内"。
 
 - **嫌疑 1（读码所得，未测）＝组覆盖不全**：`_emit_stage_request` 只取 `tables[group_ids[0]]`（**组 6**）的块表行作为 55 个槽块，而 16 个 full_attention 层被 G=8 分在**组 6 与组 7 两个组**里、同一请求在两组用的是**不同物理块** ⇒ 若如此，**组 7 的 8 层从未被烘焙**，检索区一半层仍是占位段 KV。`baked ... 16 layer(s)` 那行是**层迭代计数**，不证明两组物理块都被覆盖。
@@ -1104,6 +1106,47 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 - EOS 属**采样边界**（im_end 与 换行/空格 差 0.3-0.5 nat），换 nonce/换问题就翻转 ⇒ **不要用"某次有没有输出"判机制好坏**，要用分支指纹 + debug 的 outputs/status。
 - **证据管理纪律**：worker 的 `kvmem_retrieval_%03d` **每 boot 从 001 重号**，同一 dump 目录会被后一 boot 覆盖 ⇒ **每个 boot 一个新 dump 目录**（本轮 `kvmem_k8a/b/c`，boot1-3 已存 `kvmem_k8a_boot3keep/`）。
 - **工具可用性**：committed 的 `tools/kvmem_viewport_probe.py` 曾引用未定义的 `args.serve_ignore_eos` ⇒ **serve 步骤必崩**（072 实测用的不是这份文件）；本步补齐并加 `--stages serve`（只重发视窗请求，省一次 8 分钟 ingest+flush）与 `--question-style`。
+
+## 12.16 步骤 074：窗外 needle **判据 GO** —— 根因是"检索槽只烘焙了一个 KV 组"，修法 = 逐槽 × 逐组发射/烘焙 + 读回校验
+
+> **本步把 §12.15.3 的两条嫌疑一次结案**：嫌疑 1（组覆盖不全）**成立并修好**；嫌疑 2（写了但没落地）由读回校验**排除**。设计 §5.1 的固定槽位压缩视窗自此在真机上第一次同时满足"免全量重 prefill"与"窗外内容读得出"。
+
+### 12.16.1 为什么会坏：G=8 把 16 个注意力层切成两个 KV 组，而 stage-in 只认第一个
+
+`VLLM_KV_GROUP_SIZE=8` 下 16 个 full_attention 层分成 **kv cache group 6 与 group 7**（boot 日志：`KVMem workspace stores kv cache group(s) [6, 7] (sliding_window=[163072, 163072], block_size=[1424, 1424])`）。同一个逻辑页号在两组落在**不同物理块**上，因此：
+
+- **入库/装配都是逐组展开的**（`_emit_incremental_stores` 里 `for gid in self.group_ids`、066 的 load 同样），host 侧每组每层都有自己的槽 ⇒ 数据一直是全的；
+- **只有 stage-in 是单组的**：`_emit_stage_request` 取 `tables[group_ids[0]]`，`KVMemStageInRequest.blocks` 是"每槽一条 `(group, block)`"，worker `_stage_in` 按 `self._layers_per_group[group_id]` 迭代 ⇒ **只写组 6 的 8 层**，组 7 的 8 层在检索槽位置保留的是**占位段原生 prefill 的 KV**。
+
+对模型而言针页变成"半重建"：16 层里 8 层读到针、8 层读到占位内容，注意力在检索区拿到互相矛盾的 K/V ⇒ 窗外 needle 答不出。**旧日志看不出这件事**，因为 `baked 55 page(s)` 数的是槽，`16 layer(s) scored` 是打分侧层数；只有把 MiB 摊开才暴露：`55 × 1,640,448 B × 8 层 = 688.4 MiB`（注册日志明写每组 `8 layers, page 1640448 B`），两组应是 1376.8 MiB。
+
+**一般化教训（进必守）**：任何"逐层/逐槽"的 KV 写入，**必须按 KV 组展开并打印覆盖集合**；`VLLM_KV_GROUP_SIZE>1` 时"层数"与"组数"是两个维度，只数其中一个必然漏。
+
+### 12.16.2 修法（仍只落在 `kvmem_workspace/`，engine 零改动）
+
+- **发射**：`KVMemStageInRequest.blocks` → `slots: list[list[(group_id, gpu_block_id)]]`（逐槽、槽内逐组）。任一组在该逻辑行没有真块 ⇒ **整体截断**，绝不发半覆盖槽；日志改为 `55 slot(s) x 2 group(s) = 110 block(s) ... stored group(s) [6, 7] (covered [6, 7])`。
+- **烘焙**：外层按槽、内层按 `(group, block)`、再按 `_layers_per_group[group]` 每层重建（065 精度契约不变：raw K → bf16、cos/sin 保 fp32、单次重建、绝不 delta re-RoPE）；写入字节**实测累加**而不是推算。
+- **读回校验**：新旋钮 `VLLM_KVMEM_BAKE_VERIFY=n`（默认 0），每槽每组读回前 n 层目标物理块与重建字节 `torch.equal`。它证的是离线单证不了的那半件事：**引擎真的把字节放进了 decode 会读的那个物理块**。
+- **守卫**：各存储组 `block_size` 不一致 ⇒ `_decline_window("mixed-page-size")`（页表与烘焙都以单一页长为键，混长会静默半烘焙）。
+- **顺带清账**：`_viewport_rewrite` 原地改 token 序列后清空并重算 `request.block_hashes`（§12.15 记的陈旧 `hashes=139` vs 68 块 ⇒ 本轮 `hashes=67`）。
+- **离线覆盖单测**：`tools/kvmem_stage_coverage_test.py`（CPU，12/12）用**按组索引**的假块表快照钉住发射契约：两组齐块 ⇒ 每槽 2 条且两组物理块互不相交、行序一致；组 7 缺行 ⇒ 槽数截断且无半覆盖槽；混长 ⇒ 不发射；worker 侧结构为逐槽嵌套且旧 `blocks` 字段不存在。
+
+### 12.16.3 实测（`tools/serve_gsq_kvmem_viewport074.cmd` = 073 臂 + `BAKE_VERIFY=1`；dump `kvmem_k9a`/`kvmem_k9b`）
+
+- **覆盖与读回（两次 boot 逐字一致）**：`stage-in plan: 55 slot(s) x 2 group(s) = 110 block(s) ... (covered [6, 7])` → `baked 55 slot(s) x group(s) [6, 7] = 880 layer-page copie(s) ... 1376.7 MiB written, read-back 110 checked 0 mismatch`（6.59-6.64 s；`0 without a stored page`、`0 layer-row(s) without authority rows`）。880 = 55 × 16 层，**MiB 正好 073 的 2×**。
+- **窗外 needle 双 boot 命中**：针 token **125,370**（depth 0.65，`in-window=False`）= 页 88，视窗请求打分排 top-64 第 9。boot1（`vp074a`，`--serve-ignore-eos`、512 token）首 token 即答案 `first_ids=[271, 22, 22]` → 文本以 `\n\n77349` 开头，TTFT 92.477 s；**boot2（`vp074b`，自然采样、64 token）`text="\n\n77349"`、`finish_reason="stop"`、6 chunk、TTFT 92.072 s** ⇒ 命中 + 连贯，不需要越 EOS。
+- **分支指纹自证（§12.15.1 的口径）**：同一 boot 三份 `kvmem_retrieval_*.json` 的 `recent_tokens` = 32768（ingest）/ 32768（flush）/ **16384（serve）** ⇒ 命中确实来自视窗分支。改写读数 `hashes=67`、`adopted external=0 computed=0 rows=1`、`forward68 num=720 end=96128`（68 步 prefill）。
+- **收益**：同一 prompt 原生全量 198,184 token 需 TTFT 224-250 s；压缩视窗 96,128 token **92 s**，窗外针仍答得对。
+- **装配链无回归**（067 带图臂 + `kvmem_assembly_probe.py`，dump 改指 `kvmem_k9c`）：`matches at 34176 tokens (24 stored page(s))` → `issued (48 page(s) + 6 mamba state block(s), boundary 34176)` → `prefix landed; requested=1 completed=1`，TTFT **224.478 s**（067 223.94 / 066 229.76-230.13 ⇒ 带内），needle 命中、**零 ERROR**、`capture drain: 0 single-token call(s)` ⇒ **decode 仍在 FULL 图上**（必守 21 一等判据未破）。
+- **AOT 缓存未破**：两类 boot 都 `Directly load the compiled graph(s) ... 1.488-1.503 s`、`init engine 11.5 s` ⇒ 只改 `kvmem_workspace/` 不改缓存键（062/072 结论第三次复现）。
+
+### 12.16.4 本步的边界（勿误读）
+
+- **"needle 能读出" ≠ "召回稳”**：本步只测了**一个深度（0.65）× 两个 nonce**。针页能否**总**进 `sorted(top)[:55]` 属检索质量问题（§12.8 早期页偏置已判 NO-GO，不可用"关掉缓存"解锁），本步没有改变打分算法，也没有统计命中率。
+- **读回不是全覆盖**：`BAKE_VERIFY=1` 只读回每槽每组 1 层（110/880 次拷贝）。全量读回是 1.4 GB 的阻塞 D2H，只应在专门的取证 boot 上开大。
+- **不代表性能结论**：阶段 1 不含性能判定；视窗 TTFT 92 s 是**同一请求少 prefill 一半以上 token**的直接结果，不是优化出来的吞吐。臂仍**无投机**，与生产 122.58 tok/s 不可直接比较（用户拍板项）。
+- **仍未做**：N/R 预算扫描、recent 段滚动重烘焙、多轮 ΔP、GPU 化烘焙、多轨迹与长稳、`VIEWPORT=0` 的同臂对照。
+- **证据目录**：`kvmem_k9a`（074 boot1）、`kvmem_k9b`（074 boot2）、`kvmem_k9c`（装配回归）。装配臂的默认 dump 已从 `kvmem_k5a` 改指 `kvmem_k9c` —— **k5a 是 066/067 的证据，复跑不得覆盖**。
 
 ---
 

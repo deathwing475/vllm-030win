@@ -146,13 +146,21 @@ class KVMemStageInRequest:
     host slot (the manager's page table, so the worker needs no page bookkeeping
     of its own); a page the table lost is simply not eligible. ``slot_start``
     is the window position of the first retrieval slot (S of design §5.1).
+
+    ``slots`` is one entry per retrieval slot, in slot order: slot j is logical
+    block row ``S // block_size + j`` of this request's block table. Each entry
+    carries that row's physical block **for every stored kv cache group**, as
+    ``(group_id, gpu_block_id)`` pairs (step 074). With ``VLLM_KV_GROUP_SIZE=8``
+    the 16 full-attention layers sit in two groups, and the same logical row has
+    a *different* physical block in each, so a slot is only complete once both
+    groups' blocks are baked -- baking one group leaves half the layers reading
+    the placeholder prefill.
     """
 
     trajectory: bytes
     request_id: str
-    # (group_id, gpu_block_id) per retrieval slot, in slot order: slot j is
-    # logical block row S // block_size + j of this request's block table.
-    blocks: list[tuple[int, int]] = field(default_factory=list)
+    # per retrieval slot: (group_id, gpu_block_id) for each stored group.
+    slots: list[list[tuple[int, int]]] = field(default_factory=list)
     slot_start: int = 0
     page_size: int = 0
     # trajectory page index -> workspace host slot, for V / non-rotary K.

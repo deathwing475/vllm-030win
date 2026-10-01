@@ -142,7 +142,10 @@ set "VLLM_KVMEM_LOAD=1"
 set "VLLM_KVMEM_SNAPSHOT_KEEP=20"
 set "VLLM_KVMEM_SNAPSHOT_EVERY_PAGES=8"
 set "VLLM_KVMEM_SNAPSHOT_TRAJ=2"
-set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k5a"
+rem Dump dir: kvmem_k5a holds the step 066/067 evidence and must not be written
+rem again (the worker's kvmem_retrieval_%03d counter restarts each boot). Step
+rem 074's assembly regression run writes kvmem_k9c.
+set "VLLM_KVMEM_DUMP=G:\qwen3.8model\prod029_logs\kvmem_k9c"
 call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 set "LIB=C:\PROGRA~1\NVIDIA~2\CUDA\v13.3\lib\x64;%LIB%"
 del /q "G:\qwen3.8model\_tmp_prod029\vllm_offload_*.mmap" 2>nul

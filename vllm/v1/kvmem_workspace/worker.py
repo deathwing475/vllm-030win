@@ -915,8 +915,15 @@ class KVMemWorkspaceWorker:
         after issuing all of them; the decode step that follows observes the
         baked slots because it runs on the same stream. Runs synchronously
         inside ``wait_for_save``, so there is no race with the first decode.
+
+        Step 074: each slot carries one physical block *per stored kv cache
+        group*, and every layer of every one of those groups is baked. The 16
+        full-attention layers sit in two groups under ``VLLM_KV_GROUP_SIZE=8``,
+        and a slot whose second group still holds the placeholder prefill reads
+        as half-rebuilt KV to the attention of those 8 layers -- which is what
+        made a baked needle page unreadable.
         """
-        if not stage.blocks:
+        if not stage.slots:
             return
         top_pages = report.get("top_pages") or []
         if not top_pages:
@@ -928,7 +935,7 @@ class KVMemWorkspaceWorker:
             return
         # Slots fill in time order (design §5.3: the model sees a time-ordered
         # window); the highest-scoring pages win the earliest slots.
-        selected = sorted(top_pages)[: len(stage.blocks)]
+        selected = sorted(top_pages)[: len(stage.slots)]
         started = time.monotonic()
         try:
             rotary = self._rotary_embedding()
@@ -942,11 +949,19 @@ class KVMemWorkspaceWorker:
             return
         missing_rows = 0
         missing_pages = 0
-        baked_pages = 0
-        # The full fp32 cache goes to the bake; it indexes the slot rows
-        # itself (an already-indexed slice would be indexed a second time).
+        baked_slots = 0
+        copies = 0
+        bytes_written = 0
+        groups_baked: set[int] = set()
+        # Step 074 read-back: the MiB line only proves the copy was *issued*;
+        # this proves it landed in the physical block the decode step reads.
+        # VLLM_KVMEM_BAKE_VERIFY = layer-pages checked per slot per group
+        # (0 = off; a check is a blocking device->host copy of one page).
+        verify_per_slot = config.bake_verify()
+        verified = 0
+        verify_mismatch = 0
         cos_sin_cache_cpu = rotary.cos_sin_cache.to(device="cpu")
-        for slot_j, (group_id, gpu_block_id) in enumerate(stage.blocks):
+        for slot_j, group_entries in enumerate(stage.slots):
             if slot_j >= len(selected):
                 break
             page_index = selected[slot_j]
@@ -954,66 +969,95 @@ class KVMemWorkspaceWorker:
             if slot is None:
                 missing_pages += 1
                 continue
-            geom = self._geometry.get(group_id)
-            block = self._block_size.get(group_id)
-            if geom is None or not block:
-                continue
-            src_positions = np.arange(
-                page_index * stage.page_size,
-                page_index * stage.page_size + block,
-                dtype=np.int64,
-            )
-            slot_start = stage.slot_start + slot_j * stage.page_size
-            dst_positions = torch.arange(
-                slot_start, slot_start + block, dtype=torch.long
-            )
-            tokens = torch.arange(block, dtype=torch.long)
-            for layer_name in self._layers_per_group.get(group_id, ()):
-                rows = self._authority_rows(stage.trajectory, layer_name, src_positions)
-                if rows is None:
-                    missing_rows += 1
+            slot_copies = 0
+            for group_id, gpu_block_id in group_entries:
+                geom = self._geometry.get(group_id)
+                block = self._block_size.get(group_id)
+                if geom is None or not block:
                     continue
-                stored = self._host[(group_id, layer_name)][slot]
-                rebuilt = stored.view(torch.uint8).clone()
-                # Step 065 precision contract: the authority is fp16 (exact for
-                # bf16 values) and the engine rotates bf16 K against fp32
-                # cos/sin -- restore both before the bake.
-                raw = torch.from_numpy(
-                    np.ascontiguousarray(rows).reshape(
-                        block, geom.num_heads, geom.rotary_dim
-                    )
-                ).to(torch.bfloat16)
-                remat.rematerialize_page(
-                    rebuilt,
-                    geom,
-                    raw,
-                    tokens,
-                    dst_positions,
-                    cos_sin_cache_cpu,
-                    is_neox_style=bool(rotary.is_neox_style),
-                    mrope_section=getattr(rotary, "mrope_section", None),
+                src_positions = np.arange(
+                    page_index * stage.page_size,
+                    page_index * stage.page_size + block,
+                    dtype=np.int64,
                 )
-                dst = self._gpu_views[(group_id, layer_name)][gpu_block_id]
-                dst.copy_(rebuilt.view(torch.int8))
-            baked_pages += 1
+                slot_start = stage.slot_start + slot_j * stage.page_size
+                dst_positions = torch.arange(
+                    slot_start, slot_start + block, dtype=torch.long
+                )
+                tokens = torch.arange(block, dtype=torch.long)
+                checked_this = 0
+                for layer_name in self._layers_per_group.get(group_id, ()):
+                    rows = self._authority_rows(stage.trajectory, layer_name, src_positions)
+                    if rows is None:
+                        missing_rows += 1
+                        continue
+                    stored = self._host[(group_id, layer_name)][slot]
+                    rebuilt = stored.view(torch.uint8).clone()
+                    # Step 065 precision contract: the authority is fp16 (exact for
+                    # bf16 values) and the engine rotates bf16 K against fp32
+                    # cos/sin -- restore both before the bake.
+                    raw = torch.from_numpy(
+                        np.ascontiguousarray(rows).reshape(
+                            block, geom.num_heads, geom.rotary_dim
+                        )
+                    ).to(torch.bfloat16)
+                    remat.rematerialize_page(
+                        rebuilt,
+                        geom,
+                        raw,
+                        tokens,
+                        dst_positions,
+                        cos_sin_cache_cpu,
+                        is_neox_style=bool(rotary.is_neox_style),
+                        mrope_section=getattr(rotary, "mrope_section", None),
+                    )
+                    dst = self._gpu_views[(group_id, layer_name)][gpu_block_id]
+                    dst.copy_(rebuilt.view(torch.int8))
+                    slot_copies += 1
+                    groups_baked.add(group_id)
+                    bytes_written += rebuilt.numel()
+                    if checked_this < verify_per_slot:
+                        checked_this += 1
+                        back = dst.detach().to(device="cpu").view(torch.uint8)
+                        verified += 1
+                        if not torch.equal(back, rebuilt):
+                            verify_mismatch += 1
+                            logger.error(
+                                "vllm-030win KVMem viewport (req=%s): read-back "
+                                "mismatch at slot %d group %d layer %s block %d "
+                                "(page %d): %d/%d byte(s) differ from the bake",
+                                stage.request_id,
+                                slot_j,
+                                group_id,
+                                layer_name,
+                                gpu_block_id,
+                                page_index,
+                                int((back != rebuilt).sum()),
+                                rebuilt.numel(),
+                            )
+            if slot_copies:
+                baked_slots += 1
+                copies += slot_copies
         self.stage_in_seconds += time.monotonic() - started
         self.stage_ins_served += 1
-        self.stage_in_pages += baked_pages
+        self.stage_in_pages += baked_slots
         logger.info(
-            "vllm-030win KVMem viewport (req=%s): baked %d page(s) into the "
-            "retrieval slots in %.2f s (%d slot(s) offered, %d without a "
-            "stored page, %d layer-row(s) without authority rows); %.1f MiB "
-            "written",
+            "vllm-030win KVMem viewport (req=%s): baked %d slot(s) x group(s) "
+            "%s = %d layer-page copie(s) into the retrieval slots in %.2f s "
+            "(%d slot(s) offered, %d without a stored page, %d layer-row(s) "
+            "without authority rows); %.1f MiB written, read-back %d checked "
+            "%d mismatch",
             stage.request_id,
-            baked_pages,
+            baked_slots,
+            sorted(groups_baked),
+            copies,
             self.stage_in_seconds,
-            len(stage.blocks),
+            len(stage.slots),
             missing_pages,
             missing_rows,
-            baked_pages
-            * self.page_bytes.get(stage.blocks[0][0], 0)
-            * len(self._layers_per_group.get(stage.blocks[0][0], ()))
-            / (1024 * 1024),
+            bytes_written / (1024 * 1024),
+            verified,
+            verify_mismatch,
         )
 
     def _write_report(self, report: dict) -> None:
