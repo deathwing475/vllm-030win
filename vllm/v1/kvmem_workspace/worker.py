@@ -117,16 +117,10 @@ class KVMemWorkspaceWorker:
         self._retrieval_reports: list[dict] = []
         self._score_seconds = 0.0
 
-        # Step 072: stage-in (bake the scored pages into the retrieval slots)
-        # and the finish sweep's completion bookkeeping.
+        # Step 072: stage-in (bake the scored pages into the retrieval slots).
         self.stage_ins_served = 0
         self.stage_in_pages = 0
         self.stage_in_seconds = 0.0
-        # store job id -> the finished request whose sweep it carries
-        self._sweep_req_by_job: dict[int, str] = {}
-        # sweep requests whose copies have landed: reported through
-        # get_finished()'s finished-sending set, which releases their blocks.
-        self._finished_sweeps: set[str] = set()
 
         # K3 second half (step 064): the pre-RoPE rotary prefix kept as the
         # rematerialisation authority. trajectory -> layer -> fp16
@@ -1017,10 +1011,8 @@ class KVMemWorkspaceWorker:
             missing_pages,
             missing_rows,
             baked_pages
-            * sum(
-                self.page_bytes.get(g, 0) * len(self._layers_per_group.get(g, ()))
-                for g, _ in stage.blocks
-            )
+            * self.page_bytes.get(stage.blocks[0][0], 0)
+            * len(self._layers_per_group.get(stage.blocks[0][0], ()))
             / (1024 * 1024),
         )
 
@@ -1084,10 +1076,6 @@ class KVMemWorkspaceWorker:
                     self._run_selftest(job)
                 if config.authority_enabled() and config.roundtrip_selftest():
                     self._run_remat_selftest(job)
-                if job.sweep_req_id:
-                    # The sweep's blocks stay alive until the request id comes
-                    # back through finished-sending; remember who to report.
-                    self._sweep_req_by_job[job.job_id] = job.sweep_req_id
                 event = torch.cuda.Event()
                 event.record()
                 self._events[job.job_id] = event
@@ -1330,9 +1318,6 @@ class KVMemWorkspaceWorker:
             if event.query():
                 del self._events[job_id]
                 self._completed.append(job_id)
-                sweep_req = self._sweep_req_by_job.pop(job_id, None)
-                if sweep_req is not None:
-                    self._finished_sweeps.add(sweep_req)
         # Step 066: a request whose assembly copy has fired is reported as
         # finished *recving*, which is what promotes it out of
         # WAITING_FOR_REMOTE_KVS. The set is kept until
@@ -1347,11 +1332,7 @@ class KVMemWorkspaceWorker:
             if event.query():
                 del self._snapshot_events[key]
                 self._completed_snapshots.append(key)
-        # The first return value is finished-*sending* (the mixin unpacks it
-        # that way): a swept request's id there releases its blocks.
-        finished_sweeps = set(self._finished_sweeps)
-        self._finished_sweeps.clear()
-        return finished_sweeps, set(self._finished_loads)
+        return set(), set(self._finished_loads)
 
     def build_connector_worker_meta(self) -> KVMemWorkerMetadata | None:
         if not (

@@ -97,6 +97,7 @@ def post(base: str, prompt: str, max_tokens: int, ignore_eos: bool = False) -> d
     t0 = time.time()
     ttft = None
     chunks = 0
+    finish_reason = None
     text: list[str] = []
     usage: dict = {}
     try:
@@ -115,6 +116,8 @@ def post(base: str, prompt: str, max_tokens: int, ignore_eos: bool = False) -> d
                 if obj.get("usage"):
                     usage = obj["usage"]
                 for ch in obj.get("choices", []):
+                    if ch.get("finish_reason"):
+                        finish_reason = ch["finish_reason"]
                     piece = ch.get("text") or ""
                     if piece and ttft is None:
                         ttft = time.time() - t0
@@ -137,6 +140,7 @@ def post(base: str, prompt: str, max_tokens: int, ignore_eos: bool = False) -> d
         "prompt_tokens": usage.get("prompt_tokens"),
         "completion_tokens": usage.get("completion_tokens"),
         "n_chunks": chunks,
+        "finish_reason": finish_reason,
         "needle_hit": NEEDLE_CODE in out,
         "prefill_tok_s": (
             None

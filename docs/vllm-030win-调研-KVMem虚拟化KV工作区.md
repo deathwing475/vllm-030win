@@ -956,9 +956,9 @@ dynamo 的 Hint 直接给出方向：**"wrap the operator into a PyTorch-underst
 
 ---
 
-## 12.14 阶段 1 K3 后半接线第四半（步骤 072：固定槽位压缩视窗 —— 重烘焙路线 + 完库 sweep）
+## 12.14 阶段 1 K3 后半接线第四半（步骤 072：固定槽位压缩视窗 —— 重烘焙路线 + prefill 期滚动入库）
 
-> 本节记录 §5.1 原案（重烘焙路线）的接线与实测。**结论先行**：机制落地——单坐标视窗改写、完库 sweep、打分后 stage-in 烘焙三条链全部接通，离线单测 16/16（槽位烘焙与引擎 writer **逐位一致** 205,056 字节 0 mismatch、非旋转 1,435,392 字节原样、重烘焙零漂移）。**与 068-071 被回滚的双坐标路线的根本区别：本路线没有第二坐标系**——视窗请求的 prefill token 序列**就是**压缩视窗本身，positions/slot_mapping/块表全部停留在引擎原生视窗坐标，没有帧翻译、没有调度前跳、没有 mamba 快照恢复、没有取数侧平移。
+> 本节记录 §5.1 原案（重烘焙路线）的接线与实测。**结论先行**：机制落地——单坐标视窗改写、prefill 期滚动入库、打分后 stage-in 烘焙三条链全部接通，离线单测 16/16（槽位烘焙与引擎 writer **逐位一致** 205,056 字节 0 mismatch、非旋转 1,435,392 字节原样、重烘焙零漂移）；**N=1 视窗端到端 GO**（改写 198,204→19,232、TTFT 16.966 s、输出连贯）。**但 N=55 大视窗（96,128 token）输出为空（首个采样即 EOS），卡点未解**（见 12.14.6）。**与 068-071 被回滚的双坐标路线的根本区别：本路线没有第二坐标系**——视窗请求的 prefill token 序列**就是**压缩视窗本身，positions/slot_mapping/块表全部停留在引擎原生视窗坐标，没有帧翻译、没有调度前跳、没有 mamba 快照恢复、没有取数侧平移。
 
 ### 12.14.1 ⭐ 机制：视窗 prefill = 改写 prompt（单坐标）
 
@@ -980,16 +980,21 @@ positions = 0..B-1（引擎原生派生，零改动）
 
 **零污染**：改写后 `num_tokens = B + 生成 < W` ⇒ 视窗请求**无滑窗淘汰** ⇒ 无 K1 store、无快照抓取、页哈希不写入；`KVMemStepSpan.viewport=True` 让 `_ingest` 只提取 q（打分用）而**不进索引/权威区**（视窗的 K 行不是轨迹在那些位置的行——sink/占位段 token 相同但 recent 段相位已变）。
 
-### 12.14.2 ⭐ 完库 sweep（K1 的必要补全）
+### 12.14.2 ⭐ prefill 期滚动入库（K1 的必要补全；两版 sweep 都死锁后改此）
 
-**K1 只存滑窗淘汰页**——200K ingest 结束时 store 只有窗外约 25 页，而检索槽烘焙需要的 V/非旋转 192 维字节恰恰在**滑窗内活着的中段页**里（请求结束即释放）。`VLLM_KVMEM_SWEEP=1` 在 `request_finished` 时把未入库页 sweep 进 store：复用 K1 管道（store job + `_jobs` 登记），但块持有方式不同——`request_finished` 返回 **True**（base 契约：块延迟释放，直到 req_id 从 `get_finished()` 的 **finished-sending** 集合回来）⇒ worker 拷完（event）⇒ `get_finished` 报 sending ⇒ 调度器 `_free_blocks`。时序：request_finished 在步 N 输出处理段（该步 meta 已建）⇒ job 在步 N+1 的 `build_connector_meta` 冲刷并拷贝 ⇒ 步 N+2 释放；引擎空闲时延迟到下一个有 forward 的步。视窗请求被排除在 sweep 外（它的页不是轨迹页）。
+**K1 只存滑窗淘汰页**——200K ingest 结束时 store 只有窗外约 25 页，而检索槽烘焙需要的 V/非旋转 192 维字节恰恰在**滑窗内活着的中段页**里（请求结束即释放）。补全的第一版是"请求结束时 sweep 剩余页"（`request_finished` 返回 True 持有块、req_id 经 `get_finished()` 的 finished-sending 回来才释放），**实测两种形态都死锁**：
+
+1. 存全部剩余页：200K ingest 结束时 232 页（116 物理块/组）被持有 ⇒ 池只剩 27 块 ⇒ 后续请求（需 141 块）**无法准入** ⇒ **没有 forward 步 ⇒ 拷贝永不发生 ⇒ 块永不释放**（引擎日志 `Waiting: 1 reqs` 后静默）。
+2. 只存打分选中的页（84 页）仍死锁：持有量小了，但"要靠下一个 forward 步来驱动拷贝"这个依赖没变。
+
+**定案 = prefill 期逐页滚动入库**（`_emit_incremental_stores`）：某页的最后一个 token 在本步算完（`end // block_size` 越过它）即当步发 store job——页 KV 刚写好、请求还持有该块、**零块持有**，拷贝在同一步的 forward 之后完成。死锁在结构上不可能发生（拷贝不需要额外步）。块的来源 = **每步权威的 `kv_connector_block_state.block_ids`**（scheduler 侧每步填的块表快照；int 行、null = 0），**不能用 admission 时刻的副本**（会漏掉 chunked prefill 后续分配的块）。页 token 哈希也在这里记录（保持 066 的"装配前缀必须是同一批 token"性质）。视窗请求被排除在外（它的 recent 段相位已变，其页不是轨迹在那些位置的页）。
 
 ### 12.14.3 stage-in（打分后烘焙进检索槽）
 
 prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`），但 `KVMemScoreRequest.num_tokens` 传**原轨迹长度 L**（store 页键是原轨迹页号；排除项 = 原 sink + 原 recent 尾，eligible = 中段 ✓），q = 改写序列尾部 `query_span` token 的 pre-RoPE q（capture 现成）。随后 `_stage_in`：
 
 1. top 页按**页号升序（时间序）**分配检索槽（§5.3"选满 N 个后按时间序分配槽位"）；
-2. 每页每层：工作区页字节 → 重建 buffer（V+非旋转原样）→ 权威区 raw K 行 `rematerialize_page` 到**槽位位置**（065 精度契约：bf16 还原 + fp32 cos/sin，完整 cache 引用传入）→ `dst.copy_` 进请求块（blocks 从 `update_state_after_alloc` 拿，manager 侧随 `KVMemStageInRequest` 下发，含页号→host slot 映射）；
+2. 每页每层：工作区页字节 → 重建 buffer（V+非旋转原样）→ 权威区 raw K 行 `rematerialize_page` 到**槽位位置**（065 精度契约：bf16 还原 + fp32 cos/sin，完整 cache 引用传入）→ `dst.copy_` 进请求块（**块表取自每步权威的 `kv_connector_block_state.block_ids`**，manager 侧随 `KVMemStageInRequest` 下发，含页号→host slot 映射）；
 3. 同步在 `wait_for_save` 内完成（引擎单线程串行）⇒ 第一个 decode 步在流序上必然看到烘焙后的块，无竞争。
 
 本步**不做**的：多轮 LCP/ΔP（query 段 q>0 的形态）、recent 滚动重烘焙、GPU 化烘焙、烘焙耗时优化（host 每页 16 层旋转+量化，阶段 1 只记录）。
@@ -998,13 +1003,14 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 | 文件 | 内容 |
 |---|---|
-| `kvmem_workspace/config.py` | `VLLM_KVMEM_VIEWPORT` / `_VIEWPORT_PAGES`(55) / `_VIEWPORT_RECENT`(16384) / `VLLM_KVMEM_SWEEP` |
-| `kvmem_workspace/metadata.py` | `KVMemStepSpan.viewport` / `KVMemStoreJob.sweep_req_id` / `KVMemStageInRequest`（blocks/slot_start/pages） |
-| `kvmem_workspace/manager.py` | `_viewport_layout` / `_viewport_rewrite`（改写+推迟）/ `update_state_after_alloc` 视窗分支 / `_emit_spans` 视窗标志+stage 组装 / `_emit_stage_request` / `_emit_finish_sweep` / `build_connector_meta` 冲刷 / 完成回报 |
-| `kvmem_workspace/worker.py` | `_ingest` 视窗 span 只提 q / `_stage_in`（烘焙+拷贝）/ sweep 事件与 finished-sending 回报 |
+| `kvmem_workspace/config.py` | `VLLM_KVMEM_VIEWPORT` / `_VIEWPORT_PAGES`(55) / `_VIEWPORT_RECENT`(16384) / `VLLM_KVMEM_SWEEP`（滚动入库开关） |
+| `kvmem_workspace/metadata.py` | `KVMemStepSpan.viewport` / `KVMemStageInRequest`（blocks/slot_start/page_size/pages） |
+| `kvmem_workspace/manager.py` | `_viewport_layout` / `_viewport_rewrite`（改写+推迟一步）/ `update_state_after_alloc` 视窗分支 / `_emit_spans`（视窗标志 + stage 组装）/ `_emit_stage_request`（块表取自每步快照）/ `_emit_incremental_stores`（滚动入库） |
+| `kvmem_workspace/worker.py` | `_ingest` 视窗 span 只提 q（不进索引/权威）/ `_stage_in`（烘焙 + 拷进槽块） |
 | `tools/kvmem_viewport_test.py`（新） | 离线单测（见 12.14.5） |
-| `tools/kvmem_viewport_probe.py`（新） | ingest → flush → serve 三请求探针（窗外 needle 判据） |
+| `tools/kvmem_viewport_probe.py`（新） | ingest → flush → serve 三请求探针（窗外 needle 判据；`--serve-ignore-eos` 可选） |
 | `tools/serve_gsq_kvmem_viewport072.cmd`（新） | 臂变体（dump `kvmem_k7a`；LOAD=0、VIEWPORT=1、SWEEP=1、WORKSPACE_MB=5120、AUTHORITY_TRAJ=2、TOPN=64） |
+| `tools/serve_gsq_kvmem_viewport072_n1.cmd` / `..._top1.cmd`（新） | 对照变体（N=1 小视窗；TOPN=1 单页烘焙） |
 
 **engine 文件零改动**（`scheduler.py`/`gpu_model_runner.py`/注意力路径全部未动；本步只改 `kvmem_workspace/` 四文件 ⇒ 不触发 AOT 重编译，062 结论适用）。
 
@@ -1023,15 +1029,38 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 ### 12.14.6 实测（步骤 072）
 
-（待臂实测后补记）
+臂 = `tools/serve_gsq_kvmem_viewport072.cmd`；探针 = `tools/kvmem_viewport_probe.py`（ingest 200K → **flush** 200K 异 nonce → serve 同 prompt）。prompt = 198,205 token，needle 深度 0.65（token 125,367）。**证据**：`prod029_logs\kvmem_k7a_boot1..7.*`、`prod029_logs\kvmem_k7a\`（dump）、`kvmem_k7a_n1\`、`kvmem_k7a_top1\`。
+
+| 项 | 结果 |
+|---|---|
+| boot | `workspace scheduler ready: groups=[6, 7], 204 host slots (5.00 GiB)`；`viewport needs 236 block(s) ... pool has 259`；`GPU KV cache size: 273,771 tokens` |
+| 改写 | `rewritten onto the compressed window: 198205 -> 96128 token(s) (sink 1424 + 55 retrieval page(s) + recent 16384; stored page(s) 139); deferring one scheduling pass` |
+| 滚动入库 | 每步 `job N stored 2 entry(ies) ... slots k/204` 递增、`dropped=0`；**两轨迹 × 200K 会把 204 槽用满**（`logical slots=204/204`） |
+| 打分 | `retrieval (req=...) 198205 tokens / 140 pages (block 1424, sub-block 32), 16 layer(s) scored, eligible 128` |
+| stage 计划 | `stage-in plan: 55 slot block(s) from row 1, page table carries 139 page(s) of this trajectory` |
+| 烘焙 | `baked 55 page(s) into the retrieval slots in 3.42 s (55 offered, 0 without a stored page, 0 layer-row(s) without authority rows); 688.4 MiB written` |
+| **serve（N=55）** | **`finish_reason="stop"`、`n_chunks=0`、`text=""`**（即首个采样 = EOS）、总耗时 89.6 s；视窗 prefill 本身正常跑完 68 步 |
+| **serve（N=1 对照，`_n1` 变体）** | 改写 198,204 → 19,232；1 槽烘焙 0.08 s；**TTFT 16.966 s**；**输出连贯**（`<think>\nThe user is asking me to:\n1. Find a "secret access code ..."`） |
+| **serve（TOPN=1 对照，`_top1` 变体）** | 视窗仍 96k、只烘焙 1 页 ⇒ **同样空输出**（stop、86.2 s） |
+| **serve（阳性对照，深度 0.30，needle 在视窗头部）** | 视窗路径日志齐全（检索 top-64 里**针页 39 排第 3**、`baked 55 page(s)`）；**输出连贯**（32 chunk、`finish_reason="length"`）；needle 未命中（`max_tokens=32` 截在推理中途）；**但 TTFT 245.9 s ≈ 全量 prefill 量级（0.65 轮 89.6 s）、`Prefix cache hit rate` 升到 45.2% ⇒ 内部路径与 0.65 轮不同，对照未完全定性** |
+| 崩溃（已修，过程留档） | boot3 `AttributeError: 'tuple' object has no attribute 'get'`（`KVCacheBlocks.blocks` 是按组 tuple）；boot4 `AttributeError: 'int' object has no attribute 'block_id'`（每步块表是 int 行） |
+
+**⭐卡点（未解）**：N=55 视窗**首个采样即 EOS**；`TOPN=1` 对照已**排除"烘焙数量"**（只烘焙 1 页同样空）⇒ 落在**视窗结构/长度本身**（19,232 正常、96,128 异常）。**阳性对照（深度 0.30，needle 落在视窗头部）结果矛盾、未定性**：视窗路径日志齐全（改写 198,205→96,128、检索 top-64 里**针页 39 排第 3**、`baked 55 page(s)`），**输出连贯**（32 chunk、`finish_reason="length"`，模型在"逐段查找文档"），needle 未命中（`max_tokens=32` 截在推理中途，属预期）；**但 TTFT 245.9 s（≈全量 prefill 量级，0.65 轮只有 89.6 s）且 `Prefix cache hit rate` 由 0.0% 升到 45.2%** ⇒ 这一轮的内部路径与 0.65 轮不同（疑与缓存/重 prefill 交互），**对照本身需重跑**（先打掉缓存再测）。待查线索：`--serve-ignore-eos` 看原始输出、`num_computed_tokens`、前缀缓存命中、**`block_hashes` 在改写后未重算**（仍为原 198,205 token 的 140 个，而 prompt 只 68 块——陈旧哈希理论上可能造成越界命中）。
+
+**两个真缺陷（已修）**：①**完库 sweep 死锁**（两版都死，见 12.14.2）⇒ 改 prefill 期滚动入库；②**`_allocate_slot` 键语义用错**（期望页号、传了 token 偏移）⇒ 中段页在页表里键错位、检索按绝对页号查不到（只有 K1 淘汰的早期页键正确）⇒ boot5 出现"55 槽仅 23 个有页"；修后 55/55 全中。
 
 ### 12.14.7 本步的边界（勿误读）
 
 - 单请求单轮形态：视窗 = 头部 + 尾部拼接，**多轮 ΔP（query 段）未实现**——§5.1 执行流水的步骤 1（LCP 差量）留待下一步；因此"prefill 时基于旧工作集"的检索槽内容本步是**占位段**（prompt 原位连续段），不是上一轮的检索结果。
 - 检索槽**只覆盖 55 页**（78K token），工作区其余部分不召回；needle 若落在未被选中的页上仍答不出——检索质量本身是 061 的判据，本步判据是"选中的页真能被读到"。
 - 烘焙在 host CPU 同步做，TTFT 尾部加烘焙耗时（55 页 × 16 层，实测值见 12.14.6）；阶段 1 不判性能。
-- sweep 的块释放依赖后续调度步（空闲时延迟）；`--max-num-seqs 1` 下探针场景天然有后续请求。
+- **⭐N=55 大视窗空输出未定性**：视窗改写/入库/烘焙三链都跑通（日志齐全、烘焙 55/55 成功），但 96,128-token 视窗的 serve 首个采样即 EOS；`TOPN=1` 对照已排除烘焙数量，根因未定。**在定性之前，不要把"视窗路径可用"当结论**。
+- 滚动入库的块来源必须用**每步的 `kv_connector_block_state.block_ids`**（admission 时刻的副本会漏掉 chunked prefill 后续分配的块）；`_allocate_slot` 的入参是**页号**不是 token 偏移。
+- **不能靠"持有块等后续步驱动拷贝"**：请求结束时持有块会把池挤死、没有 forward 步就没有拷贝 ⇒ 死锁（本步实测两版）。任何"请求结束后还要搬东西"的设计都必须让拷贝发生在**同一步的 forward 之后**。
 - **identity canary 口径**：视窗只在 `L > B` 且 store 有页时激活 ⇒ canary 用 `L ≤ B` 的请求（或 VIEWPORT=0 的 boot）对照。
+- 烘焙在 host CPU 同步做，TTFT 尾部加烘焙耗时（55 页 × 16 层 3.42 s）；阶段 1 不判性能。
+- 检索槽**只覆盖 55 页**（78K token）；needle 落在未被选中的页上仍答不出（检索质量本身是 061 的判据，本步判据是"选中的页真能被读到"）。
+- **`block_hashes` 陈旧**（已知未修）：改写后 `request.block_hashes` 仍是原 prompt 的哈希（长 140 vs 现 68 块）——本次运行未观察到越界命中（日志 `Prefix cache hit rate: 0.0%`），但属正确性隐患，下一步一并核。
 
 ---
 

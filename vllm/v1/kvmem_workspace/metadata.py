@@ -39,12 +39,6 @@ class KVMemStoreJob:
     # (group_id, gpu_block_id, page_index); the host destination is the
     # worker's snapshot region, keyed by (trajectory, boundary).
     mamba_snapshots: list[tuple[int, int, int]] = field(default_factory=list)
-    # Step 072 (finish sweep): the finished request whose still-resident pages
-    # this job stores. Its blocks are *not* freed by the scheduler (the
-    # connector claimed them in request_finished); once the copies land the
-    # request id goes back through get_finished()'s finished-sending set,
-    # which is what releases the blocks to the pool.
-    sweep_req_id: str | None = None
 
 
 @dataclass

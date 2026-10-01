@@ -80,7 +80,8 @@ def run(args) -> dict:
     r2 = post(base, flush_prompt, 1, ignore_eos=True)
     time.sleep(1.0)
     print(f"[serve ] ~{n_ingest} tokens (same prompt; the window path runs)")
-    r3 = post(base, ingest_prompt, args.max_tokens)
+    r3 = post(base, ingest_prompt, args.max_tokens,
+              ignore_eos=args.serve_ignore_eos)
 
     out = {
         "tag": args.tag,
@@ -103,6 +104,8 @@ def run(args) -> dict:
             "ttft_s": r3.get("ttft_s"),
             "total_s": r3.get("total_s"),
             "ok": r3.get("ok"),
+            "finish_reason": r3.get("finish_reason"),
+            "n_chunks": r3.get("n_chunks"),
             "text": r3.get("text", ""),
             "sample": r3.get("sample", ""),
             "needle_hit": NEEDLE_CODE in (r3.get("text", "")
