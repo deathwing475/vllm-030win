@@ -2,8 +2,7 @@
 rem ===========================================================================
 rem STEP 077 DIAGNOSTIC ARM (KVMem ARM, NOT production): faithful reproduction of
 rem the 076 peel E config (step076_peelE_mbt1456) plus the scheduler trace patch
-rem (tools/apply_sched_trace_step077.py, gated by VLLM_KVMEM_.. no: gated by
-rem VLLM_SCHED_TRACE=1).
+rem (tools/apply_sched_trace_step077.py, armed by VLLM_SCHED_TRACE=1).
 rem
 rem Config = production recipe + VLLM_KVMEM_SW_WINDOW=131072, --max-model-len
 rem 163072, --max-num-batched-tokens %SCHED077_MBT% (default 1456), DFlash2 N=2.
