@@ -1140,6 +1140,10 @@ class KVMemWorkspaceWorker:
         "snap",
         "load",
         "save",
+        # vllm-030win step 080: mirrored from capture.stats(), because
+        # record() runs inside the forward and no wait_for_save window
+        # can see it (that blind spot is how "outside" grew to 9.5 s).
+        "rec",
     )
 
     def _kvtime_add(self, key: str, started: float) -> None:
@@ -1179,6 +1183,11 @@ class KVMemWorkspaceWorker:
         _cap0 = capture.stats()
         acc["sync"] = float(_cap0.get("drain_sync_seconds") or 0.0)
         acc["copies"] = float(_cap0.get("drain_copy_seconds") or 0.0)
+        # vllm-030win step 080 capture-record fix: the record() segment,
+        # mirrored (not accumulated here) so the emit loop below prints
+        # it in the same shape the analyser already parses.
+        acc["rec"] = float(_cap0.get("record_seconds") or 0.0)
+        self._kvtime_n["rec"] = int(_cap0.get("record_calls") or 0)
         acc["score"] = self._score_seconds  # existing: score + bake
         counts = self._kvtime_n
         if first:
@@ -1187,7 +1196,7 @@ class KVMemWorkspaceWorker:
                 "vllm-030win patch (step 079): [KVTIME] patch loaded: "
                 "every=%d selftest=%d bake_verify=%d pid=%d "
                 "page_bytes=%s layers_per_group=%s store_groups=%s "
-                "armed=%s geometry=%s",
+                "armed=%s geometry=%s rec_nosync=%d",
                 self._kvtime_every,
                 int(config.roundtrip_selftest()),
                 int(config.bake_verify()),
@@ -1200,6 +1209,10 @@ class KVMemWorkspaceWorker:
                 sorted({group for group, _ in self._host}),
                 capture.stats().get("armed_counts"),
                 capture.stats().get("geometry"),
+                # vllm-030win step 080 capture-record fix: prove which
+                # record path is live, because outside-without-this is
+                # how the 9.5 s blind spot got read as 'not the connector'.
+                int(config.record_nosync()),
             )
         parts = [
             f"wall={now:.3f} dt={dt:.3f} "
@@ -1225,10 +1238,13 @@ class KVMemWorkspaceWorker:
         )
         cap = capture.stats()
         parts.append(
-            "cap(unarmed=%d decode=%d)"
+            "cap(unarmed=%d decode=%d rec_sync=%d rec_calls=%d nosync=%d)"
             % (
                 cap.get("skipped_unarmed_steps") or 0,
                 cap.get("skipped_decode_steps") or 0,
+                int(cap.get("record_sync_calls") or 0),
+                int(cap.get("record_calls") or 0),
+                int(cap.get("record_nosync") or 0),
             )
         )
         self._kvtime_prev = acc

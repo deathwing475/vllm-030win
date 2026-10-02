@@ -370,6 +370,19 @@ def timing_every() -> int:
     return _env_int("VLLM_KVMEM_TIMING_EVERY", 50)
 
 
+def record_nosync() -> bool:
+    """vllm-030win step 080 capture-record fix: keep the host sync
+    out of the capture op.
+
+    ``capture._record_impl`` used to call ``torch.equal(positions[0],
+    positions[1])`` once per full-attention layer, i.e. 16 stream-
+    draining syncs inside every prefill forward. Off by default = the
+    old behaviour, byte for byte; the step 080 arm sets it to 1.
+    Revert with tools/apply_kvmem_record_sync_step080.py revert.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_RECORD_NOSYNC", "0")))
+
+
 def sweep_enabled() -> bool:
     """Store the pages a finished request still holds (step 072).
 

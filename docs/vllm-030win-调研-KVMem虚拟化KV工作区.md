@@ -1381,6 +1381,31 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 工具：`tools/kvmem_slot_budget.py`（纯离线）。**自检**：用 dump 里的 `page_scores` 重排前 64 名，与引擎自己写出的 `top_pages` 逐字相同 ⇒ 六变体 × 两 dump 全 `replay_ok=True`，重实现可信；回归锚 = 必须复现"针页 86 / logit 序第 9 / 引擎序第 11 / 时间序第 53 / 余量 2"。
 
+### 12.23 ⭐慢态计时与 `record` 同步定罪（步骤 080，2026-10-02，py-spy + 带外指纹 + 门控修法）
+
+**结论级事实（按实测，不按推演）**
+
+1. **079 的 `outside` 是个筐，不是归因**。`capture.record` 是 `torch.library.custom_op`，在 **`execute_model` 内部**每个 full-attention 层被调一次；079 的台账只从 `wait_for_save` 里取窗口，所以 `record` 从来没被计量，全部落进 `outside`，并被 079 读成"连接器之外 = 模型前向/调度/图侧"。**必守 24① 的反例就是这一条**（未计量的段读起来像无罪）。本步起台账有第 14 段 `rec=`，分析器把 `record` 从 `outside` 剥出来，并新增判定档 `(d)`。
+2. **慢态的栈顶只有一行**。b4（门控关，9.78-9.80 s/页步，同 boot 4 次复测）录到 7,640 个 GIL-holding 样本，**94.62% 栈顶 = `vllm/v1/kvmem_workspace/capture.py:166`**，即 `torch.equal(positions[0], positions[1])`；inclusive 链 `execute_model → qwen3_next.forward → piecewise/cuda_graph → record → _record_impl` = 94.63%。这行**每个 full-attention 层跑一次 ⇒ 每页步 16 个 CUDA 流同步**，违反必守 16⑥（device→host 一律留在 `drain()`）。
+3. **修法把同步归零，但等待换了地方**。`VLLM_KVMEM_RECORD_NOSYNC=1`（默认 0 = 旧行为逐字不动）把 `positions[:2]` 一起暂存，同轴判定挪到 `drain()` 里用 numpy 做（那份数据本来就要 `.cpu()`）。实测：`cap(... rec_sync=0)`、CPU 单测 20 项（canary 计数不变、`drain()` 交出的一仍是 1-D 行 0）；b6/b9 的栈顶搬到 `drain` 的第一次 `.cpu()`（91.65%），`execute_model/forward` 只剩 2.48%。**页步：慢态 9.784 → 8.384（−14%），快态 1.269 vs 门控关 1.315-1.452（不变）** ⇒ **修复的是不变量，不是速度**。
+4. **慢态的 GPU 没在算**（这是本步真正的判据）：快态 `power.draw` 中位 **196.7 W**、`utilization.memory` **13%**、**60 °C**；慢态 **84-87 W / 1% / 47 °C**；SM 3060 MHz、显存 14801 MHz、PCIe gen5 x16 = max **两态相同**；`pstate` 都是 P1、`clock_reasons` 都以 GpuIdle(0x1) 为主。"util≥90% 且 <130 W 且 mem-util<10%" 占比：快态 **0.000**，慢态 **0.64-0.84**。
+5. **四条候选被直接否掉**：①**显存被挤/权重页落系统内存**——引擎专用/共享记账在快慢两态**逐字相同**（15,780.5-15,792.5 / 8,654-8,666 MiB，40 s 轮询 8 次无变化），且 8.66 GB 共享是本臂"锁页工作区 5.00 GiB + raw-K 权威区"的正常足迹（**不可套生产 `共享 − 8,298` 公式**，必守 19）；②**主机内存压力/换页**——**快态的空闲 RAM 反而更低**（0.71 GB vs 慢态 5.33/1.47 GB），慢态 pagefile 与磁盘读平直（~0 MB/s）；③**降频/热墙**——两态时钟相同、慢态更凉；④**链路**——gen5 x16 = max。
+6. **同一支慢态 boot 的 decode 更快**：b4 的 8k 锚点 = 110.99/115.94/116.05（独立采样窗口），快态 b8 = 96.15；台账在 decode 窗口 `save = 0`。⇒ 反相关成立且有计时证据；单图提交（decode）不受影响，慢的是"多 kernel 提交的整页前向"。
+7. **机制未定罪的准确说法**：能说的是"整页前向的提交-完成握手被拖住 ×7-8，而 GPU 自身强度极低"；不能说的是"被谁拖住"。本步取证手段的边界：`gpu_apps` 只有引擎自己的 8 个 PID（无他占客户端读数）、py-spy 不带 `--native` 就看不见驱动调用、`--idle` 采样（b9，39,893 样本）里 `schedule`/zmq 帧 ≈0 ⇒ **scheduler 侧一次性诊断（079 已授权）判定为不必打**，因为它不能改变任何决策。
+
+**边界（勿误读）**
+
+- **"KVMem 无责"与"KVMem 有罪"都不成立**：连接器的自有开销（`host_py` 0.141-0.144、净拷贝 0.030-0.034）在两态**逐字不变**；它贡献的是**同步形态**（把等待显形化的位置），不是等待的量。079 那句"连接器只占 ~12%"因此需要限定：**它只统计了 `wait_for_save` 窗口**。
+- **态会在 boot 内漂**：b11 起服 1.44 s/页，同 boot 同 prompt 只重发 serve 的 TTFT 108.0 → 180.3 s。所以"按 boot 取中位"是**下限**口径，跨 boot 比较时必须记录测量时刻。
+- **抽样率**：本步 11 boot = 6 慢 / 5 快，且沿时间成簇（13:30-13:37 全快 → 13:38-15:12 几乎全慢 → 15:13 又快）。与 078（4 boot 2 慢）、079（6 boot 0 慢）合起来 ⇒ **"再抽几次一定抽到"仍不成立**，任何"快慢态发生率"的数字都要带时段。
+- **`VLLM_KVMEM_RECORD_NOSYNC` 默认 0** ⇒ 生产与所有历史 boot 行为不变；本步所有正确性判据（needle/指纹/全图）都是在门控开的臂上重取的，**没有**沿用 078/079 的结论。
+
+**未验证项（081 的靶子）**
+
+①把 `record` 整条路径摘掉后的页步地板（`S079_RAWK=0` 是现成旋钮，属 078 peel 血统，**注意它同时改变工作**，只能当"地板参考"不能当干净对照）；②驱动级取证（`--native` 需符号，或换 ETW/xperf 类工具）；③多深度命中率网格（本步只 0.65 × 2 次采样，判据口径已改：单次 32-token serve 会把命中读成 miss）；④`record` 段在 079 六支旧 boot 上的回溯（旧日志无该段，只能标"未知"）；⑤recent 滚动重烘焙、多轮 ΔP、装配探针在 1456 上的回归、阶段 1 出口五项。
+
+**工具（本步新增，全留存）**：`tools/kvmem_boot_fingerprint.py`（带外 1 Hz，`run|summarize`）、`tools/step080_boot.py`（`next|classify|measure|vp|stop|verify|show`，状态落 `prod029_logs/step080_boots.json`）、`tools/apply_kvmem_record_sync_step080.py`（三态 + `--target`，可逆性已实测）、`tools/kvmem_record_nosync_test.py`（CPU 20 项，跑臂前闸门）。证据：`step080_b{1..11}_arm.{out,err}.log`、`step080_b4_pyspy_slow.raw`（7,640 样本）、`step080_b6_pyspyS.raw`、`step080_b9_pyspyI.raw`（39,893 样本，`--idle --threads`）、`step080_b{4,6,8}_fingerprintS.{csv,json}`、`step080_b{4,6}_headroomS.json`、`step080_b{4,6,8,9}_timebudget*.json`、`step080_b11_vp_d65_a.log` + `kvmem_k14k/vp080a_d065{,_ignoreeos}.json`、`step080_slotbudget_{078anchor,b11}.json`；dump 目录 `kvmem_k14a…k14k`（每 boot 一个新名）。
+
 ---
 
 ## 11. 参考索引

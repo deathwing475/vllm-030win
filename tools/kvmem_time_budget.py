@@ -13,7 +13,13 @@
                           连接器里的 Python：位置掩码 / 索引折叠 / 组装 copy 条目
   selftest   = d_selftest   roundtrip 自测（内含 ``torch.cuda.synchronize()``）
   copy_issue = d_copy       ``ops.swap_blocks_batch`` 的发射（不含传输）
-  outside    = dt - d_save   连接器根本没被调用到的部分：调度、前向发射、图重放、草稿
+  record     = d_rec       ⭐``capture.record`` custom op 本体 —— 它在 **execute_model
+                          内部**跑（每个 full-attention 层一次），``wait_for_save``
+                          窗口天生看不见它。079 把它记进了 ``outside`` 并据此说
+                          "连接器之外"，是必守 24①那个坑（未计量的段读起来像无罪）；
+                          步骤 080 补了这一段，py-spy 同时独立指到同一行。
+  outside    = dt - accounted - record
+                          剩下才真是连接器之外：调度、图重放、模型自身计算
 
 两个必须记住的陷阱
 ------------------
@@ -93,11 +99,15 @@ def split_of(w: dict) -> dict:
         "snap": d.get("snap", 0.0),
         "load": d.get("load", 0.0),
         "save": d.get("save", 0.0),
+        # step 080: NOT part of `save` (record runs in the forward), so it is
+        # deliberately outside `accounted` -- accounted/save stays the
+        # self-consistency check on the wait_for_save window.
+        "record": d.get("rec", 0.0),
     }
     out["accounted"] = (out["gpu_wait"] + out["gpu_copy"] + out["selftest"]
                         + out["copy_issue"] + out["host_py"] + out["score_pure"]
                         + out["bake"] + out["snap"] + out["load"])
-    out["outside"] = dt - out["accounted"]
+    out["outside"] = dt - out["accounted"] - out["record"]
     out["residual"] = out["save"] - out["accounted"]  # 记账自洽性检查，应≈0
     return out
 
@@ -142,7 +152,7 @@ def main() -> int:
               f"ttft={cad.get('ttft_s')} "
               f"engine_drain中位={cad.get('engine_drain', {}).get('median_s')}")
     keys = ("gpu_wait", "gpu_copy", "host_py", "score_pure", "selftest",
-            "copy_issue", "bake", "snap", "load", "outside")
+            "copy_issue", "bake", "snap", "load", "record", "outside")
     ref = (cad or {}).get("s_per_page_step") if args.cadence else None
     if ref:
         slow_w = [w for w in active if w["dt"] / w["dsteps"] > 2.0 * ref]
@@ -193,7 +203,12 @@ def main() -> int:
                     "max_residual_s": resid, "windows": len(rows)}
         gw, gc, hp = med["gpu_wait"], med["gpu_copy"], med["host_py"]
         oth, sp = med["outside"], med["score_pure"]
-        if oth >= 50.0:
+        rec = med.get("record", 0.0)
+        if rec >= 50.0:
+            v = ("(d) capture.record 为主 —— 连接器在 **前向内部** 的那一段（raw-K "
+                 "暂存 / M-RoPE 同轴检查）吃掉了这一步；它不在 wait_for_save 窗口里，"
+                 "079 的口径把它记成了 outside")
+        elif oth >= 50.0:
             v = ("(c) 连接器之外为主 —— 时间在这一页的模型前向/调度/图侧，"
                  "连接器内没有可归因的大头")
         elif gw >= 50.0:

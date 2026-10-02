@@ -79,6 +79,26 @@ _MROPE_AXES_DIFFER = 0
 # vllm-030win step 079 timing instrumentation: drain(), split.
 # A dict so the loop below needs no ``global`` statements.
 _DRAIN_ACC: dict[str, float] = {"sync": 0.0, "copies": 0.0}
+# vllm-030win step 080 capture-record fix: the cost of the record()
+# custom op, which runs INSIDE execute_model and therefore was never
+# inside any window the wait_for_save-based [KVTIME] ledger measured.
+#   seconds    = monotonic time spent in the armed body (per call)
+#   calls      = armed calls (16 per page step on this model)
+#   sync_calls = of those, how many paid the torch.equal stream sync
+_REC_ACC: dict[str, float] = {"seconds": 0.0, "calls": 0.0,
+                              "sync_calls": 0.0}
+# Resolved once: _record_impl runs 16 times per page step.
+_NOSYNC: bool | None = None
+
+
+def _nosync() -> bool:
+    """``VLLM_KVMEM_RECORD_NOSYNC``, cached (this is a hot path)."""
+    global _NOSYNC
+    if _NOSYNC is None:
+        from vllm.v1.kvmem_workspace import config
+
+        _NOSYNC = bool(config.record_nosync())
+    return _NOSYNC
 # Step 075: the token counts the connector expects to compute in the step about
 # to run (its prefill spans). None = the connector has not armed this step, so
 # nothing is recorded. An explicit allow-list is the only rule that survives
@@ -162,17 +182,37 @@ def _record_impl(
     # the same row three times, which is the scalar position the index wants.
     # Vision would make the axes differ, and a single scalar cannot express
     # H/W — the design keeps vision out of stage 1 for exactly that reason.
+    #
+    # vllm-030win step 080 capture-record fix. The canary below was written
+    # as ``torch.equal(positions[0], positions[1])``, and on a CUDA tensor
+    # torch.equal BLOCKS until the stream drains. It runs once per
+    # full-attention layer => 16 synchronisation points inside every
+    # 1456-token forward, which py-spy measured at 94.6% of the wall clock
+    # of a slow-state boot (94.62% of 7640 samples, leaf
+    # capture.py:_record_impl). Iron rule 16 (vi) already says device->host
+    # reads belong in drain(), not in the forward; this honours it: rows 0
+    # and 1 are stashed and compared where the data is already headed to
+    # the host, so the canary and its per-layer count survive with zero
+    # syncs in the forward. Gate off (default) = the old code path.
+    _t080 = time.monotonic()
+    axes = None
     if positions.ndim == 2:
-        if not torch.equal(positions[0], positions[1]):
-            _MROPE_AXES_DIFFER += 1
-        positions = positions[0]
+        if _nosync():
+            axes = positions[:2]
+        else:
+            if not torch.equal(positions[0], positions[1]):
+                _MROPE_AXES_DIFFER += 1
+            _REC_ACC["sync_calls"] += 1.0
+            positions = positions[0]
 
     span = min(_query_span(), num_tokens)
     _STASH[layer_idx] = (
-        positions.detach().clone(),
+        (axes if axes is not None else positions).detach().clone(),
         q.detach()[-span:].clone(),
         k.detach().clone(),
     )
+    _REC_ACC["seconds"] += time.monotonic() - _t080
+    _REC_ACC["calls"] += 1.0
 
 
 @torch.library.custom_op("vllm_kvmem::record", mutates_args="unknown")
@@ -220,6 +260,7 @@ def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     graphed region.
     """
     global _STASH, _LOGGED, _SKIPPED_DECODE, _SKIPPED_UNARMED
+    global _MROPE_AXES_DIFFER
     # The counters flush even on a step that recorded nothing: with the step 075
     # allow-list a decode/verify step leaves an empty stash, and "0 calls
     # outside the armed sizes since the last drain" is the read that the graphed
@@ -248,6 +289,14 @@ def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     _split = False
     for layer_idx, (positions, q_tail, k) in stash.items():
         _pos = positions.cpu().numpy()
+        if _pos.ndim == 2:
+            # vllm-030win step 080 capture-record fix: the M-RoPE axis
+            # canary moved here from the forward, where it cost a stream
+            # sync per layer. Same read, same per-layer granularity, done
+            # with numpy on data drain() copies to the host anyway.
+            if bool((_pos[0] != _pos[1]).any()):
+                _MROPE_AXES_DIFFER += 1
+            _pos = _pos[0]
         if not _split:
             _DRAIN_ACC["sync"] += time.monotonic() - _t079
             _split = True
@@ -298,6 +347,11 @@ def stats() -> dict:
         "geometry": _GEOMETRY,
         "drain_sync_seconds": round(_DRAIN_ACC["sync"], 3),
         "drain_copy_seconds": round(_DRAIN_ACC["copies"], 3),
+        # vllm-030win step 080 capture-record fix
+        "record_seconds": round(_REC_ACC["seconds"], 3),
+        "record_calls": int(_REC_ACC["calls"]),
+        "record_sync_calls": int(_REC_ACC["sync_calls"]),
+        "record_nosync": int(_nosync()),
     }
 
 
@@ -310,4 +364,10 @@ def reset() -> None:
     _SKIPPED_DECODE = 0
     _SKIPPED_UNARMED = 0
     _MROPE_AXES_DIFFER = 0
+    # vllm-030win step 080: the accumulators, not the gate -- the env
+    # does not change within a boot, and re-reading it 16x per step was
+    # the very cost being removed.
+    _REC_ACC["seconds"] = 0.0
+    _REC_ACC["calls"] = 0.0
+    _REC_ACC["sync_calls"] = 0.0
     _ARMED = None
