@@ -966,9 +966,80 @@ class KVMemWorkspaceWorker:
                 stage.request_id,
             )
             return
-        # Slots fill in time order (design §5.3: the model sees a time-ordered
-        # window); the highest-scoring pages win the earliest slots.
-        selected = sorted(top_pages)[: len(stage.slots)]
+        # vllm-030win step 081 slot-pick fix, gated by
+        # VLLM_KVMEM_SLOT_PICK. ``time`` (the default) is exactly the
+        # line this replaces:
+        #
+        #     # Slots fill in time order (design §5.3: the model sees a
+        #     # time-ordered window); the highest-scoring pages win the
+        #     # earliest slots.
+        #     selected = sorted(top_pages)[: len(stage.slots)]
+        #
+        # whose second clause never held: ``sorted`` discards the score
+        # order ``index._summarize`` returns ``top_pages`` in, so the
+        # rule that ran was "the lowest-numbered pages of the top
+        # VLLM_KVMEM_TOPN", which drops precisely the LATE
+        # high-scoring pages. Needle at token 125,370 (page 86 at
+        # block 1456): score rank 8-11, time rank 53/64 -- 2 slots of
+        # slack, and TOPN 64 -> 96 pushed it out (079 and 080 each
+        # reproduced it). ``score`` fills the slots by score and then
+        # re-sorts the winners into page order, so the model still
+        # sees a time-ordered window (design §5.3) and only *which
+        # pages win* changes.
+        #
+        # What does NOT change with the pick, and why the bake stays
+        # whole: ``selected`` feeds nothing but
+        # ``enumerate(stage.slots)`` below, so the number of slots
+        # filled, each slot's (group, block_id) coverage and the
+        # resulting layer-page copy count are functions of the slot
+        # plan, not of the pages -- ``VLLM_KV_GROUP_SIZE=8`` splits the
+        # 16 full-attention layers over group 6 and group 7, and every
+        # slot still bakes both (073: a half-covered slot reads as
+        # half-rebuilt KV). tools/kvmem_slot_pick_test.py drives this
+        # very method under both gate values and checks that
+        # equivalence item by item.
+        pick = config.slot_pick()
+        selected = (
+            sorted(top_pages)
+            if pick == "time"
+            else sorted(top_pages[: len(stage.slots)])
+        )[: len(stage.slots)]
+        # One-shot self-proof of which rule ran, in the step's own
+        # prefix so a boot log can be read without the arm script. It
+        # reads host-side structures only: no tensor is pulled back to
+        # the host here, and the bake below stays exactly as it was
+        # (step 080's discipline still holds -- those reads live in
+        # drain(), never in a per-layer path).
+        _needle_token = config.slot_pick_needle_token()
+        _needle_block = report.get("block_size") or stage.page_size
+        _needle_page = (
+            None
+            if _needle_token is None or not _needle_block
+            else _needle_token // _needle_block
+        )
+        _picked = set(selected)
+        logger.info(
+            "vllm-030win patch (step 081): slot pick=%s req=%s "
+            "top_pages=%d slots=%d selected=%d needle=%s "
+            "in_selected=%s dropped=%s selected_pages=%s",
+            pick,
+            stage.request_id,
+            len(top_pages),
+            len(stage.slots),
+            len(selected),
+            (
+                f"page {_needle_page} (token {_needle_token})"
+                if _needle_page is not None
+                else "n/a (VLLM_KVMEM_SLOT_PICK_NEEDLE=<token>)"
+            ),
+            (
+                _needle_page in _picked
+                if _needle_page is not None
+                else "-"
+            ),
+            [p for p in top_pages if p not in _picked],
+            selected,
+        )
         started = time.monotonic()
         try:
             rotary = self._rotary_embedding()

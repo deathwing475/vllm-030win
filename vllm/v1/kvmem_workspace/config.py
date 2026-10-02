@@ -349,6 +349,74 @@ def viewport_retrieval_pages() -> int:
     return _env_int("VLLM_KVMEM_VIEWPORT_PAGES", 55)
 
 
+SLOT_PICKS = ("time", "score")
+
+
+def slot_pick() -> str:
+    """vllm-030win step 081 slot-pick fix: which pages win the
+    retrieval slots.
+
+    ``worker._stage_in`` filled the slots with ``sorted(top_pages)
+    [:n]``, and ``sorted`` throws away the score order that
+    ``index._summarize`` hands back (``top_pages`` arrives already
+    sorted by score, descending). The rule that actually ran was
+    therefore *the lowest-numbered pages among the top
+    ``VLLM_KVMEM_TOPN``*, which drops precisely the LATE high-scoring
+    pages -- measured twice on the viewport arm: the needle at token
+    125,370 (page 86 at block 1456) sits at score rank 8-11 but at
+    time rank 53/64, so 55 slots left a slack of 2, and raising TOPN
+    64 -> 96 pushed it out of the slots altogether.
+
+    ``time`` is that code path, byte for byte, so production and the
+    079/080 boots stay comparable. ``score`` takes the slots by score
+    and then lays the winners out in page order, so the design's
+    invariant -- the model sees a time-ordered window (design
+    section 5.3) -- holds under both values, as does the per-slot
+    group expansion: only *which* pages win changes.
+
+    Read once per stage-in (not per layer), so no need for the
+    hot-path caching ``capture`` uses. Revert with
+    tools/apply_kvmem_slot_pick_step081.py revert.
+    """
+    raw = os.environ.get("VLLM_KVMEM_SLOT_PICK", "").strip()
+    if not raw:
+        raw = "time"
+    if raw not in SLOT_PICKS:
+        raise ValueError(
+            f"VLLM_KVMEM_SLOT_PICK must be one of {SLOT_PICKS}, "
+            f"got {raw!r}"
+        )
+    return raw
+
+
+def slot_pick_needle_token() -> int | None:
+    """Needle token the step 081 pick line reports membership for.
+
+    LOG ONLY -- nothing here can change which pages are picked, and
+    unset (the default) only costs the ``needle=n/a`` field. The
+    probe prints the needle's absolute token index (``needle at token
+    125370``); dividing it by the score report's ``block_size`` gives
+    the page, which is what ``tools/kvmem_slot_budget.py`` calls
+    ``needle_page``.
+    """
+    raw = os.environ.get("VLLM_KVMEM_SLOT_PICK_NEEDLE", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(
+            f"VLLM_KVMEM_SLOT_PICK_NEEDLE must be a token index, got "
+            f"{raw!r}"
+        ) from None
+    if value < 0:
+        raise ValueError(
+            f"VLLM_KVMEM_SLOT_PICK_NEEDLE must not be negative, got "
+            f"{value}"
+        )
+    return value
+
+
 def timing_enabled() -> bool:
     """vllm-030win step 079 timing instrumentation: the [KVTIME] ledger.
 

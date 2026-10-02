@@ -1406,6 +1406,33 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 **工具（本步新增，全留存）**：`tools/kvmem_boot_fingerprint.py`（带外 1 Hz，`run|summarize`）、`tools/step080_boot.py`（`next|classify|measure|vp|stop|verify|show`，状态落 `prod029_logs/step080_boots.json`）、`tools/apply_kvmem_record_sync_step080.py`（三态 + `--target`，可逆性已实测）、`tools/kvmem_record_nosync_test.py`（CPU 20 项，跑臂前闸门）。证据：`step080_b{1..11}_arm.{out,err}.log`、`step080_b4_pyspy_slow.raw`（7,640 样本）、`step080_b6_pyspyS.raw`、`step080_b9_pyspyI.raw`（39,893 样本，`--idle --threads`）、`step080_b{4,6,8}_fingerprintS.{csv,json}`、`step080_b{4,6}_headroomS.json`、`step080_b{4,6,8,9}_timebudget*.json`、`step080_b11_vp_d65_a.log` + `kvmem_k14k/vp080a_d065{,_ignoreeos}.json`、`step080_slotbudget_{078anchor,b11}.json`；dump 目录 `kvmem_k14a…k14k`（每 boot 一个新名）。
 
+### 12.24 ⭐kernel 级取证：慢态归口到量化 GEMM 的每调用双峰；连接器第三次无责；槽位选取门控（步骤 081，2026-10-02）
+
+**结论级事实（全部实测，工具与取证路径在步骤 081）**
+
+1. **080 的"提交-完成握手被拖住"作废**。torch profiler（本机实测可用，CUPTI 出带时间戳的 `cat=="kernel"` 事件）给出的 device busy 是**区间并集**占比：b1（请求侧 3.4 s/页步）**86.8%**、b4（9.3-10.4 s/页步）**94.3%**，空隙只 13.2% / **5.7%**，单个 ingest 块内 95-98%。⇒ 慢态的时间**在 kernel 执行里**，不在 host 提交与完成通知之间。`capture.drain()` 第一次 `.cpu()` 的等待、`cudaMemcpyAsync` 平均阻塞 6.9 ms，都是被 kernel 顶回来的下游症状。⇒ **不需要**再升级取证手段去"看驱动帧"（`py-spy --native` / ETW / xperf 这条路线对本问题不再有诱惑力）。
+2. **慢的对象被指名**：两个窗口的第一主导 kernel 都是 **`humming` WNA16 量化 GEMM**（`MmaOpClass`，逐层 gate/up `Shape<0,34816,5120>`、down `Shape<0,5120,17408>` 等），b1 里 gate/up 一族 Σ62.7 s = **device busy 的 61%**。
+3. **⭐同一 `(kernel 名, grid, block)` 的调用存在 15-28× 双峰，且"态"= 慢模态调用的占比**。b1 的 gate/up 变体（grid `[70,1,1]`、block `[384,1,1]`，2048 次 = 32 前向 × 64 层）：快簇 1328 次中位 **5.15 ms**、慢簇 720 次中位 **77.67 ms = 15.1×**；**每次前向稳定 19-23 个慢调用，且慢的是固定的层位次**（跨 32 次前向同一位次 76-81 ms、其余 5.1-5.2 ms）。一次前向的账 = 23×78 ms + 41×5.15 ms ≈ **2.0 s**。b1→b4 同名 kernel 中位时长：down-proj **2.586 → 73.62 ms（28.5×）**、`<0,5120,25600>` 25×、`_causal_conv1d_fwd_kernel` 13.1×、`layer_norm_fwd_kernel` 11.1×、fused rms_norm 3.8×、`chunk_gated_delta_rule` 1.42×，而 `BatchPrefillWithPagedKVCache` **反而 0.57×**。
+4. **连接器仍然无责（第三次独立复现）**：台账里连接器自有开销 `host_py + gpu_copy` 在 3.4 s 档与 10.6 秒档**逐字不变 = 0.165-0.172 s/页步**（079 与 080 各自量过同一事实），device 侧拷贝 31.4 GiB / 7,767 条的**总时长只有 0.47 s**（平均 61 μs）⇒ 079 判死的"修拷贝形态"继续成立，且现在有了 kernel 级旁证。`record` 绝对值 0.42-0.47 s 在两档也基本不变（NOSYNC=1）。
+5. **窗口读数的地位=描述性仪表，不是判态器**（本步否证了一条刚提出的推论）：flashinfer autotune 窗（`[Autotuner] starts/ends` 之差）确实是一次 `mbt=1458` 的**无连接器/无投机/无长注意力**整页前向，080 的 11 支上与请求侧标签 10/11 同判；但 081 的 **b3 = 窗口 1.112 s（快簇）而请求 8.686 s/页步（慢簇）**，b1/b2 同样是"窗口快、请求 mid"。⇒ **判态必须按请求测**（必守 25 配套 2 不变），窗口只用于描述"那次纯前向快不快"。
+6. **15 分钟内的第三个档位**：079 快档 1.3、080 慢档 9.8 之外，081 的 b1/b2/b5 稳定在 **3.4-3.7 s/页步**（单 boot 内三条独立读数一致：sweep 中位、主节拍、台账 `dt/步` 互差 ≤1%）⇒ 080 已有的"态会在 boot 内漂"要再软化为**"慢模态占比是时变量，boot 只是它的采样单位"**。
+7. **槽位选取门控交付**（`VLLM_KVMEM_SLOT_PICK=time|score`，默认 `time` = §5.3/§12.16 的旧行为逐字不动）：旧行 `selected = sorted(top_pages)[:len(stage.slots)]` 的真实规则是"**分数前 TOPN 名里页号最小的 PAGES 个**"，丢掉的高分页恰是深位针页（079/080 两次复现"TOPN 64→96 反把针页挤出槽"）；`score` 档 = 先按分数取满槽、再把中选者按页号升序排版 ⇒ **模型看到的仍是时间序窗口**（§5.1 的"query 位置与选择无关"不变式不破），只换"谁进槽"。CPU 单测 63 项证两档 **槽数 55 / `(group, block_id)` 覆盖 110 项 / 880 = 55×2×8 层页拷贝逐项相等**（必守 16⑨ 的"半覆盖伪装全成功"没有引入），针页时间序第 53/64（余量 2）→ 分数序取满后第 48/55（**余量 7**）；`TOPN` 抬到 96 时 `time` 档丢针、`score` 档免疫。在线自证行：`vllm-030win patch (step 081): slot pick=score req=… top_pages=64 slots=55 selected=55 needle=page 72 (token 104858) in_selected=True dropped=[…]`。
+
+**边界（勿误读）**
+
+* **"名集合不同"不等于"tactic 非确定"**：`--compare` 确实报出"只在 b4 出现 tile-112 变体、只在 b1 出现 tile-16 + `cublasLt::splitKreduce` + cutlass bf16 路径"，但两个 profile 窗的**工作负载混合不同**（页步 / verify 步比例、M 分布），humming 本就按 M 分 tile 档 ⇒ 这条**只能记为不可判**。本步的决定性证据是第 3 条的**同 launch 配置双峰**，它不依赖名集合差。
+* **profiler 可用但有代价边界**：本步量到的侵入度 ≤2%（窗前/中/后三发同形节拍，判据见步骤 081 第 4 条），但它的前提是 `with_stack=false` + `ignore_frontend=true`；打开栈回溯就不是这个数字。`profiler_out_<rank>.txt` 是固定名，**同 boot 第二个窗必须先改名**（`step081_boot.py prof` 已内置改名）。
+* **humming 的 config 选择入口**是 `get_heuristics_config(...)`（`humming/tune/__init__.py:134`，未显式给 `tuning_config` 时走它），且 `humming/ops/gemm.py:27` 接受显式 `tuning_config` ⇒ **082 若要"钉住 GEMM 变体"是有口的**（仓内 `vllm/model_executor/layers/fused_moe/experts/fused_humming_moe.py:191` 已是先例）。但**本步没有任何证据说是选择错了**，第 3 条说的是"同一选择下每次调用差 15×"，两者不要混。
+* **`SLOT_PICK=score` 的端到端 needle 判据本步未达成**（b5 = MISS，成因见下），**不得**引用本节点当"分数取槽已在线验过"。
+* **b5 的 MISS 是本步协议自伤，不是修法的失败**：探针前先跑了 5 发节拍请求，`VLLM_KVMEM_AUTHORITY_TRAJ=2` 只保两条轨迹的 raw-K 权威区 ⇒ 针轨迹的权威行被挤掉，serve 时 `baked 0 slot(s) … 880 layer-row(s) without authority row`。**教训一般化：视窗臂的探针之前不许插任何会入库的节拍请求**（一入库就占掉权威区的两条轨迹名额）。
+* **两条仪器缺陷**：`step080_boot.py` 的 `kvtime_loaded` 恒 False（横幅在 health 之后 ~24 s 才打，字段在 health 时点就读日志）⇒ 080 的"门控自证"入表硬门实际没被执行过，靠人工兜住；080 的 triton 缓存取证目录错（臂用 `C:\fi\.triton`，不是 shell 的 `~/.triton`），结论方向不变。
+
+**未验证项（082 的靶子，按顺序）**
+
+① **同 launch 配置双峰的定罪**：候选排序 = 权重页驻留（16 GB 卡上 11.46 GiB 权重 + 3.17 GiB KV 池 + 0.53 GiB 草稿 + 5 GiB 锁页工作区 + raw-K 权威区 = 必然超订，WDDM 只能把东西推来推去）> 数据相关分支 > 电源/时钟（后者已被 080 的带外指纹否）。判据 = 同一 `(shape, M)` 在"驻留被人为改变"的两种条件下（例如把 KV 池 / 工作区调小一档，或去掉一个竞争者）的时长分布是否合并成单峰。② `score` 档的 in-situ needle（净 boot、探针前零污染、≥2 次采样）。③ 多深度网格（前置卡点已由 ⑦ 解开，余量 2 → 7）。④ **"他占 GPU 客户端"仍未否证**：`nvidia-smi --query-compute-apps` 看不见 WDDM 图形/拷贝客户端；本步想用 PDH `GPU Engine(pid…,engtype…)` 补，venv 有 pywin32 但 `EnumObjectItems` arity 未探明、`typeperf` 通配符报 `No valid counters`。⑤ `record` 段在 079 六支旧 boot 上的回溯（旧日志无该段）。⑥ recent 滚动重烘焙、多轮 ΔP、装配探针在 1456 上的回归、阶段 1 出口五项。
+
+**工具与证据（本步新增，全留存）**：`tools/kvmem_boot_window.py`（离线读 autotune 窗，含"必须配对读 out/err 两个流"的处理）、`tools/kvmem_trace_budget.py`（trace → busy 区间并集 / 空隙 / host-API 分桶 / 提交延迟 / 切块 / top kernel，`--compare` 出名集合差与同名时长比）、`tools/serve_gsq_kvmem_viewport081_spec.cmd`（079 臂逐字 + `S081_PROF`/`S081_PICK`，非注释行 diff 只 4 处）、`tools/step081_boot.py`（新判态协议 + `Sweeper` + `prof` 窗 + 侵入度夹逼）、`tools/apply_kvmem_slot_pick_step081.py` + `tools/kvmem_slot_pick_test.py`（63 项，apply/revert 往返实测）。取证：`step081_b{1..6}_arm.{out,err}.log`、`step081_b{1,2,3,4}_timebudget.json`、`step081_b{1,4}_tracebudget.json`、`kvmem_k15{a..f}/prof/b{1,4}_w1_rank0.*.pt.trace.json.gz`（b1 877,340 事件 / b4 593,426 事件）、`step081_b{1,4}_engine_fp.csv`、`step081_b{1..6}_window.json`、`kvmem_k15{e,f}/vp081_vp081{a,b}_d80*.json`、`prod029_logs/step081_boots.json`。**离线可复算的原始数字**：`_tmp_line_b/s081_gate_profiler.py`（前提闸门）、`s081_trace_deepdive.py`、`s081_gemmpat.py`、`s081_onecfg.py`（双峰与位次稳定性）。dump 目录用到 `kvmem_k15a…k15f`。
+
 ---
 
 ## 11. 参考索引
