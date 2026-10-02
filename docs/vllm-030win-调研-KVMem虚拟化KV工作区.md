@@ -1436,6 +1436,34 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 ---
 
+### 12.25 ⭐步骤 082：移植验收收口——双峰定罪「驻留因果支持」；PDH 取证打通；score 网格 4/4 HIT 但欠 2 格（2026-10-02 深夜，用户令断电收兵）
+
+**路线性质重申**：本步是阶段 1 移植验收（082-A 排除/记录 ingest 性能风险、082-B 阶段 1 正确性网格、082-C 补充归因取证），不构成任何 KVMem 优化立项。
+
+**082-A（双峰定罪）——三值结论 = `驻留因果支持`**：
+
+- 仪器：`tools/kvmem_bimodal082.py`（锚定 081 同一 `(humming Shape<0,34816,5120>, grid [70,1,1], block [384,1,1])`；081 b1 已知读数逐字复现校验通过：快簇 5.149 ms×1328 / 慢簇 77.671 ms×720 / 比值 15.09 / 每前向 modal 23 min19 max23）；`tools/serve_gsq_kvmem_viewport082_spec.cmd`（= 081 臂逐字 + `S082_KVMB`/`S082_WSMB`，非注释 diff 4 处）；`tools/step082_boot.py`（= 081 协议逐字 + PDH 线程）。
+- 条件（每条件降级预算 2 boot，正序 + 反序两轮交叉防时段漂移）：**A0** 基线（081 臂逐字默认）；**A1** `S082_KVMB=3000000000`（KV 池 3.4e9→3.0e9，**纯驻留 A/B**：页长 1456 不变、请求路径不变、AOT 键不变——b2/b7 `compiling_n=0`）；**A2** `S079_SPEC=0`（去草稿 0.53 GiB，机制隔离）；**A3** `S079_RAWK=0`（摘 capture/D2H 路径，机制隔离）。
+- 结果（每 trace 锚配置 n=2432 = 38 前向 × 64 调用，`fallback=False` 全 8 支）：**A0 两支全双峰**（b1 mid 态：快簇 5.14 ms×1762 / 慢簇 99.93 ms×670 = 19.4×，慢占计数 27.6% / 时间 88.6%，每前向 modal 20、稳定度 0.816；b8 全慢态 9.90 s/页步：83.74 ms×850、34.9%/89.3%、modal 23、慢位次 6/12/14/16/18/20 全 1.0）；**六个缓解 boot 全部零慢调用**（单峰合并，max 5.2-14.8 ms；页步 1.16-1.46 s fast）。慢簇中位沿基线族连续（081 b1 77.67 → 081 b4 82.81 → 082 b8 83.74 → 082 b1 99.93 ms），快簇 5.14-5.60 ms 全条件不动。
+- 归因链：交叉顺序排除时段漂移（b5-b7 于 22:15-22:40 全 fast，b8 于 22:45 落全慢态）；**A1 单独生效 ⇒ 约 0.4 GiB 余量就是悬崖宽度**；A2/A3 证实"任何降低 GPU 侧/链路压力的改动都消除慢模态"（机制隔离，不参与纯驻留归因）。**边界（勿误读）**：本结论说"慢模态由驻留压力因果驱动"，**不**说 humming"选错了 kernel"（081 的口径不变：同一选择下每次调用差 15×）；也不给出"生产应该缩池"的建议（缩池换余量 = 待授权项）。
+
+**082-C（PDH 取证）——GO**：
+
+- 工具 `tools/pdh_gpu_engine.py`。**081 四探针真败因更正**：`win32pdh.EnumObjectItems` 的 machine 参数必须传 `None`，081 传的空串被当成远程机器名报 buffer-size 错——不是本地化（本机对象名就是英文 `GPU Engine`）、不是 arity。**第二条坑**：`Utilization Percentage` 是速率计数器，同一查询句柄须 Collect ≥2 次才有真值 ⇒ 每 tick 重建查询恒 0，必须持久句柄（首版踩过，`eng` 恒空）。
+- 实战读数：所有采样窗内**除引擎外无 GPU 客户端**（b8 慢态窗：引擎 3D 均值 88.9%/max 100%，其余 pid 均值 ≤0.01%/max 0.0%）⇒ 必守 26④ 的"他占客户端"候选由无效否证升级为**有效否证**。引擎 local 15.50-15.60 GiB + non_local 8.36-8.41 GiB、committed 总 24 GiB 对 16 GB 物理 = **结构性超订直接可见**；**边界**：non_local 含 8 GiB kv-offloading 主机池（WDDM 记为该进程 shared 面），判"权重页降级"要看动态增量；实测稳态窗 local 15.53 GiB 零瞬态下探 ⇒ **PDH 粒度看不到页故障级动态**，降页取证不能只靠 PDH 绝对值。
+
+**082-B（score 网格）——INCOMPLETE（机制再证 GO、欠 2 格）**：
+
+- 已完成：**b9 d0.40 双发双 HIT**（TTFT 98.6/242.1 s、指纹 `recent_tokens=16384`、finish=length、`baked 55×[6,7]=880 copies` 0 缺 authority、`read-back 110 checked 0 mismatch`）+ **b11 d0.70 双发双 HIT** ⇒ score 档累计 6/6（含 081 b6）。
+- 欠账：**b10 d0.55 = 0/2**（慢态 boot 三段探针 ingest/flush/serve 各 ~198k token，~45 分钟超出驱动默认 2400s 超时被杀）与 **b12 d0.85 未跑**（断电收兵）。补测 = 净 boot（`--sweep 0 --no-main`）+ `--timeout 7200`，脚本 `_tmp_line_b/roundB2_082.py` 已备（b13/k16m 起）。**不得以 4 格外推召回率。**
+- 仪器坑：`in_selected=-`（臂未设 `VLLM_KVMEM_SLOT_PICK_NEEDLE`，该诊断字段无效，不影响判定）；A3 臂 autotune 窗读数失真（window 1.76-1.85 "mid" 而请求侧全 fast）——必守 26①"窗不能当判态器"再添一证。
+
+**阶段 1 出口清单状态**：identity canary、紧预算 needle、冷 262K transcript、多轨迹/串台、1456 页长装配回归 **未做**；082-A 有效结果 **已做**；082-B **欠 2 格**。出口达成后冻结 KVMem 线回原项目主线。
+
+**证据**：`prod029_logs/step082_boots.json`（8 A-boot + B 台账）、`step082_b{1..8}_pdh.jsonl`、`step082_b{1..8}_arm.{out,err}.log`、`kvmem_k16{a..l}/`（dump + prof trace 8 支 + vp json 4 份）、`_tmp_line_b/round{1,2,B,B2}_082.py` + `roundB_082.log`、`bimodal_082_all.json`（8 trace 终表）。boot 号：b1-b8 = A 轮（k16a-k16h），b9-b12 = B 网格（k16i-k16l，b12 未完成）。生产默认未动；收兵时 kill 全部孤儿、独显回落 85 MiB；**断电未恢复生产，下次上电先跑 `tools/prod_watchdog.ps1`**。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |

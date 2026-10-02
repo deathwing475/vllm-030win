@@ -82,11 +82,12 @@ class PdhThread:
         self.rows = 0
 
     def _loop(self) -> None:
-        from pdh_gpu_engine import sample_once
+        from pdh_gpu_engine import EngineUtilQuery, sample_once
+        engq = EngineUtilQuery(None, PDH_LUID)  # 速率计数器须持久句柄
         fh = open(self.path, "a", encoding="utf-8")
         while not self._stop.is_set():
             try:
-                row = sample_once(None, PDH_LUID)
+                row = sample_once(None, PDH_LUID, engq)
             except Exception as exc:  # noqa: BLE001
                 row = {"pdh_err": repr(exc)[:200]}
             row["ts"] = time.strftime("%H:%M:%S")
@@ -98,6 +99,7 @@ class PdhThread:
                 pass
             self._stop.wait(self.interval)
         fh.close()
+        engq._close()
 
     def __enter__(self) -> "PdhThread":
         self._t = threading.Thread(target=self._loop, daemon=True)
