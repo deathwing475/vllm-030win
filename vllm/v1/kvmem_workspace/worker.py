@@ -110,6 +110,20 @@ class KVMemWorkspaceWorker:
         self.bytes_stored = 0
         self.store_seconds = 0.0
 
+        # vllm-030win step 079 timing instrumentation (env-gated).
+        # ``storing`` is the store window as it already stands; ``copy``
+        # and ``selftest`` are cut out of it so the entry-building Python
+        # (storing - copy - selftest) and the selftest's device sync are
+        # visible separately, and ``load`` splits the assembly side out
+        # of store_seconds (078: both directions share that accumulator).
+        self._kvtime: dict[str, float] = {}
+        self._kvtime_n: dict[str, int] = {}
+        self._kvtime_prev: dict[str, float] = {}
+        self._kvtime_prev_n: dict[str, int] = {}
+        self._kvtime_wall = 0.0
+        self._kvtime_enabled = config.timing_enabled()
+        self._kvtime_every = max(1, config.timing_every())
+
         # K3: retrieval index (host-resident) and the trailing query span of
         # the most recent prefill step of each trajectory.
         self._index: KVMemMeanKIndex | None = None
@@ -826,7 +840,9 @@ class KVMemWorkspaceWorker:
         not reach the index or the authority. Only the query tail is kept, for
         scoring.
         """
+        _s79 = time.monotonic()
         step = capture.drain()
+        self._kvtime_add("drain", _s79)
         if not step:
             return
         if self._index is None:
@@ -912,7 +928,9 @@ class KVMemWorkspaceWorker:
             )
             stage = stage_by_req.get(request.request_id)
             if stage is not None:
+                _s79 = time.monotonic()
                 self._stage_in(stage, report)
+                self._kvtime_add("bake", _s79)
         self._score_seconds += time.monotonic() - started
 
     def _stage_in(self, stage, report: dict) -> None:
@@ -1104,13 +1122,135 @@ class KVMemWorkspaceWorker:
     def retrieval_reports(self) -> list[dict]:
         return self._retrieval_reports
 
+    # ------------------------------------------------------------------
+    # vllm-030win step 079 timing instrumentation (VLLM_KVMEM_TIMING, off by default).
+    # ------------------------------------------------------------------
+
+    _KVTIME_SEGMENTS = (
+        "drain",
+        "sync",
+        "copies",
+        "ingest",
+        "fold",
+        "storing",
+        "selftest",
+        "copy",
+        "score",
+        "bake",
+        "snap",
+        "load",
+        "save",
+    )
+
+    def _kvtime_add(self, key: str, started: float) -> None:
+        """Accumulate one segment. Host monotonic only, never syncs."""
+        if not self._kvtime_enabled:
+            return
+        now = time.monotonic()
+        self._kvtime[key] = self._kvtime.get(key, 0.0) + (now - started)
+        self._kvtime_n[key] = self._kvtime_n.get(key, 0) + 1
+
+    def _kvtime_bump(self, key: str, amount: int = 1) -> None:
+        """Count something that has no duration of its own."""
+        if not self._kvtime_enabled:
+            return
+        self._kvtime_n[key] = self._kvtime_n.get(key, 0) + amount
+
+    def _kvtime_step(self) -> None:
+        """Emit one [KVTIME] line every VLLM_KVMEM_TIMING_EVERY steps.
+
+        Absolute accumulators plus this window's increment, so the reader
+        gets ``d<segment>/dt`` without offline differencing. The line
+        reads Python floats only -- no tensor, no stream query, no device
+        sync -- because a timer that changes the thing it measures is
+        worth nothing (step 078's boot-state spread is exactly what is
+        being sampled here).
+        """
+        if not self._kvtime_enabled:
+            return
+        steps = self._kvtime_n.get("save", 0)
+        if steps % self._kvtime_every:
+            return
+        now = time.time()
+        first = self._kvtime_wall == 0.0
+        dt = 0.0 if first else now - self._kvtime_wall
+        acc = dict(self._kvtime)
+        acc["fold"] = acc.get("ingest", 0.0) - acc.get("drain", 0.0)
+        _cap0 = capture.stats()
+        acc["sync"] = float(_cap0.get("drain_sync_seconds") or 0.0)
+        acc["copies"] = float(_cap0.get("drain_copy_seconds") or 0.0)
+        acc["score"] = self._score_seconds  # existing: score + bake
+        counts = self._kvtime_n
+        if first:
+            # Once per boot: prove the patched code is the code running.
+            logger.info(
+                "vllm-030win patch (step 079): [KVTIME] patch loaded: "
+                "every=%d selftest=%d bake_verify=%d pid=%d "
+                "page_bytes=%s layers_per_group=%s store_groups=%s "
+                "armed=%s geometry=%s",
+                self._kvtime_every,
+                int(config.roundtrip_selftest()),
+                int(config.bake_verify()),
+                os.getpid(),
+                {g: int(b) for g, b in self.page_bytes.items()},
+                {
+                    g: len(v)
+                    for g, v in self._layers_per_group.items()
+                },
+                sorted({group for group, _ in self._host}),
+                capture.stats().get("armed_counts"),
+                capture.stats().get("geometry"),
+            )
+        parts = [
+            f"wall={now:.3f} dt={dt:.3f} "
+            f"dsteps={steps - self._kvtime_prev_n.get('save', 0)}"
+        ]
+        for key in self._KVTIME_SEGMENTS:
+            value = acc.get(key, 0.0)
+            count = counts.get(key, 0)
+            parts.append(
+                f"{key}={value:.3f} "
+                f"d{key}="
+                f"{value - self._kvtime_prev.get(key, 0.0):.3f} "
+                f"n{count} "
+                f"dn{count - self._kvtime_prev_n.get(key, 0)}"
+            )
+        ratio = (acc.get("save", 0.0) / dt) if dt > 0 else 0.0
+        parts.append(f"acc={ratio:.3f}")
+        parts.append(f"bytes={self.bytes_stored / 1048576.0:.1f}MiB")
+        parts.append(
+            f"copy_calls={counts.get('copy', 0)} "
+            f"entries={counts.get('entry', 0)} "
+            f"busy={counts.get('busy', 0)}"
+        )
+        cap = capture.stats()
+        parts.append(
+            "cap(unarmed=%d decode=%d)"
+            % (
+                cap.get("skipped_unarmed_steps") or 0,
+                cap.get("skipped_decode_steps") or 0,
+            )
+        )
+        self._kvtime_prev = acc
+        self._kvtime_prev_n = dict(counts)
+        self._kvtime_wall = now
+        logger.info(
+            "vllm-030win patch (step 079): [KVTIME] " + " | ".join(parts)
+        )
+
     def wait_for_save(self) -> None:
+        _s79_save = time.monotonic()
         metadata = self._pending
         self._pending = None
         if metadata is None:
+            self._kvtime_add("save", _s79_save)
+            self._kvtime_step()
             return
+        self._kvtime_bump("busy")
         if getattr(metadata, "spans", None):
+            _s79 = time.monotonic()
             self._ingest(metadata)
+            self._kvtime_add("ingest", _s79)
         if getattr(metadata, "score_requests", None):
             self._score(metadata)
         if not metadata.store_jobs:
@@ -1130,11 +1270,16 @@ class KVMemWorkspaceWorker:
                                 self.page_bytes[page.group_id],
                             )
                         )
+                _s79 = time.monotonic()
                 self._copy(entries)
+                self._kvtime_add("copy", _s79)
+                self._kvtime_bump("entry", len(entries))
+                _s79 = time.monotonic()
                 if config.roundtrip_selftest():
                     self._run_selftest(job)
                 if config.authority_enabled() and config.roundtrip_selftest():
                     self._run_remat_selftest(job)
+                self._kvtime_add("selftest", _s79)
                 event = torch.cuda.Event()
                 event.record()
                 self._events[job.job_id] = event
@@ -1144,11 +1289,16 @@ class KVMemWorkspaceWorker:
                     for p in job.pages
                 )
             self.store_seconds += time.monotonic() - started
+            self._kvtime_add("storing", started)
         # Step 066: loads are issued from ``start_load_kv`` (see there), so a
         # load job can never race the snapshot ring evicting the boundary it
         # reads -- loads run at the start of a step, snapshots at its end.
         if getattr(metadata, "snapshot_requests", None):
+            _s79 = time.monotonic()
             self._take_snapshots(metadata.snapshot_requests)
+            self._kvtime_add("snap", _s79)
+        self._kvtime_add("save", _s79_save)
+        self._kvtime_step()
 
     def _run_loads(self, load_jobs) -> None:
         """Copy workspace pages and mamba snapshots into request blocks.
@@ -1225,6 +1375,7 @@ class KVMemWorkspaceWorker:
                 job.num_tokens,
             )
         self.store_seconds += time.monotonic() - started
+        self._kvtime_add("load", started)
 
     def _take_snapshots(self, snapshot_requests) -> None:
         """Copy the mamba state slots at page-aligned boundaries to the host.
@@ -1426,6 +1577,14 @@ class KVMemWorkspaceWorker:
             "index": self._index.stats() if self._index is not None else None,
             "score_seconds": round(self._score_seconds, 3),
             "retrieval_reports": len(self._retrieval_reports),
+            "kvtime": {
+                "enabled": self._kvtime_enabled,
+                "every": self._kvtime_every,
+                "seconds": {
+                    k: round(v, 3) for k, v in self._kvtime.items()
+                },
+                "counts": dict(self._kvtime_n),
+            },
             "authority": {
                 "enabled": config.authority_enabled(),
                 "trajectories": len(self._authority),

@@ -62,6 +62,7 @@ not expect prompt tokens from records nothing, whatever its size.
 from __future__ import annotations
 
 import numpy as np
+import time
 import torch
 
 from vllm.logger import init_logger
@@ -75,6 +76,9 @@ _LOGGED = False
 _SKIPPED_DECODE = 0
 _SKIPPED_UNARMED = 0
 _MROPE_AXES_DIFFER = 0
+# vllm-030win step 079 timing instrumentation: drain(), split.
+# A dict so the loop below needs no ``global`` statements.
+_DRAIN_ACC: dict[str, float] = {"sync": 0.0, "copies": 0.0}
 # Step 075: the token counts the connector expects to compute in the step about
 # to run (its prefill spans). None = the connector has not armed this step, so
 # nothing is recorded. An explicit allow-list is the only rule that survives
@@ -239,13 +243,21 @@ def drain() -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
     # from a CUDA graph, so the number of calls the allow-list rejected is a
     # direct read on whether decode is actually running inside the FULL graph:
     # 0 means graphed, anything else means it fell back to eager.
+    _t079 = time.monotonic()
     out: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    _split = False
     for layer_idx, (positions, q_tail, k) in stash.items():
+        _pos = positions.cpu().numpy()
+        if not _split:
+            _DRAIN_ACC["sync"] += time.monotonic() - _t079
+            _split = True
+            _t079 = time.monotonic()
         out[layer_idx] = (
-            positions.cpu().numpy(),
+            _pos,
             q_tail.cpu().to(torch.float16).numpy(),
             k.cpu().to(torch.float16).numpy(),
         )
+    _DRAIN_ACC["copies"] += time.monotonic() - _t079
     if not _LOGGED:
         _LOGGED = True
         num_heads, num_kv_heads, head_dim = _GEOMETRY or (0, 0, 0)
@@ -284,6 +296,8 @@ def stats() -> dict:
         "armed_counts": sorted(_ARMED) if _ARMED else _ARMED,
         "mrope_axes_differ": _MROPE_AXES_DIFFER,
         "geometry": _GEOMETRY,
+        "drain_sync_seconds": round(_DRAIN_ACC["sync"], 3),
+        "drain_copy_seconds": round(_DRAIN_ACC["copies"], 3),
     }
 
 

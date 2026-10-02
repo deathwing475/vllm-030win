@@ -349,6 +349,27 @@ def viewport_retrieval_pages() -> int:
     return _env_int("VLLM_KVMEM_VIEWPORT_PAGES", 55)
 
 
+def timing_enabled() -> bool:
+    """vllm-030win step 079 timing instrumentation: the [KVTIME] ledger.
+
+    Off by default: with the gate off every ``_kvtime_*`` helper in
+    worker.py returns on its first statement, so the only cost left in
+    the hot path is a few ``time.monotonic()`` locals. Revert with
+    tools/apply_kvmem_timing_step079.py revert.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_TIMING", "0")))
+
+
+def timing_every() -> int:
+    """``wait_for_save`` calls between two [KVTIME] lines.
+
+    ``_env_int`` rejects <= 0, so the smallest interval is one step. A
+    60K-token ingest is ~42 page steps, so 50 would print nothing at all
+    -- the step 079 arm sets 25.
+    """
+    return _env_int("VLLM_KVMEM_TIMING_EVERY", 50)
+
+
 def sweep_enabled() -> bool:
     """Store the pages a finished request still holds (step 072).
 
