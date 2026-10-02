@@ -1259,6 +1259,73 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 ①窗外 needle 判据在投机臂上跑通（同 nonce + flush + 指纹确认走视窗）；②ingest 6× 慢的归因与修复；③`_retained_by_block_id` 改组号键；④命中率统计（多深度 × 多 nonce）、`VIEWPORT_PAGES`/`_RECENT` 预算扫描、recent 滚动重烘焙、多轮 ΔP、GPU 化烘焙——**全部仍未做**。
 
+## 12.20 步骤 078：窗外 needle 判据在**带投机的臂**上 GO；但 077 的"ingest 慢 6×"作为**配置属性**的前提被实测推翻
+
+**零代码改动**：本步没动 `vllm/` 任何文件（引擎、连接器、`kvmem_workspace/` 全未改），只新增两个工具——变体臂 `tools/serve_gsq_kvmem_viewport078_spec.cmd`（`S078_TAG`/`S078_SPEC`/`S078_RAWK`/`S078_AUTH`/`S078_WS` 全部可用环境变量注入，一次 peel 不必新建文件）与单请求节拍探针 `tools/kvmem_ingest_cadence.py`（客户端 `TTFT / ceil(tokens/页长)` + 引擎侧 `capture drain` 相邻差的中位/p10/p90 两个独立读数）。
+
+### 12.20.1 ⭐判据达成（b2 = `kvmem_k12c`，nonce `vp078a`，200,000 tokens / depth 0.65）
+
+074 的四条判据（窗外 needle 命中 / 输出连贯 / 装配链不回归 / 双 boot）逐条对账：
+
+| 判据 | b2 实测 |
+|---|---|
+| 窗外 needle | 针 token **125,370**（页 88，`in_window=False`）；serve 输出 `"\n\n77349"`、`needle_hit=true` |
+| 连贯 | `finish_reason=stop`、6 chunk、无 `ignore_eos`（与 074 boot2 同形态） |
+| 走了视窗（必守 16⑦） | 三份检索报告指纹 = ingest `32768` / flush `32768` / **serve `16384`**；且 serve 有 `rewritten onto the compressed window: 198184 -> 97920` |
+| 逐组覆盖（必守 16⑨） | `stage-in plan: 55 slot(s) x 2 group(s) = 110 block(s) ... (covered [6, 7])` → `baked 55 slot(s) x group(s) [6, 7] = 880 layer-page copie(s) in 7.02 s; 1407.7 MiB written, read-back 110 checked 0 mismatch` |
+| 全图兼容（必守 21） | 340 条 drain 全部 `0 single-token call(s) + 0 call(s) outside armed sizes`，serve 的 decode 是 `num=3` 的 verify 步 ⇒ 投机解码仍在图上 |
+| 装配链 | 本步零代码改动 ⇒ 无回归对象；未重跑装配探针（见 12.20.5） |
+| 双 boot | **b2（快 prefill 态）+ b3（慢 prefill 态）两支都命中**，见 12.20.2 表与 §12.20.2 末段 |
+
+算术自证：1407.7 MiB / 074 的 1376.7 MiB = **1.0225** = 页长 1456/1424 ⇒ 覆盖量与 074 完全同构，只是页更长。收益账：同一 prompt **原生 ingest 258.994 s** vs **视窗 serve TTFT 105.066 s**（40.6%），页 88 在 serve 打分里排 **top-64 第 40**（074 是第 9），仍在 `sorted(top)[:55]` 的预算内。
+
+**b3 = 慢 prefill 态的第二支 boot，判据同样成立**：`needle_hit=true`、`text="\n\n77349"`、`finish=stop`、5 chunk、`stage-in plan 55 x 2 = 110 (covered [6,7])`、`baked 880 copies in 6.94 s / 1407.7 MiB / read-back 110 checked 0 mismatch`、页 88 排**第 39**、指纹 `recent_tokens=16384`、ERROR/Traceback 各 0、347 条 drain 全 `0 + 0`。两态对照给了这条线最重要的一句结论：**慢态吃掉的是绝对时间，不是 KVMem 的相对收益**——省下的 prefill 比例在快/慢两态分别是 **40.6%**（105.066 / 258.994）与 **48.6%**（608.063 / 1250.341）。
+
+### 12.20.2 ⭐"ingest 慢 6×"不是配置属性——四 boot 对照（同一 launcher、同一 AOT 缓存）
+
+| boot | 页步（1456 tok） | 8k decode | 采法 |
+|---|---|---|---|
+| 077 boot6（`k11b`） | **11.0 s** 中位（p10 10 / p90 11，自第 11 步起恒定，201 条 drain） | 103.67 / 108.10 | 077 据此写下"慢 6×" |
+| 078 b1（`k12b`） | **1.42 s**（客户端 44.058 s / 31 步；drain 中位 1 s） | 未测 | cadence 探针 |
+| 078 b2（`k12c`） | **1.89 s**（ingest 258.994 s / 137 步；drain 中位 2 s、p90 2 s） | **62.03 / 62.82 / 64.00** | 三请求全流程 |
+| 078 b3（`k12d`） | **9.13 s**（ingest 1250.341 s / 137 步；drain 中位 9.0 / p10 8 / p90 10；冷 8k TTFT 47.844 s / 5.6 步同向） | **104.44 / 108.85 / 111.67** | 锚点在 ingest 之前 + 三请求全流程 |
+
+⇒ 077 的"投机 × 连接器 ⇒ ingest 慢 6×"**作为配置结论作废**：完全同一份 launcher（只差 dump 目录与 077 那条已 revert 的 `VLLM_SCHED_TRACE` env）在 boot 之间跳 1.4 ↔ 11 s，跨度 7.8×。b2 的 1.89 s/步与 074 的 ~1.7 s/步（页长 1424）同量级 ⇒ **074 与 077 之间的"6×"是 boot 态差，不是投机差**。
+
+同时暴露一条新的、更硬的现象：**同一臂的 prefill 与 decode 在 boot 之间呈反相关**（慢 prefill ↔ 快 decode：boot6、b3；快 prefill ↔ 慢 decode：b1、b2），n=4 各两例。decode 差不是投机失效：b2 `accepted/draft_tokens = 429/718 = 0.597`（每步多产 1.195 token）、boot6 = 415/736 = 0.564（1.126），几乎相同，但 256-token 段的每 token 墙钟差 1.7× ⇒ 差在 GPU 侧执行速率。
+
+### 12.20.3 慢态的指纹（实测，未定罪）
+
+在 b3 的慢态 ingest 期间外置观测（`nvidia-smi`，5 s 一次）：
+
+- **`utilization.gpu` 100%、`clocks.sm` 3060-3067 MHz（=boost）、`memory.used` 15,834 MiB、`temperature` 55 °C**，但 **`utilization.memory` 只有 1%、功耗 82-105 W**（power limit 350 W）。
+- **PCIe 链路 `gen.current=5 / width.current=16`，与 `max` 相同** ⇒ "链路降速"当场否掉。
+- 六个 boot 的宿主页日志逐字相同：`200 host slots (2.50 GiB pinned)` ×2 组，且**没有任何** `pinned host allocation ... falling back to pageable` 警告 ⇒ `worker._alloc_host()` 的 pageable 回退这条解释**否掉**。
+- 启动横幅无可观测差：`Initial free memory 14.68 GiB` / `GPU KV cache size 234,000 tokens` / `num_gpu_blocks=253` / `reserved 3.17 GiB` / `compilation 4.39-5.08 s` 两态一致；pin_shim 日志 `PIN_MOVED p=pass1 moved=44 params=113 skipped=4 mb=545` 在 boot6 与 b2 逐字相同 ⇒ 快慢态钉（030/033/044 那条 WDDM 掷骰子线）**不是**这次的开关。
+⇒ 慢态画像 = **"kernel 常驻但不烧算力也不烧显存带宽"的等待型**，不是算力型也不是带宽型；与"显存被挤"（049 判据）也不同向。每步入库量算术：一个 slot = 25.59 MiB（每组 8 层 × page 1,677,312 B × 2 组），`wait_for_save` 把 16 条 `(src_ptr, dst_ptr, 1,677,312 B)` 交给 `ops.swap_blocks_batch` 一次发完 ⇒ 若 8 s 全花在入库上，等效带宽 3.3 GB/s（远低于 Gen5 x16 与该路径的量级）⇒ 时间**大概率不在**拷贝本身，但**没有计时证据**，本步不定罪。
+
+现成的读数拿不到：`worker.stats()` 里有 `store_seconds`/`bytes_stored` 累加器，但 `KVMemConnector.workspace_stats()` **全仓无调用者**（既没接路由也没落文件）⇒ 079 的第一手工具 = 给它加一条门控日志（或直接在 `wait_for_save` 处按 50 步打一条），并配 revert 脚本。
+
+### 12.20.4 12.19.5 里第③条（`_retained_by_block_id` 改组号键）**前提不成立，不动代码**
+
+077 的担心是"组 6/组 7/组 8 的块号可能同号 ⇒ 假命中"。核账结果相反：
+- `kv_cache_coordinator.py:99` **全引擎只有一个 `BlockPool`**；`kv_cache_utils.py:166` 明写 `block_id` = "ranging from 0 to num_gpu_blocks - 1"，`KVCacheBlock` 是**终身对象、id 固定**，不随组重新编号。
+- 发出侧 `kv_cache_manager.py:895` 用的是 `block.block_id`（同一个全局 id），登记侧 `manager.py:321` 用 `block.block_id` 存**同一个对象** ⇒ 两侧同一命名空间，`block_id` 单独作键已经无歧义。
+- 反而**改成 `(group_id, block_id)` 会立刻坏**：`register_workspace_retained_blocks(blocks)` 只收到块对象、拿不到组号 ⇒ 登记键与查回键不同 ⇒ 每次查回都 miss，块既不被 copy 也不 `free_blocks` ⇒ **真块泄漏**（077 修的正是泄漏）。
+⇒ 结论：登记未修的判断作废；`KeyError: 8` 那类跨组误认领已经由 077 的 `self.group_ids` 过滤修掉，键本身不需要动。
+
+### 12.20.5 本步的边界（勿误读）
+
+1. **"判据 GO"只覆盖 depth 0.65 × nonce `vp078a`/`vp078b` 两点**，与 074 的"一个深度 × 两个 nonce"同规格；页 88 的排名在投机臂上从第 9 掉到第 40 ⇒ **离 55 槽预算只剩 15 名余量**，命中率统计（多深度 × 多 nonce）欠得比 074 更紧了。
+2. **cadence 的 1.42 s（b1）与 1.89 s（b2）不可当"臂的 ingest 速度"**——同一配置能出 1.4 也能出 11，任何 ingest/TTFT 数字**必须先报页步中位再报结论**，且要 ≥3 boot。
+3. **"慢态成因"未定位**：本步只否掉了 pageable 回退、PCIe 降速、显存被挤、pin 快慢态、配置差（投机）五条候选，**没有**正面定罪。
+4. **b3 的判据落在慢态** ⇒ 它证明的是"**正确性与 boot 态无关**"（慢 boot 也能读出窗外针），**不**构成性能证据；两支的绝对时间差 5.8×（serve 105 s vs 608 s）。
+5. **证据目录卫生（发现一处历史违例）**：`prod029_logs/kvmem_k9b/` 的 `kvmem_retrieval_00{1,2,3}.json` 与 `kvmem_remat_*` 时间戳是 **10-01 22:28-22:39（077 的 `k9g` 回归跑）**，而 `vp074b.json` 是 10-01 19:25 ⇒ 074 boot2 的检索证据已被 077 复跑覆盖（必守 16⑧）。**读 074 的打分排名请以《实验步骤文档》步骤 074 的原文为准**，不要以 `kvmem_k9b` 目录当前文件为准。
+
+### 12.20.6 未验证项（079 的靶子）
+
+①给 `workspace_stats()`/`wait_for_save` 出门控计时日志，在**慢态 boot** 上读 `store_seconds` 与步时之比（先判"时间在哪"再谈修法）；②若入库不是主因，同法判 `capture.drain` 与 `_ingest`（raw-K 折叠）两段；③prefill↔decode 反相关需要 n≥6 才谈"规律"，每次 boot 必须两个都测；④命中率统计（多深度 × 多 nonce）、`VIEWPORT_PAGES`/`_RECENT` 预算扫描、recent 滚动重烘焙、多轮 ΔP、GPU 化烘焙、装配探针在新页长（1456）上的回归——**仍全部未做**（①②是本线交付形态的前置：KVMem 的卖点是"免全量重 prefill"，若慢态随机出现，收益账不能算）。
+
 ---
 
 ## 11. 参考索引
