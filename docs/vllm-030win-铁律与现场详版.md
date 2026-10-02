@@ -1,0 +1,144 @@
+# 铁律与现场详版 — vLLM 0.30-on-Windows 迁移（全文；2026-10-02 步骤 078 收尾时由《交接提示词.md》整体转来）
+
+> **本文的角色 = 参考全文，不再是开场提示词**。开场提示词（只含索引 + 头名任务）= **[《交接提示词.md》](交接提示词.md)**。
+> **为什么会有这份**：提示词连续四步膨胀（30 → 32 → 35 → 40 KB，目标 ≤14 KB），2026-10-02 用户指令「**提示词只需要留一些索引和下一步该做什么，剩下的全部分到其他的文档里面**」⇒ 全文整体转存到本文，提示词重写为索引版。
+> **锚点约定（重要，别踩）**：其它文档里所有「**必守 N**」「**必守 16⑦**」「**关键机制 N**」的历史引用，**指的就是本文的同一编号**（编号未变、内容未删）。本文与《交接文档.md》/《进度文档.md》可能重复，**冲突时以本文的纪律条目为准，以《交接提示词.md》的"当前状态/下一步"为准**（本文的 §当前状态 与 §下一步 是 078 收尾那一刻的快照，会过时）。
+> **拆分时被移除的旧头部原文（零删减留档，勿再找 git）**：标题行 `# 新会话提示词 — vLLM 0.30-on-Windows 迁移（2026-10-02 更新）`；`> 本文的定位 = 提示词，不是文档：只放"接手必须在开场知道"的东西；历次收档、已结案总览、挂账观察、历史沿革全在《交接收档存档.md》。`；`> 用法：新会话开场把本文全文发给 AI。本文自包含。`；`你是 vLLM 0.30-on-Windows 迁移战役的执行者。先读这五样再动手（都在 G:\qwen3.8model\vllm-030win-git\docs\）：①《交接文档.md》②《进度文档.md》③《实验日志.md》④《实验步骤文档.md》⑤《锚点采集协议.md》。**近期细节** = 《交接收档存档.md》；**KVMem 设计权威** = 《vllm-030win-调研-KVMem虚拟化KV工作区.md》（**接手 KVMem 线先读 §12.8（062 偏置结案）与 §12.7（061 K3 前半），再读 §12.5/§12.6（060 K1/K2）、§5.1、§12.1-12.3**）。`——其中"先读这五样"的阅读顺序已被索引版《交接提示词.md》§4 的分工表取代；该处的 KVMem 阅读顺序（§12.7/§12.8）也已过时，**KVMem 线现在先读 §12.20（078）与 §12.19（077）**。
+
+
+> **⭐⭐仓库纪律（最高优先级）**：**唯一远程仓 = `github.com/deathwing475/vllm-030win`**（本地记录仓 `G:\qwen3.8model\vllm-030win-git`，分支 `main`；**代码 `vllm/`（0.29.0 底座 + 全部移植，5106 文件）+ `docs/` + `tools/` 同仓同分支**）。**每一次确定的改动都必须 commit 并 push（`git push origin main`）——禁止只提交本地仓**。底座仓 `vllm-029base-git` 已降级为本地工作区/历史归档（**无远端**），其中产生的 commit 必须**立即 cherry-pick 进记录仓**。详见「必守」第 3 条。
+
+> **⭐收尾规范**：每一步做完该更新哪些文件、各写到什么颗粒度、怎么自检，见 **[《vllm-030win-任务收尾规范.md》](vllm-030win-任务收尾规范.md)**（本文末尾也有链接）。
+
+> **读法**：本文是**按需查**的全文参考——开场只读《交接提示词.md》（索引 + 头名），遇到"某条纪律原文/某个数字出处/某次 boot 用的哪个臂"再回到本文。**历次收档、已结案总览、挂账观察、历史沿革在《交接收档存档.md》**，逐步数据在《实验步骤文档.md》。
+
+---
+
+以下正文 = 2026-10-02（步骤 078 收尾）时《交接提示词.md》的全文快照。其中「**当前状态 / 关键机制 / 关键路径 / 必守 / 下一步**」是本文的本职（纪律与现场细节的权威出处）；**§ 下一步 与 § 当前状态的"头名/生产态"会过时，一切以《交接提示词.md》为准**。
+
+## 使命
+
+把现役 vLLM 0.27.1 Windows 自研栈迁到 **SystemPanic vllm-win 0.29.0 底座**，甄选移植 0.30 功能，服务 **G:\qwen3.8model\Qwen3.8-27B-3Bit-GSQ**（compressed_tensors WNA16 int3 g128 + embed int4 g64，lm_head int3 走 GPTQ-marlin）。**deadline 2026-10-30（新 27B 发布即止损）；10-18 硬承诺（生产等价+切换）已于 09-26 提前 22 天收口。**
+
+## 当前状态（勿重复劳动）
+
+**✅ 生产运行在 0.29 栈（046 = bf16 ssm + L=163,072）**：入口 `G:\qwen3.8model\Qwen3.8-27B-3Bit-GSQ\run_dflash2_n2_base029.cmd`（shim→`tools/serve_gsq_prod029_n2.cmd`）；配置 = spec DFlash2 gptq3c **N=2** + nvfp4 KV + **手动池 3.4e9** + **FULL_AND_PIECEWISE（无 compilation-config）** + prefix-cache + offload 8G + seqs 1 + **快档钉 `tools/pin_shim`**（PYTHONPATH + `VLLM_DBG_TRACE/MIN/PIN=1`；`PASSES=2` + `SKIP_SHARED=1` + PIN 前置 `gc.collect()+empty_cache()` + pass2 前 free 门）+ page 校验缓存补丁 + seq_lens_cpu 同步消除补丁 + **`VLLM_KV_GROUP_SIZE=8`** + **`--mamba-ssm-cache-dtype bfloat16`** + **`--max-model-len 163072`**。**引擎自报容量 163,719 tokens**。**⭐启动走 `tools/prod_watchdog.ps1`**（8k 探针×3 中位 ≥105 判快、慢则杀重启；阈值 105 在 163k 配置下复验有效，8k 带 116-125）。
+
+**并存变体 bat（生产默认均未变）**：`run_dflash2_n2_base029_cb2.cmd`（草稿码本 2bit、池 3.43e9、L=164,528、容量 165,175；接受率 61.91% vs 现役 62.82%，用户门 55%）；`run_dflash2_n2_base029_vis_cpu.cmd`（vision 开 + `VLLM_DBG_VIS_CPU=1` 塔驻内存 CPU 跑 + `OMP_NUM_THREADS=8`，**图片整轮 13.5s→5.1s（≈2.5×）**；**该臂 boot 期易撞余量悬崖**，手起前先跑 `prod_headroom_check.ps1` 确认被挤 0）。
+
+**KVMem 线（当前主线）**：设计权威 = `docs\vllm-030win-调研-KVMem虚拟化KV工作区.md`（**§12 = 实施机制与实测；接手先读 §12.14 与 §12.13，再按需回溯**）。**057-067 已落地**（逐步细节见《交接收档存档.md》与设计档 §12.x）：有界 prefill（057）→ K1 copy-before-free + K2 准入守卫（060）→ K3 前半 raw-K + Mean-K 检索（061，粒度 32）→ 早期页偏置结案（062，NO-GO）→ 重物化原语（063）→ raw-K 权威区（064）→ `PageGeometry` 内核块重写 + 实时往返 GO（065）→ **066 = 连接器级前缀装配 GO**（页第一次被放回视窗；同 prompt serve **TTFT 256.63 → 229.76/230.13 s = −10.4%**、needle 命中、零 error；**原始位置装配零改动模型执行器**，硬问题在 mamba 逐边界快照 + 环形区按轨迹分槽）→ **067 = 全图捕获兼容 GO**（`record` 包成不透明 custom op ⇒ 臂进生产同构图模式；8k decode **17.28 → 69.16 tok/s = 4.0×**，装配链仍走通 TTFT 223.94 s，零 error）→ **072 = 单坐标固定槽位压缩视窗落地**（设计 §5.1 重烘焙路线；离线单测 **16/16**、N=1 视窗端到端 GO；**N=55 大视窗输出为空卡点未解**，见"下一步"）。**窗外 needle 仍答不出**（072 是它的实现路径，但大视窗卡点未过）。**臂**：装配线 `tools/serve_gsq_kvmem_ws163k_graph.cmd`（带图主力）、压缩视窗线 `tools/serve_gsq_kvmem_viewport072.cmd`（+`_n1`/`_top1` 对照）、073 观测臂 `..._viewport073.cmd`（= 072 臂 + `VLLM_KVMEM_DEBUG=1`）；dump 目录 `kvmem_k5a` / `kvmem_k7a*` / `kvmem_k8a*`；变体 bat 并存、生产默认不动。**⭐073（2026-10-01）把 072 卡点定性结案**：N=55 的"输出为空"= **模型首 token 采出 EOS（A 类）**，B/C 排除（同 boot 只换 nonce 即复现/消失；同一视窗 token 序列当**普通 prompt** 发也在 EOS 与换行间近并列；`ignore_eos` 后立刻 94 chunk 连贯），且**视窗端到端其实能跑通**（68 步 prefill→55 页烘焙→340 chunk 完整推理）⇒ 072 记的"阳性对照给出连贯输出"那条**根本没走视窗**（指纹见必守 16⑦）。**真卡点重定为：窗外 needle 读不出**（针页 88 排 top-9 且确被烘焙，模型仍答"没有"；同 prompt 原生全量直接答出 77349）。详见设计档 §12.15。**⭐步骤 074（2026-10-01）= 窗外 needle 判据 GO**：根因 = `_emit_stage_request` 只取 `tables[group_ids[0]]`（组 6）⇒ 检索槽只烘焙了 16 个注意力层里的 **8 层**（旧日志 `688.4 MiB` 正好 = 55 页 × 1,640,448 B × 8 层），组 7 的 8 层一直读占位段 KV；改成**逐槽 × 逐组**发射/烘焙 + 读回校验后，针页 88（token 125,370，top-64 第 9）在压缩视窗上**双 boot 直接答出 77349**（boot2 `finish=stop`、6 chunk、TTFT **92.07 s** vs 同 prompt 原生 224-250 s），烘焙量 688.4 → **1376.7 MiB（880 layer-page copies，read-back 110 checked 0 mismatch）**；装配链 224.478 s 带内、零 error、decode 仍在图上 ⇒ **KVMem 线第一次同时兑现"免全量重 prefill"与"窗外内容读得出"**（设计档 §12.16、步骤 074）。**⭐077（2026-10-02）= 机制定罪 + 准入解开**：抓到"页长 `mbt` × 投机"的裁零分支（`draft_slots=2` ⇒ 预算 1454 < 页长 1456 ⇒ align 裁块把首块裁到 0 ⇒ 静默 break；设计档 §12.19），臂口径改为 **`mbt ≥ 页长 + num_spec`（1458）**，并修掉投机 draft 组 8 被 workspace 误认领导致的 `KeyError: 8`；**窗外 needle 判据在带投机的臂上仍未测**（非失败），新头号卡点 = **ingest 慢 ~6×**（~11 s/页步 vs 074 的 1.7 s）。**⭐078（2026-10-02）把这两条都改了写**：窗外 needle 判据在带投机的臂上 **GO**（b2/b3 双 boot 都答出 77349，serve 指纹 `recent_tokens=16384`、`baked 880 copies / 1407.7 MiB / read-back 0 mismatch`、drain 全 `0 + 0` ⇒ 投机仍在图上；账 = 快态 105.066 s vs 原生 258.994 s = 40.6%，慢态 608.063 vs 1250.341 s = 48.6%），而**"ingest 慢 6×"作废** —— 同一份 launcher 的 boot 之间页步 1.42 / 1.89 / 9.13 / 11.0 s、decode 62-64 / 104-111 tok/s，**prefill 与 decode 反相关**（接受率相同 ⇒ 非投机失效），慢态指纹是"util 100% 但 mem-util 1% + 82-105 W + PCIe gen5 x16=max"的**等待型**，pageable 回退 / 链路降速 / 被挤显存 / 快慢态钉四条候选全否，**机制未定罪**（079 头名）；078(c) 的 `_retained_by_block_id` 改组号键**前提不成立**（单 `BlockPool`、`block_id` 全局唯一 ⇒ 改键必 miss、反成块泄漏），**零代码改动**。细节 = 设计档 §12.20 + 步骤 078。**⭐2026-10-01 回滚补记：068/069/070（固定槽位压缩视窗·双坐标路线）与 071 已整体回滚到 067 收尾，过程与取证见"下一步"的回滚记录块；072 走的是另一条路线（单坐标重烘焙），与它们无关。**
+
+**Orca EXL3（059，已跑通，仅作兼容基线）**：`qwen3.8exl3` 在 `vllm-win029` 上跑通（权重 11.46 GiB、8001 ready、chat 返回 4/stop）；后续计划 = `docs/orcasaq2后续推进计划.md`。生产 GSQ/KVMem 默认未改。
+
+**水位（anchor 口径，163,072 / G=8 / N=2 / ssm bf16）**：8k **122.58**（watchdog 三探针 124.28/122.58/121.7）、146k 档（90%，判据②）**107.73** needle 命中、TTFT 168s（prefill ~867 tok/s，池值 3.4e9 硬上限未触碰）。**⭐余量判据（步骤 049）**：`powershell -NoProfile -File tools\prod_headroom_check.ps1`——**主判据看「引擎共享 − 8,298 MiB」**：0 = 健康（8k 121-127）、>100 = WARN（~111）、>250 = DEGRADED（~92 或更低）；**引擎专用绝对值随运行漂移（跑过推理 +308 MiB），不可作判据**。快档基线 = 专用 15,497.8 / 共享 8,298（boot 后未跑推理）。**余量口径**：独显（LUID `...0x000115c2`）boot 后 ~795 MiB / 跑过推理后 ~492-513 MiB；**`GPU Adapter Memory` 合计混含核显（443.1 MiB，跑在系统内存上），不可与独显容量相减**。
+
+**回滚**：快档钉 = launcher 删 4 行 set；page 补丁 = `_tmp_line_b/revert_page_patch.py`；seq_lens 补丁 = `tools/apply_seq_lens_cpu_patch.py revert`；**launcher 配置（046+036）= 先 `tools/apply_prod_ssm_bf16_step046.py revert` 再（次序不可反）`tools/apply_prod_kvgroup_step036.py revert`**（036 的 revert 断言 `max-model-len == 144432`，046 未回滚时必失败）；图模式 = 重加 compilation-config 行；watchdog = 直接不用。回退锚 = 旧 venv `vllm-win`（0.27.1 冻结只读）+ overlay tag `freeze-migration-20260925`。
+
+## 关键机制（已定案，勿重新推导）
+
+1. **mamba 显存账（045）**：48 层 GDN ×（conv bf16 102,400 B + ssm **fp32** 3,145,728 B）/层/份 = 148.68 MiB/份；align 份数 = **2 + N(2) + ckpt(0) = 4（公式硬编码）**。fp32 来源 = 模型 `config.json` 的 `mamba_ssm_dtype=float32`；**bf16 在 fused 白名单内、fp16 不在**。
+2. **bf16 ssm 的容量联动（046 已生效）**：mamba page raw 3,248,128→1,675,264 → attn block 2832→1456 → 统一 page 1,677,312 → `bytes_per_block`(G=8) 13,418,496 → num_blocks 130→253 → **L 上限 163,072、容量 163,719**。
+3. **⭐首编深塌**：L/dtype 变更后的**第一次无缓存 boot**（AOT 重编译 ~145s）8k steady 16.8-18.7 tok/s；**同配置第二 boot（缓存 ~61s）恢复 116-125**。⇒ **双 boot 的本质是"先有同配置编译缓存"**；未来 L/dtype 变更若无缓存仍须双 boot（watchdog 天然覆盖）。
+4. **快慢态 + 钉快档（030/033/044）**：草稿权重 WDDM 掷骰子 → pin_shim 两遍搬移 + empty_cache；第二随机源（载入瞬态滞留池）→ 044 PIN 前置 gc+empty_cache 钉住。
+5. **图模式（026/027）**：FULL_AND_PIECEWISE 是生产配置（decode FULL 整图）。gap 三胜：page 校验缓存 −1.3ms、seq_lens D2H 消除 −2.55ms、钉快档搬移空转修复 −2.16ms；GPU util 97% 两侧到头。
+6. **容量（034/035/036/040）**：池值 3.4e9 硬上限（prefill 敏感，4.13× 慢）；`VLLM_KV_GROUP_SIZE=8`；容量公式 `blocks_per_req = cdiv(L,block)×cdiv(16,G) + 4·cdiv(48,G) + sw·cdiv(5,G) ≤ num_blocks − 1`（null block），`sw = cdiv(2047+2×mbt, block)+1`（block=1456 时 sw=4）。
+7. **阶段 3（037/038）**：0.29 底座已含大量 0.30 改动；D 组/C6 全 NO-GO（CuTe DSL Linux-only）。
+
+## 关键路径
+
+**唯一远程仓 = `github.com/deathwing475/vllm-030win`**（本地 = 记录仓 `G:\qwen3.8model\vllm-030win-git`，分支 `main`，内含 `vllm/` + `docs/` + `tools/`）｜新底座 venv `G:\qwen3.8model\vllm-win029`（cp312，flashinfer 0.6.18.post1）｜底座仓 `vllm-029base-git`（本地工作区/历史归档，**无远端**）｜迁移源 `nvfp4-win-experiment\vllm-overlay`（tag freeze-migration-20260925）｜0.30 树 `vllm-0.30.0`（纯上游快照）｜旧生产 `vllm-win`（冻结只读）｜锚点 `vllm-030win-锚点数据包\`｜生产日志 `G:\qwen3.8model\prod029_logs\`｜测量 scratch `G:\qwen3.8model\_tmp_line_b\`｜工具 `vllm-030win-git\tools\`｜**KVMem 设计档 `docs\vllm-030win-调研-KVMem虚拟化KV工作区.md`**。**历次新增的具体文件清单见《交接收档存档.md》附录 C.4。**
+
+## 必守（违反必翻车）
+
+1. **环境契约**：VS vcvars64 + `HOME=C:\fi` + CUDA 8.3 短路径 + LIB CUDA lib\x64 + TMP/TEMP→G 盘（**勿删 `_tmp_anchors`；`_tmp_prod029` 里是生产在用的 8 GiB offload mmap**）——抄任一 serve_gsq launcher；humming 八件套垫片在 `tools/shims/`。
+2. **启动服务 cwd 铁律**：绝不在记录仓 `vllm-030win-git` 目录下启 python，一律 cd 别处（`boot_keep.py` 已内置 cwd）。
+3. **⭐⭐提交与推送铁律**：见顶部仓库纪律块（**唯一远程仓，禁止只提交本地**）。
+4. **⭐仓库内文件写入一律走 Write/Edit 工具，不得用脚本绕过**（`sed -i` 会把 CRLF 改成 LF）。**Write/Edit 保持文件原有行尾**；新写 .cmd 是 LF 须 python 做 LF→CRLF 转换；临时脚本生成 .cmd 读写都要 `newline=""`。
+5. **⭐改完生产参数后 grep 全仓该参数的旧值**，逐个判定「历史记录 vs 现役描述」。
+6. **每步一 commit**：步骤文档（四段式）与改动同 commit；收尾按《任务收尾规范.md》更新各文档再 push。**四段式插入后必 `grep -n "^## 步骤"` 复核序列**（历史上多次"吞下一节标题"）。
+7. **测量纪律**：chunk≠token；热身弃 1+重复取中位；性能对比 ≥3 boot；**A/B 必须同时段交替**；判据贴近容量；禁 KV 溢出；池值手动；停服按 CommandLine 杀（文件版 `tools/kill_vllm_orphans.ps1`）；复跑锚点一律新文件名；每轮清临时缓存查磁盘水位。**boot 间性能是连续谱（83-129）——先想谱宽**。**⭐078 升级为硬口径**：任何 ingest/decode 速度断言必须**先报页步中位（`capture drain` 相邻差）+ ≥3 boot**——同一份 launcher、同一 AOT 缓存命中、pinned 行逐字相同的 boot 之间，1456-token 页步实测 **1.42 ↔ 11.0 s**、8k decode **62 ↔ 111 tok/s**，且 **prefill 与 decode 反相关**（接受率几乎相同 ⇒ 不是投机失效）⇒ 单 boot 的速度读数只能当"该 boot 的状态"，**不得**当配置属性（077 的"ingest 慢 6×"就是这样被 078 推翻的）；分型手段 = `utilization.gpu` **必须配** `utilization.memory` + `power.draw` + `pcie.link.*.current/max` 一起看（100% / 1% / 82-105 W / gen5 x16=max ⇒ "kernel 常驻但等待型"，既非算力型也非带宽型，也非链路降速）。
+8. **⚠️PPL 非位精确**（漂移带 ~1e-3）：正确性主判 = needle 多深度；PPL 容差 3e-3 + 多采样 + **同轮双臂对照**。
+9. **移植铁律**：覆盖率自检；0.30 树逐 hunk；**记录仓 `vllm/` 与 venv `vllm-win029` 逐字节同步**（`tools/sync_venv.py`，路径相对 `vllm/` 根）；平台专项先查 OS 依赖。
+10. **Windows 坑**：注解 `"X" | str`；getsource 尾换行；含反斜杠替换落 .py；.cmd CRLF（续行链禁插注释）；**⭐链式 bash→内联复杂 PowerShell 必崩 exit 4294967295——kill 一律走文件版 ps1，起服走 `boot_keep.py`**；Git Bash 跑 .cmd 须 `MSYS_NO_PATHCONV=1`；脚本读写 CRLF 双端 `newline=""`；WDDM 下卡级 memory.used 是唯一可靠外置口径。
+11. **图模式知识**：FULL_AND_PIECEWISE 生产配置；元数据分支/状态算子入图会输出塌缩——图改动必须过 needle。
+12. **flashinfer 0.6.18 契约**：`FLASHINFER_WORKSPACE_BASE=C:/fw`（正斜杠）+ `FLASHINFER_EXTRA_LDFLAGS=-L.../tvm_ffi/lib -ltvm_ffi`；venv 两补丁 grep 特征串核验。
+13. **铁律 = 提示清单非完备理论**：禁止拿条文当推理锚点，一切以直接测量为准。
+14. **任何 venv 源码补丁必须有对应 revert 脚本**；A/B 阴性即回退。
+15. **验收零容差**：性能总分 ≥ 现役；接受率 ±1pp；容量不缩水；needle 命中 + 输出连贯。性能回退先查口径三件套。
+16. **⭐KVMem 线**：设计以《调研-KVMem虚拟化KV工作区.md》为**唯一权威**（**接手先读 §12.13 与 §12.12，再按需回溯 §12.5-§12.11、§5.1、§12.1-12.3；真实页布局 = §12.10.3，065 往返 GO = §12.11**）——**三条硬约束**（块粒度 1456 token 不可改小 / GDN 循环状态不能回退 / 显存余量悬崖要求新增显存池前分配）与 **§5.1 固定槽位布局的关键不变式**（query 位置 `B=S+N+R` 与选择无关 ⇒ 不重 prefill ⇒ 无 GDN 快照 ⇒ 无 mask ⇒ 生产注意力路径不动）**已定稿，勿重新推导**；**三条被否路线勿重开**（论文/QW3 的"重 prefill query"、参考的"原始位置+洞+mask"、**"修早期页偏置"（062 判 NO-GO）**）；**重物化一律从 raw K 单次重建，禁止 delta re-RoPE**；阶段 1 判据不含性能。**各步补充纪律（060-065）已全部进设计档对应小节的"边界（勿误读）"，此处只留违反必得反向结论的几条**：①**工作区页键 = `(轨迹, token 偏移)`，绝不能带 `group_id`**（16 层被 G=8 分 2 组，带它会让同页占 2 个 slot、容量腰斩）；②**评估修法必须用它自身的信号强度**（用基准的会得出反向结论），in-sample 的漂亮数字必须过留一验证；③**页字节布局类断言的锚必须是引擎的真实张量**，不能是"参考 writer 写进自己构造的视图"（自证陷阱，063 载过）；④**权威区重建必须 `raw.to(bfloat16)` + cos/sin 保 fp32 再走引擎同款计算**（fp16 直喂 + cos/sin 截 fp16 = 双重舍入 ⇒ 超步）；⑤达标形态 = **量化步内一致**（不可归零也无需归零）；⑥**`capture.record` 现在是不透明 custom op**（067）⇒ 函数体可以保留 Python 记账，但**仍不得做 host 同步**（device→host 一律留在 `drain()`）；⑦**判"某请求有没有走视窗"只能用分支指纹**——`kvmem_retrieval_*.json` 的 `recent_tokens`：**16,384 = 视窗、32,768 = 原生**（或按 req id 找 `rewritten onto the compressed window`）；**禁止用 TTFT / "输出是否连贯" / `finish_reason` 反推**（073 实测：072 那条"连贯阳性对照"其实是指纹 32768 的原生请求，因此被误记成"视窗路径结果矛盾"）；⑧**`kvmem_retrieval_%03d` 计数每 boot 从 001 重来** ⇒ **每个 boot 必须换 `VLLM_KVMEM_DUMP` 目录**，否则后一 boot 静默覆盖前一 boot 的检索/烘焙证据（073 踩过，boot2 的 003 已被覆盖）；⑨**`VLLM_KV_GROUP_SIZE>1` 时"层数"与"组数"是两个维度**（074 定罪：16 个 full_attention 层被 G=8 切成组 6/组 7，同一逻辑行在两组是**不同物理块**）⇒ **任何逐层/逐槽的 KV 写入都必须按 `self.group_ids` 展开、日志打印 `(group, block_id)` 覆盖集合、并配读回校验**（`VLLM_KVMEM_BAKE_VERIFY`）；只数槽或只数层的 MiB 读数会把"半覆盖"伪装成"全成功"（072/073 就是这样被 `688.4 MiB` 误导了 两步）。入库（060/072）与装配（066）一直是逐组展开的，**只有 stage-in 曾漏**；⑩**「`mbt` 钉页长」这条口径在加投机后必须改成「`mbt ≥ 页长 + num_spec`」**（077 定罪：DFlash 的 `max_num_new_slots_for_drafting = 2` ⇒ 每请求预算 = 页长 − 2，而 `scheduler.py:431-438` 的 align 裁块保护条件比的是**未扣 draft_slots 的** `max_num_scheduled_tokens` ⇒ 首块被裁到 **0 token** ⇒ `scheduler.py:1000` **静默 break**、每步空转且零日志）。⇒ 任何 `mbt ∈ [页长, 页长 + num_spec)` 的配置必死；判"某个请求会不会撞"看的是 **prompt 是否长过 `mbt − draft_slots`**（同一 boot 上短请求照常跑，别拿短冒烟当"臂通了"）；诊断手段 = `tools/apply_sched_trace_step077.py`（`VLLM_SCHED_TRACE=1` 门控的分支计数 + boot 横幅，**用完必须 revert**）。
+17. **⭐门控补丁的通用纪律**：**改任何被模型/图编译引用的源文件都会改掉 AOT 编译缓存的键** ⇒ 部署后**第一次 boot 必然重编译且处在退化态** ⇒ **一律双 boot 或走 `tools\prod_watchdog.ps1`，禁止拿单次冷 boot 判性能回归**。（062 实测：只改 `kvmem_workspace` 下文件**不**触发退化。）
+18. **⭐重启时序纪律**：`kill_vllm_orphans.ps1` 之后**先轮询 `nvidia-smi --query-gpu=memory.used` 落回 <800 MiB 再起服**（实测「kill 后 5 s 就 boot」连续 4 次全被挤；等到落回 ~124 MiB 再 boot 一次就干净）。
+19. **⭐KVMem 臂的余量判据要换口径**：`prod_headroom_check.ps1` 的 `引擎共享 − 8,298` **只在有 8 GiB 前缀缓存 mmap 的配置上成立**；KVMem 臂没有那块 mmap（`KVMemConnector` 顶掉了 offloading 槽位），共享基线是 **4,198 MiB**，照抄会算出 **−4,100 的假读数**。KVMem 臂上看 `viewports needs / pool has` 那行与 8k 解码带。
+20. **⭐探针的 `--dump-dir` 必须等于引擎的 `VLLM_KVMEM_DUMP`**（061 踩过一次：报告其实在、探针报"没有新报告"）。
+21. **⭐全图捕获兼容是硬前提（2026-09-30 用户立，**067 已达成**）**：用户原话「先把 full cuda graph 兼容修复了，速度起码翻一倍。下一个优化就是这个了，**然后之后的优化全部都要全图捕获的兼容**」。⇒ 阶段 1 的"无图模式"约束作废；**任何新优化在设计与验收时都要把"能不能进 FULL 图"当一等判据**（历史教训：元数据分支/状态算子入图会输出塌缩）。**067 实测结论（硬事实，勿再推演）**：①**`--enforce-eager` 是"编译 + 图"双重禁用**（日志 `-cc.mode=none -cc.cudagraph_mode=none`）⇒ 臂 eager 态 8k decode 只有 **17.28**，带图 **69.16（4.0×）**；②**旧记录"臂 8k 约 69 vs 生产 122"是错的**（69 是带图数字），生产 122.58 = 编译 + 图 + **DFlash2 N=2 投机**，**69 vs 122 的差额来自投机、不是图模式**（臂每步 14.45 ms 已快于生产每步 18.4 ms）；③修法 = `capture.record` 包成 `torch.library.custom_op("vllm_kvmem::record", mutates_args="unknown")`（唯一拦路虎是 M-RoPE 的 `torch.equal` 数据依赖），**只改 `kvmem_workspace/capture.py`、零改动调用点、不改 AOT 缓存键**；④`CudagraphDispatcher.dispatch` 对 `num_tokens > max_cudagraph_capture_size` 返回 `NONE` ⇒ **prefill 永不进图**（走编译产物逐算子执行），图收益集中在 decode；⑤判据 = `drain` 的"单 token 调用计数"（**0 = decode 真在图上**）；⑥09-25 的"FULL 图挂死 = flashinfer BatchPrefill nvfp4 reader"**067 未复现 ⇒ 视为已过时**（生产 FULL_AND_PIECEWISE 长期正常）；⑦**投机下"token 数"不再能区分 prefill 与 decode**（075 实测：N=2 的 verify 步 = 3 token，`capture.record` 旧规则 `num_tokens<=1` 把它当 prefill 录 ⇒ 图捕获里 clone + M-RoPE `torch.equal` host 同步 ⇒ `cudaErrorStreamCaptureInvalidated`）⇒ **任何"看步的大小猜步型"的判据在多 token 图化场景一律不可信**，必须由连接器显式授权（`KVMemStepSpan.prefill` + `capture.arm/disarm`，worker 在 `bind/clear_connector_metadata` 装/卸）；图判据也相应升级为「单 token 调用数 **+** 落在 allow-list 外的调用数 = 0/0 ⇒ decode 在图上」。
+22. **⭐066 装配线的三条口径**：①**`--max-num-batched-tokens` 必须钉页长 1424**（无投机的臂；**带投机的臂必须 `mbt ≥ 页长 + num_spec`，否则首块被裁到 0 token 而静默死锁，见必守 16⑩**）（mamba 快照只在"步尾恰为页边界"时精确；且 9968 会把滑窗 admission 从 117 抬到 123 块/组 ⇒ boot 报"需 3.32 GiB > 可用 3.15 GiB"，1424 与 1024 的 `cdiv` 同为 117 ⇒ 零增长）；②**引擎原生前缀缓存会掩盖装配**（同 transcript 重发在池块未复用时能救回约 97%）⇒ 验证装配必须先用一条**不同 nonce 的长请求 flush** 掉池块；③**装载拷贝必须发在 `start_load_kv`**，不能放 `wait_for_save`——装配请求在 `WAITING_FOR_REMOTE_KVS` 时其步调度 0 token，零前向路径**只调 `start_load_kv`**（`wait_for_save=False`），放错就永久挂等待队列。
+23. **⭐"逐 token 一致"不能用 seed 固化**：`SamplingParams.seed` 只在 `temperature ≥ eps` 时生效（temperature=0 直接 `GREEDY`、seed 不被读取），分歧在 **logits 层**；vLLM 的对应开关是 **`VLLM_BATCH_INVARIANT=1`**（需 SM ≥ 9.0，本机满足）但它禁 split-K 等 ⇒ **变慢**，只作位精确闸门的**测量档**。且**不同计算路径**（chunk 起点/`seq_len`/KV 物理块不同）即使 kernel 全确定也可能归约序不同 ⇒ 逐位一致不是加开关就能拿到的性质（设计档对重物化的判据本就是"量化步内一致"）。
+
+## 下一步（**当前头名 = 步骤 079：给入库/捕获两段出计时证据，把"慢态时间在哪"定下来 + 一次 boot 内同时拿到快 prefill 与快 decode**——078 已把窗外 needle 判据在带投机的臂上跑成 GO，并推翻了 077 的"ingest 慢 6× = 配置属性"）
+
+> **⭐⚠️ 068-071（固定槽位压缩视窗·双坐标路线）已整体回滚并判死冻结**（2026-10-01 用户拍板，`git reset --hard 881e41e` + force push；重启须用户发话）。**该时期的全部结论不可信**：6 条"未经复验的线索"（前缀缓存与 mamba 页锚定 / Model Runner V2 / RoPE 形态 / 071 三处帧错位 / 快照边界与 AOT 键 / prefill 中途 NaN 未解）已原样搬入《交接收档存档.md》"068-071 回滚记录"一节——**禁止当已验证事实引用，用前必须自己复验**（073 已当场推翻其中"Qwen3.8 无 M-RoPE"一条）。不随回滚失效的工作纪律：补丁必须留一次性日志证明在跑；不可信时期结论用前先实测。
+> **⭐臂与证据目录（接手必读，细节在步骤 072-075 与设计档 §12.14-12.17）**：视窗臂 `tools/serve_gsq_kvmem_viewport074.cmd`（主力，= 073 臂 + `VLLM_KVMEM_BAKE_VERIFY=1`）、历史变体 `..._viewport073.cmd` / `..._viewport072.cmd`（+`_n1`/`_top1`）、**投机臂 `tools/serve_gsq_kvmem_viewport075_spec.cmd`（视窗 + DFlash2 N=2 + capture sizes 3 + W=131,072/L=200,704/mbt 1456；今晚卡死不准入）与判别臂 `tools/serve_gsq_kvmem_ws075_spec.cmd`（= 前者仅 `VIEWPORT=0`）**、装配臂 `tools/serve_gsq_kvmem_ws163k_graph.cmd`（带图主力，dump 已改指 `kvmem_k9c`）；探针 `tools/kvmem_viewport_probe.py`（ingest→flush→serve，`--stages serve` 可只重发视窗请求）、`tools/kvmem_assembly_probe.py`、`tools/anchor_longctx.py --lengths 8000 --warmup 0 --repeats 3`（8k decode 锚）、对照 `tools/kvmem_window_control.py`；覆盖单测 `tools/kvmem_stage_coverage_test.py`（CPU，12/12）。dump：`kvmem_k7a*`（072）/ `k8a/b/c`+`k8a_boot3keep`（073）/ `k9a`/`k9b`/`k9c`（074）/ **`k9d`/`k9e`（075 投机臂）、`k9f`（075 判别臂）、`k9g`（075 后的 074 回归）、**`k10a`–`k10d`（077：peel 定罪 / 1458 首跑 / 1458 快档 / 1457 判别）、`k11a`（077 视窗+投机首跑，崩于 draft 组 8）、`k11b`（组过滤修复后，decode 读数出自这轮）** ⇒ **077 新臂**：`tools/serve_gsq_kvmem_peel077.cmd`（= 076 peel E 逐字复现 + `VLLM_SCHED_TRACE=1`，`SCHED077_MBT`/`SCHED077_TAG` 可变）、`tools/serve_gsq_kvmem_viewport077_spec.cmd`（= 075 视窗+投机臂，`mbt=1458`，dump 由 `SCHED077_TAG` 参数化）；诊断补丁工具 = `tools/apply_sched_trace_step077.py`（apply/revert/status，**用完必须 revert 回净态**；078 开场已 revert，`scheduler.py` 现为净态）；**078 新臂与工具**：`tools/serve_gsq_kvmem_viewport078_spec.cmd`（= 077 臂逐字去掉 `VLLM_SCHED_TRACE`，旋钮 `S078_TAG`（dump 目录，每 boot 必换）/`S078_SPEC`/`S078_RAWK`/`S078_AUTH`/`S078_WS` **全部 env 注入 ⇒ 一次 peel 不必新建文件**；`S078_SPEC=0` 时 `mbt` 仍留 1458 以只差投机一个变量）、`tools/kvmem_ingest_cadence.py`（单请求节拍探针：客户端 `TTFT/ceil(tokens/页长)` + 引擎 `capture drain` 相邻差中位/p10/p90，子命令 `cadence --engine-log` 可离线重算任何臂）；078 dump `k12b`（b1 cadence）/`k12c`（b2 判据快态）/`k12d`（b3 判据慢态），日志 `step078_b1_spec_repro`/`step078_b2_needle_spec`/`step078_b3_needle_spec_b`/`step078_vp078a|b`/`step078_b2_8k`/`step078_b3_8k_before`；**证据卫生警告**：`kvmem_k9b/` 的 `kvmem_retrieval_00{1,2,3}.json` 与 `kvmem_remat_*` 已被 077 的 `k9g` 回归跑覆盖（10-01 22:28-22:39，违必守 16⑧）⇒ 读 074 的打分排名以步骤 074 原文为准，不要以该目录当前文件为准；`kvmem_k5a` = 066/067 证据，**复跑不得覆盖**（`kvmem_retrieval_%03d` 每 boot 从 001 重号 ⇒ **每 boot 换目录**）。
+> **⭐生产当前状态（2026-10-02 10:20 实测，078 收尾后恢复）**：**生产在跑且处快档** —— 078 开场时生产**本就未运行**（01:54 之后无人起过，`nvidia-smi` 0 MiB ⇒ 本步没抢显存），收尾 `prod_watchdog.ps1 -MaxRestarts 4` **boot0 SLOW（89.47）→ kill → boot1 FAST**（median **124.27**，runs 129.10/122.09/124.27，boot 85 s，vram 15,508 MiB），`prod_headroom_check.ps1` 判 **被挤 0 MiB（≤100 = 健康带）/ exit 0**（dedicated 15,805.8 / shared 8,298 = offload 8,192+106；独显 used 15,904/16,303 ⇒ 余量 399 MiB）。⇒ **实验臂与生产抢显存（一次只能一个）；按用户 2026-10-02 新令「之后你自行决定，不用问我」，跑臂前直接停生产、不再逐次询问，但收尾必须用 watchdog 恢复并核快档 + 余量**；同一条令还规定**每个会话只推进一个步骤**、做完立刻落档 + commit + push（本句取代此前"跑臂之前要先问用户是否可停生产"）。历史：072 交还时生产曾处慢档（7 次 boot 全 SLOW、DEGRADED 278 MiB），**与 kvmem 改动无关**（kvmem 文件不进模型、生产不设 KVMem 环境变量）。
+
+> **074 结案块已于 2026-10-02 外移《交接收档存档.md》**（原文零删减）。**留用的硬事实**：窗外 needle 判据 GO 的根因 = `_emit_stage_request` 只取 `tables[group_ids[0]]` ⇒ 检索槽只烘焙了组 6 的 8 层（`688.4 MiB` 正好是单组），改逐槽 × 逐组后 `110 block(s) (covered [6, 7])` → `880 layer-page copies / 1376.7 MiB / read-back 0 mismatch`，针页 88 双 boot 答出 77349（TTFT 92.07 s）；细节 = 步骤 074 + 设计档 §12.16（含 §12.16.1 的一般化教训 = 必守 16⑨）。
+
+> **075 / 076 结案块已于 2026-10-02 外移《交接收档存档.md》**（原文零删减），其中"未定罪活锁 / 机制未定位"已被步骤 077 取代。**留用的两条硬事实**：①投机 × `W=163,072` 视窗在池值 3.4e9 下**容量互斥**（需求 3.24 GiB > 可用 3.15 GiB；降 `--max-model-len` 无效——需求由滑窗钉住——只能降 `VLLM_KVMEM_SW_WINDOW=131,072`，代价 = 页长 1424 → 1456 且 262,144 上限不可达）；②**"token 数"在投机下不区分 prefill/decode**（verify 步 = 3 token ⇒ 图捕获里 host 同步 ⇒ `cudaErrorStreamCaptureInvalidated`），075 的 **capture allow-list**（`KVMemStepSpan.prefill` + worker 在 `bind/clear_connector_metadata` 处 `capture.arm/disarm`）保留，图判据 = 「单 token 调用数 **+** allow-list 外调用数 = 0/0」。074 的成果已被 077 复验未被破坏。
+
+**⭐步骤 077（2026-10-02）= 机制定罪 GO + 参数级修法 GO**（原文结案块已于 078 收尾外移《交接收档存档.md》，含 078 的三条改写标注）：留用的硬事实 = ①死因 = DFlash `max_num_new_slots_for_drafting = 2` ⇒ 每请求预算 = 页长 − 2，而 mamba「align」裁块的保护条件比的是**没扣 draft_slots 的** `max_num_scheduled_tokens` ⇒ 首块裁到 **0 token** ⇒ `scheduler.py` **静默 break**（真实死条件 = 「prompt 长过 `mbt − draft_slots`」，**别拿短冒烟当"臂通了"**）；②修法口径 = **`mbt ≥ 页长 + num_spec`（1456 页长 ⇒ 1458）**，步尾仍精确落页边界 ⇒ 066 mamba 快照 / 072 逐页入库不破；③投机的 draft 组（组 8，同为滑窗）被 060 的 workspace 门误认领 ⇒ `KeyError: 8` 打死引擎，修 = 连接器只按 `self.group_ids` 认领、其余块**立刻 `free_blocks` 归还池**（不还就是块泄漏）——**此两条改动仍在库**。细节 = 步骤 077 + 设计档 §12.19。
+
+**⭐078 = 窗外 needle 判据在带投机的臂上 GO（双 boot）+ 077 的"ingest 慢 6×"作为配置属性作废**。(a) b2/b3 两支都命中：`198184 -> 97920` 改写、`baked 55 x [6,7] = 880 copies / 1407.7 MiB / read-back 110 checked 0 mismatch`、页 88 排 top-64 第 40/39、指纹 `recent_tokens=16384`、`"\n\n77349"` + `finish=stop`、ERROR/Traceback 0、drain 全 `0 + 0`（投机 verify 步仍在图上）；账 = **快态 serve 105.066 s vs 原生 ingest 258.994 s（40.6%）**、**慢态 608.063 vs 1250.341 s（48.6%）**。(b) **6× 不可复现**：同一份 launcher（同 AOT 缓存命中、pinned 行逐字相同）的 boot 之间 1456-token 页步 = **1.42 / 1.89 / 9.13 / 11.0 s**、8k decode = **62-64 / 104-111 / 103-108**，且 **prefill 与 decode 反相关**（接受率几乎相同：0.597 vs 0.564 ⇒ 不是投机失效）；慢态指纹 = `util 100%` 但 `utilization.memory 1%` + `82-105 W` + PCIe **gen5 x16 = max** ⇒ 等待型，**pageable 回退 / 链路降速 / 被挤显存 / 快慢态钉四条候选全否，机制未定罪**（`KVMemConnector.workspace_stats()` 全仓零调用者 ⇒ 现成的 `store_seconds` 读不出来）。(c) **前提不成立、零代码改动**：`block_id` 全引擎单 `BlockPool` 唯一（`kv_cache_coordinator.py:99` + `kv_cache_utils.py:166`），登记侧与发出侧同一命名空间，改 `(group_id, block_id)` 键反而必 miss ⇒ 块泄漏。细节 = 步骤 078 + 设计档 §12.20。
+
+**⭐079 头名 = 给入库/捕获两段出计时证据，把慢态"时间在哪"定下来**：①`workspace_stats()` 接一条 env 门控日志（或 `wait_for_save` 每 50 步一条），配 revert 脚本并**先实测可逆**（必守 14），在**慢态 boot** 上读 `store_seconds / 步时` 之比 ⇒ 决定是修拷贝形态（16 条合批是否真合批、要不要上 GPU 化烘焙）还是修等待源；②速度目标改写为"**一次 boot 内同时拿到 ~1.4 s/页 + ≥100 tok/s**"，任何 ingest/decode 数字必须先报页步中位且 ≥3 boot（必守 7 的 078 升级条款），反相关需要 n≥6 才谈规律；③命中率统计（多深度 × 多 nonce——页 88 的名次已从 074 的第 9 掉到第 39/40，距 55 槽只剩 ~15 名）与 `VIEWPORT_PAGES`/`_RECENT` 预算扫描并列。**075/076/077/078 之后仍未做**：recent 滚动重烘焙、多轮 ΔP、GPU 化烘焙、性能判定、装配探针在新页长 1456 上的回归。
+
+> 073 开工时所依的「执行判断」与「072-N=55 故障收敛计划」两块历史正文已原样搬入《交接收档存档.md》（**阶段 0/2/4 已执行并结案、阶段 1/3/5 因 074 判据 GO 而不再需要**），此处不再留存，勿据历史计划开工。
+
+> **入场先核**：①三条硬约束（页长不可改小 / GDN 循环状态不能回退 / 新增显存池前先分配）与 §5.1 不变式**已定稿勿重推**；②**凡新优化先问"能不能进 FULL 图"**（067 已把它变成一等判据）；③判据 = **窗外** needle 命中 + 输出连贯 + 装配链不回归 + 双 boot。
+> **⭐速度侧挂账（用户拍板项，勿擅自做）**：臂**仍无投机**（阶段 1 设计排除该变量）⇒ **69.16 与生产 122.58 不可直接比较**；要到生产的 90-120（用户 2026-09-30 指出"生产下配置草稿模型解码能到 90-120"）需给臂加投机。**是否把投机纳入 KVMem 臂属用户决策**。
+> **交付形态**：变体 bat 并存、生产默认不动。
+
+### A. 等用户指示（**不是自主推进项，勿擅自做**）
+
+1. **余量监控接入**：把 `tools/prod_headroom_check.ps1` 接进日常/启动流程（判据 = 引擎共享 − 8,298 MiB；>100 WARN、>250 DEGRADED）。
+2. **watchdog 增强**：重启前加一次余量体检并把结论写日志（**改生产脚本行为，需用户点头**）。
+3. **上游 PR 提交**：材料已就绪（`tools/upstream_pr/` 两 patch + README），outward-facing，等用户发话。
+
+### B. 可自主推进
+
+**B 组已无默认自主推进项**（B1「P1 工程债」052 全清；B2「P2 vision CPU 臂」053 交付 GO）。**当前头名 KVMem K3 后半见上方。**
+
+### C. 已判死（冻结，勿重开）
+
+FULL 图挂死根治（WONTFIX_WITH_ROOT_CAUSE）、草稿 1bit 全族（047）、E 轨池值回填（048）、草稿权重再压缩（043，051 码本兑现后**全线收官**；qkv/fc 2bit 解禁须用户发话）、**target 权重 PIN（049，无对象 + 自触发）**、上下文提长与池值上探（035/040 定罪）、**KVMem「修早期页偏置」（062 判 NO-GO）**、**KVMem 固定槽位压缩视窗·双坐标不重烘焙路线（068-071，2026-10-01 整体回滚；重启须用户发话；归档笔记中的全部结论均出自不可信时期、仅供参考不可当真）**。
+
+### D. 止损线
+
+**10-30**（新 27B 发布即止损）—— 若新 27B 提前发布，**直接拥抱新底座**（拍板：不建版本跟进机制）。
+
+---
+
+开工前先 `git log --oneline -5` + `git status` 确认状态（**记录仓必须 clean 且与 `origin/main` 同步**；代码改动若在底座仓产生，先 cherry-pick 进记录仓再 push）。**B 组无默认自主推进项**，A 组动作先问用户；**P3 挂账观察**（清单在《交接收档存档.md》附录 B）出现再查，不主动做。不要重新调研已定事实。
+
+---
+
+## 收尾规范与文档索引
+
+**每一次任务完成后的落地清单、各文件的颗粒度与篇幅上限、收尾自检清单** —— 收尾时逐项照做：
+
+- **[《vllm-030win-任务收尾规范.md》](vllm-030win-任务收尾规范.md)** ← **收尾必读**
+
+- **提示词体积沿革**：074 收尾 ~30 KB → 075 收尾 **32.1 KB** → 077 收尾 **~35.4 KB** → 078 收尾 **~40.1 KB**（连续四步超目标 ≤14 KB）。**2026-10-02 用户令「提示词只留索引和下一步，其余全部分到其他文档」⇒ 已执行拆分**：本文（= 当时的提示词全文整体转存，**内容零删减**）承载「必守 1-23 / 关键机制 / 关键路径 / 状态详版 / 臂与证据目录 / 水位 / 回滚」，新的《交接提示词.md》重写为**索引版**（使命与止损 + 开工前三查 + 文档分工索引 + 当前状态一句话 + 红线速查一行式 + 头名任务），**体积收口到 11.5 KB**（40.1 → 11.5 KB，3.5×；目标 ~10 KB、硬线 12 KB）。
+**今后纪律（写进《任务收尾规范.md》）**：①提示词只允许改「当前状态一句话」「头名」「红线速查新增一行」，**细节一律进本文或设计档并留指针**；②历史文档里所有「必守 N」引用 = **本文同编号**；③本文的 §当前状态 / §下一步 是快照，**头名与生产态以提示词为准**，冲突时按此优先级。
+
+相关文档：
+
+| 文档 | 定位 |
+|---|---|
+| [交接提示词.md](交接提示词.md) | **开场提示词本体**（索引 + 头名任务；2026-10-02 由本文拆分而来） |
+| 本文 | 铁律（必守 1-23）与现场细节（状态 / 关键机制 / 关键路径 / 水位 / 回滚 / 臂与证据目录）全文 |
+| [交接文档.md](交接文档.md) | 接手入口（现状 / 环境契约 / 未决项） |
+| [进度文档.md](进度文档.md) | 阶段总览 + 任务板 + 资产地图 |
+| [实验步骤文档.md](实验步骤文档.md) | 每步四段式（协议/操作/结果/判定） |
+| [实验日志.md](实验日志.md) | 按日工作流水 |
+| [交接收档存档.md](交接收档存档.md) | 历次收档 + 已结案总览 + 挂账观察 + 历史沿革 |
+| [vllm-030win-调研-KVMem虚拟化KV工作区.md](vllm-030win-调研-KVMem虚拟化KV工作区.md) | KVMem 设计权威 |
+| [锚点采集协议.md](锚点采集协议.md) | 锚点采集口径 |
