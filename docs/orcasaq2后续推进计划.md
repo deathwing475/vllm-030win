@@ -16,6 +16,7 @@
 - **KVMem 步骤 060：K1 copy-before-free + K2 准入守卫 = GO**（见 §3 阶段 K1/K2 的完成记录）。滑出窗口的历史页现在会写进 host 工作区（键 `(轨迹, token 偏移)`），往返逐字节一致，零丢页零泄漏；上限不可被越过，视窗装不下在 boot 期响亮失败。
 - **KVMem 步骤 061：K3 前半（raw-K 捕获 + Mean-K 索引 + 页级检索打分）= 机制 GO、R1 部分消解**（见 §3 阶段 K3）。检索有强信号（针页 logit +5.9/+9.2、rank 8→2 / 28→1），**粒度取 32 而不是 128**；**残余"早期页偏置"是新的头号挂账**；**重物化未做**。
 - OrcaSAQ2 步骤 059：ExLlamaV3 1.5.3 native CUDA + OrcaSAQ2 plugin 已跑通，端口 8001 的 chat smoke 通过。
+- **Orca 步骤 085（O2 = checkpoint 自带 MTP）：GO**。auto KV + eager + 0.88，与同参无投机控制臂 3 轮交替（六 boot 全 health、零 ERROR）。接受率 0.6272–0.6457、平均接受长度 2.25–2.29、逐位置 0.77/0.52；解码中位 45.5/45.9/45.5 vs 21.3/21.5/21.6 tok/s = **2.12x**；正确性 on 9/9 + off 9/9（chat 三连 + needle 三深度 8,169 token 全 HIT）。**代价账**：KV 池 19,636 → 12,444 tokens（−36.6%）、并发 1.64x → 1.04x、权重 +0.21 GiB、needle TTFT 反升约 0.9 s，且**单请求 16K 上下文在 16 GB 卡上起不来**（引擎自估最大长度 12,000；厂商 16GB MTP 预设的 0.95 档实测不可达，启动空闲仅 14.68/15.89 GiB），故两臂定在 `--max-model-len 12000 --gpu-memory-utilization 0.88`。随步绕开一个**通用缺陷**：`Qwen3_5MTP` 的 `embed_tokens`/`lm_head` 由 target 共享（载入后才绑定），而 orcasaq2 的 post-load 钩子对"没收到任何权重"的模块直接抛 ⇒ 任何 EXL3 checkpoint 的 MTP/EAGLE 都会 boot 死；修 = 进程级门控补丁 `tools/orcasaq2_sitecustomize/s085_empty_shared_patch.py`（默认关、GSQ 生产零暴露）。证据 `prod029_logs/orca_o2/`、台账 `prod029_logs/step085_boots.json`。
 - **Orca 步骤 084（O1 = NVFP4 KV smoke）：GO（修复后）**。boot 一次成、NVFP4 写路径生效、KV 池 43,690 tokens（auto 21,845 的 2.0x）、attention block 2784 tokens/页（mamba 页约束推导，不能套 GSQ 1456）；chat identity 3/3 + needle 三深度 3/3 HIT（12,206 token）。途中定罪并泛化修复一个**引擎级默认布局 bug**：nvfp4 KV 专用 kernel 假设 head-major 页布局，默认 resolve 的 LBNHC 下页读回乱序（静默乱码零 ERROR）——GSQ 生产靠 launcher 显式 HND 恰好踩对；修复 = engine core 在 nvfp4 且用户未钉布局时优先 LBHNC。同 boot 窗口落地 KVMem 泛化六点（用户授权"顺便修"，为 O3/O4 铺路）。证据 `prod029_logs/orca_o1/`。
 
 ### 1.2 未完成的核心工程
@@ -151,13 +152,9 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 
 ### 阶段 O2：Orca 自带 MTP
 
-使用 checkpoint 自带 MTP：
+**✅ 已完成（步骤 085，GO）。** 计划原文用 `{"method":"qwen3_next_mtp","num_speculative_tokens":2}`；实测口径 = `method` 无论写 `qwen3_next_mtp` 还是 `qwen3_5_mtp`，都会被 `config/speculative.py` 判为 deprecated 并 alias 成 `mtp`，**draft 架构实际由 `hf_config_override` 从 target config 推出**（`model_type=qwen3_5` + `mtp_num_hidden_layers=1` → `qwen3_5_mtp` / `Qwen3_5MTP`），故两臂 launcher 直接写 `--speculative-config.method mtp --speculative-config.num_speculative_tokens 2`。
 
-```json
-{"method":"qwen3_next_mtp","num_speculative_tokens":2}
-```
-
-先在 auto/bf16 KV、eager 下验证；和 MTP-off 做 3 轮交替，记录接受率、正确性、KV 容量和显存。
+先在 auto/bf16 KV、eager 下验证；和 MTP-off 做 3 轮交替，记录接受率、正确性、KV 容量和显存。**本卡实测约束（原计划未预见）**：带投机时单请求 16,384 需 1.71 GiB KV 而 0.88 只剩 1.44 GiB，引擎自估最大长度 12,000 ⇒ 两臂必须同退 `--max-model-len 12000`；`--gpu-memory-utilization 0.95`（厂商 16GB MTP 预设）在本卡不可达（启动空闲仅 14.68/15.89 GiB）。结果与代价账见 §1.1 与步骤 085。
 
 ### 阶段 O3：Orca 专用 DFlash2
 
@@ -195,7 +192,6 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 - 当前真正下一步：**KVMem K3 —— raw-K 捕获 → Mean-K 索引 → softmax-over-pages 检索 → 固定槽位重物化**。
 - Orca native CUDA + auto KV + eager chat：GO，仅作为兼容基线。
 - **Orca NVFP4：GO（084，修复后）**——默认布局 bug 已在 engine core 泛化修复（nvfp4 未钉布局 → LBHNC 优先），O1 launcher = `tools/serve_orcasaq2_029_nvfp4.cmd`；性能只记录（12.2K TTFT 7.15s）。
-- Orca MTP：未测（下一头名 = O2）。
-- Orca MTP：未测。
+- **Orca MTP：GO（085）**——checkpoint 自带 1 层 MTP 头可用，接受率 0.627–0.646、平均接受长度 2.25–2.29、解码 **2.12x**（45.5 vs 21.5 tok/s），正确性 on/off 各 9/9。代价 = KV 池 −36.6%、并发 1.64x→1.04x、权重 +0.21 GiB，且 **16 GB 卡上带投机起不了 16K**（引擎自估上界 12,000），两臂同用 12,000/0.88。下一头名 = O3。
 - Orca DFlash2：正式纳入，但需要 Orca adapter 和匹配 draft。
 - Orca KVMem：顺延到 GSQ K3 和 Orca O1 之后。
