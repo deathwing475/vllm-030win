@@ -54,10 +54,24 @@ ARMS = {
     # with mbt raised over the 2784-token nvfp4 page in BOTH arms (iron rule 11).
     "on4": os.path.join(TOOLS, "serve_orcasaq2_029_nvfp4_mtp.cmd"),
     "off4": os.path.join(TOOLS, "serve_orcasaq2_029_nvfp4_nomtp.cmd"),
+    # step 088: DFlash2 instead of the native MTP head, auto KV (plan section O3 item 4).
+    "d2": os.path.join(TOOLS, "serve_orcasaq2_029_dflash2.cmd"),
+    # step 088 b2: same draft on the nvfp4 KV tier (the precision Orca is served in).
+    "d24": os.path.join(TOOLS, "serve_orcasaq2_029_nvfp4_dflash2.cmd"),
 }
 # 085's arms run at max-model-len 12000 (auto KV could not afford 16K with a draft head),
 # 086's nvfp4 arms target 16384 again, so the haystack follows O1's 12,206-token needle.
-NEEDLE_TOKENS_BY_ARM = {"on": 9000, "off": 9000, "on4": 12000, "off4": 12000}
+NEEDLE_TOKENS_BY_ARM = {"on": 9000, "off": 9000, "on4": 12000, "off4": 12000,
+                        "d2": 9000, "d24": 12000}
+# S088_NEEDLE caps the haystack for arms whose context is smaller than the default tier
+# (085's lesson: build_prompt overshoots its target, so the cap must stay well under L).
+if os.environ.get("S088_NEEDLE"):
+    _cap = int(os.environ["S088_NEEDLE"])
+    NEEDLE_TOKENS_BY_ARM = {k: min(v, _cap) for k, v in NEEDLE_TOKENS_BY_ARM.items()}
+# Evidence/ledger stay in 085's own directories unless a later step redirects them, so
+# re-running an 085 boot still lands where the step-085 record says it should.
+EVID = os.environ.get("S085_EVID_DIR", EVID)
+STATE = os.environ.get("S085_STATE_FILE", STATE)
 BASE = "http://127.0.0.1:8001"
 
 # The needle haystack size and depths follow 084 boot5, shrunk for this arm's 12,000-token
@@ -154,6 +168,12 @@ PATTERNS = {
     # to prove it is running, not just that it was not rejected)
     "nvfp4_layout": r"NVFP4 KV cache: preferring the head-major layout (\w+)",
     "nvfp4_write_path": r"(NVFP4 KV write path: [A-Za-z ]+)",
+    # step 088 self-attestation for the DFlash2 path (iron rule 13: a gated path has to show
+    # it is live). A DFlash2 draft that never asks the target for its aux taps, or that lands
+    # on the V1 runner, would still boot and answer -- but it would be DFlash1 semantics.
+    "aux_layers_from_config": r"Using Eagle3 auxiliary layers from config: \(([^)]*)\)",
+    "v2_runner": r"(Using V2 Model Runner)",
+    "draft_resolved_arch": r"Resolved architecture: (DFlash2DraftModel)",
 }
 
 
@@ -171,6 +191,8 @@ def parse_boot_log(out_log: str, err_log: str) -> dict:
                 ("tokens", "gib", "concurrency")) or key in (
                 "kv_pool_tokens", "attention_block_tokens", "spec_tokens") else m.group(1)
     rec["error_lines"] = len(re.findall(r"\bERROR\b", blob))
+    rec["empty_shared_tolerated"] = len(re.findall(
+        r"s085.*\b(empty|tolerat)\w*\b", blob, re.I))
     rec["traceback_lines"] = len(re.findall(r"Traceback \(most recent call", blob))
     rec["engine_failed"] = "EngineCore failed to start" in blob
     rec["draft_model_log"] = [ln.strip()[:200] for ln in blob.splitlines()
@@ -323,7 +345,8 @@ def cmd_next(args) -> int:
     say("STATE %s" % json.dumps({k: rec.get(k) for k in (
         "boot", "arm", "boot_s", "health", "fatal", "attention_block_tokens",
         "kv_pool_tokens", "max_concurrency", "kv_cache_avail_gib", "model_load_gib",
-        "error_lines", "traceback_lines")}, ensure_ascii=False))
+        "error_lines", "traceback_lines", "aux_layers_from_config", "v2_runner",
+        "draft_resolved_arch", "empty_shared_tolerated")}, ensure_ascii=False))
     return 0 if rec.get("health") else 1
 
 
@@ -382,7 +405,8 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     n = sub.add_parser("next")
     n.add_argument("--boot", required=True)
-    n.add_argument("--arm", required=True, choices=("on", "off", "on4", "off4"))
+    n.add_argument("--arm", required=True,
+                   choices=("on", "off", "on4", "off4", "d2", "d24"))
     n.add_argument("--timeout", type=float, default=600.0)
     n.add_argument("--wait-mib", type=float, default=800.0)
     n.add_argument("--keep-up", action="store_true")
