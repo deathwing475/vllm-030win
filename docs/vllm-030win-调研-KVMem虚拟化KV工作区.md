@@ -1464,6 +1464,38 @@ prefill 完成步：score 触发照旧（061 的 `start+num ≥ prompt_len`）�
 
 ---
 
+## 12.26 ⭐步骤 083：阶段 1 出口清单五项收口 = 全 GO——canary / 紧预算 / 冷 262K / 串台 / 1456 装配回归；修 072 装配语义回归 + 定罪 pinned 快照区吃提交预算；KVMem 线冻结（2026-10-03）
+
+**五项出口判定**（runner 六轮 `_tmp_line_b/roundE1..E6_082.py`，boot e1a-e1n 共 12 台，台账 `prod029_logs/stepe1_boots.json` + `kvmem_e1{a..n}/`）：
+
+| # | 出口 | 协议形态 | 关键读数 | 判定 |
+|---|---|---|---|---|
+| 1 | identity canary | 082 臂，L=48,564 ≤ B=97,888（连接器在场、视窗不激活）vs 生产（无连接器），greedy | 两端 text `"\n\n77349"` / finish=stop / 4 chunks 逐字节一致；臂侧指纹 `recent_tokens=32768`（原生分支，§12.15.1 口径） | **GO** |
+| 2 | 紧预算 needle | `S079_PAGES=1`：窗口 = sink 1,456 + 1 页 + recent 16,384 = 19,296 | d0.55 **MISS**（hit=false，模型开始推理但答不出编号）＝ recency-only 必败；与 082-B 8/8 HIT（retrieval 必成）三角闭合 | **GO** |
+| 3 | 冷 262K transcript | `cold262k` 臂（=074 逐字：L=262,144 / SW 163,072 / 无投机 / 页 1424） | probe 258,830 token 三段（ingest/flush/serve）全 ok 不崩不 OOM；needle HIT（已知风险带只记录）；零 ERROR | **GO** |
+| 4 | 多轨迹/串台 | 同 boot 四轨迹：probe A → probe B → serve A 重发（B/C/D 入库后 A 的检索链重走） | A 重发与首遍**逐位一致**、B 也 HIT ⇒ 零污染；200 槽被四轨迹挤满的丢页 WARNING 如实记录（容量紧处非串台） | **GO** |
+| 5 | 1456 页长装配回归 | `load1456` 臂（=082 逐字 + VIEWPORT=0 + `S082_LOAD` 注入），066 忠实协议（SPEC=0 + MBT=1456），LOAD=1(e1n) vs LOAD=0(e1i) | matches at 51,264 (36 stored pages) → issued (72 page(s) + 6 mamba state block(s)) → prefix landed requested=1 completed=1；TTFT 198.2 vs 239.5 s = −17.2%（share 25.8%，bound 内）；needle 双 HIT；零 ERROR；decode 在图上 | **GO** |
+
+**途中修掉/定罪的三件事**：
+
+1. **072 装配语义回归（真缺陷，已修）**：066 的 `_assembly_match` 假设"工作区只持滑窗外页"（装配边界 = `(L−W)` 页对齐）；072 的滚动入库改成**每页算完即存**后连续 run 涨到全 prompt，e1l 实测 `matches at 198016 tokens (136 stored page(s))` ⇒ 装配要把 2 块/页 × 136 = 272 块实体化，而请求的滑窗足迹只有 ~182 块（SW 131,072）⇒ 池返 null ⇒ `group 6 has no real block at page 0; skipping the load` ⇒ 装载跳过、请求**永久 Deferred**（`Waiting: 1, Deferred: 1` 空转）。072 以来 LOAD=1 从未被跑过，潜伏至今。**修法** = 页 run cap 在滑窗淘汰边（`evict_edge = prompt_len − spec.sliding_window`，窗内页归原生 prefill），只动 `kvmem_workspace/manager.py` 不触发 AOT。072 之后 LOAD=1 线的行为变化属于这个入口的回归面。
+2. **LOAD=1 boot OOM 定罪 = pinned host 快照区吃 WDDM 提交预算（必守 27）**：LOAD=1 在 `load1456` 臂上 5 连挂（e1c / e1g 净重试 90s 宽限 / e1h 去草稿 / e1j 池 3.2e9 / e1k capture 1），同 launcher LOAD=0 三连过（e1d/e1i）——不是骰子。OOM 位置 = `_init_kv_zero_meta` 的 tiny uint64 tensor，报 driver 级 `cudaErrorMemoryAllocation`（无 torch "Tried to allocate"）= **提交预算域**（044 域）。横幅证据：`snapshot region 2 x 20 row(s) (3.00 GiB host)`——LOAD=1 boot 期 pinned 快照区 = keep 20 × traj 2 × 48 mamba 层 × 1.68 MB；067 时代同区 2.93 GiB 能过 = 当时无草稿（+0.53 GiB）+ capture 1（图池更小）。**缓解旋钮** = `VLLM_KVMEM_SNAPSHOT_EVERY_PAGES=12` + `SNAPSHOT_KEEP=10` ⇒ 区 1.47-1.50 GiB（腾 ~1.5 GiB）；代价 = boundary 回退到较近的快照行（e1m/e1n boundary 52,416/51,264 而非结构 66,976，36 页 = 72 块 ≤ 182 ✓），机制判据不变。**快照环参数选取约束**：`keep × every ≥ 边界存活期（ingest 尾段页步数，200K ingest ≈ 101）`，否则老边界被 FIFO 滚掉、cap 后无 candidates 可用。
+3. **`PAGES=0` 被 `_env_int` 下界拒绝**（"must be positive, got 0"）——紧预算对照退 `PAGES=1`（窗口 19,296 + 1 个非针检索槽，效果等价）。
+
+**边界（勿误读）**：
+
+- **`outputs_identical` 不是装配判据**：066 §12.12.5 原文——引擎自身非位精确（"PPL 非位精确"），且装配/全量路径的 chunk 起点、`seq_len`、KV 物理块本就不同，逐位一致不是"加开关就能拿到"的性质。分歧用**共同前缀相对口径**：e1n(装配) vs e1i(全量) = 99 字符，与跨 boot 自然分歧基线（同为全量路径的 e1i vs e1d 也是 99）同量级 ⇒ 装配未引入超出自然带的分歧（needle 双腿 HIT、都是连贯同向总结）。
+- **spec×装配的 equality 破**（e1m vs e1d 共同前缀 13 字符）：066 协议本就无投机；e1m/e1d（spec=1）的分歧方向指向 draft 组（组 8）状态未随装配恢复（快照抓取/恢复覆盖面 n=1 未定性）——**属冻结后再授权的工程**，不在阶段 1 出口内。
+- e1m（spec=1）的 matches/issued/landed 三环同样全过（boundary 52,416 = 36 页，与环参数预测一字不差）——**装配 × 投机的调度共存本身是通的**（077 的 mbt 口径成立），破的只是输出一致性。
+- compare 自算 boundary（`(L−W)//page×page = 66,976`）与实测 51,264 的差 = 快照环 cap（记录，不算失配）；compare 的 TTFT 判据跨 boot 态骰子只作参考（必守 7/24）。
+- canary 判"逐 token 一致"的可行域：仅限 `L ≤ B` 的原生分支（视窗不激活）；`L > B` 的视窗分支路径本就改写序列，不适用 canary 口径。
+
+**KVMem 阶段 1 出口达成（判据链 057→083 全绿）→ 冻结 KVMem 移植线回原项目主线**（`docs/orcasaq2后续推进计划.md`：Orca NVFP4 → MTP → Orca 专用 DFlash2 adapter/draft → Orca/KVMem）。变体 bat 并存保留、生产默认不动；任何 KVMem 再入（检索优化、N/R/VIEWPORT 寻优、GPU 化烘焙、长稳产品化、缩池换余量、生产切换、spec×装配 equality 工程）须用户单独授权。收尾：watchdog 恢复生产 boot0 一把 FAST（median 120.61）、headroom 484 MiB、降页 0 MiB、verdict OK。
+
+**证据**：`prod029_logs/stepe1_boots.json`（12 boot 台账 + summary）、`stepe1_{e1a..e1n}_arm.{out,err}.log`、`kvmem_e1{a..n}/`（dump + vp/asm json）、`kvmem_e1_canary/vp_canary_prod.json`（生产基准）、`_tmp_line_b/roundE{1..6}_082.py` + `roundE{1..6}_082.log`、代码 diff = `vllm/v1/kvmem_workspace/manager.py`（`_assembly_match` cap）+ `tools/serve_gsq_kvmem_{load1456,cold262k}.cmd`。
+
+---
+
 ## 11. 参考索引
 
 | 资源 | 位置 |

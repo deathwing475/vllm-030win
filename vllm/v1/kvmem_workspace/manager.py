@@ -1058,9 +1058,28 @@ class KVMemWorkspaceScheduler:
         group_id = self.group_ids[0]
         block_size = self.block_size[group_id]
         prompt_len = len(token_ids)
+        # Step E1 (stage-1 exit, page-1456 assembly regression): the step 066
+        # semantics is that assembly delivers the pages the sliding window
+        # EVICTED ("the workspace only ever holds the pages the sliding window
+        # evicted" - kvmem_assembly_probe.compare). Step 072's rolling ingest
+        # stores EVERY completed page, so the contiguous run below now covers
+        # the whole prompt and matched grew to ~L; materialising 2 blocks per
+        # page for the full run (272 for a 200K prompt) exceeds what the
+        # request's sliding-window footprint can own (2 x ~91 blocks on the
+        # SW=131072 arm), the pool returns nulls, the load is skipped and the
+        # request defers forever (stepe1_e1l: "group 6 has no real block at
+        # page 0"). Cap the page run at the window-eviction edge: pages inside
+        # the window are native-prefill territory anyway (and 066's own
+        # boundary formula never claimed them).
+        sw = getattr(
+            self.kv_cache_config.kv_cache_groups[group_id].kv_cache_spec,
+            "sliding_window", None,
+        )
+        evict_edge = max(0, prompt_len - sw) if sw else prompt_len
         num_pages = 0
         while (
             num_pages * block_size + block_size <= prompt_len
+            and num_pages * block_size + block_size <= evict_edge
             and (trajectory, num_pages * block_size) in self._page_table
         ):
             num_pages += 1
