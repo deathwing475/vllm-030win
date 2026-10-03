@@ -170,17 +170,17 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 4. 在 auto KV、eager、无 MTP 下做单步 hidden/logits 对齐；
 5. 再做完整 speculative service、接受率、needle 和长稳。
 
-**禁止直接复用 GSQ 的 `dflash2\\gptq3c`。**
+**禁止直接复用 GSQ 的 `dflash2\\gptq3c`。** —— **✅ 用户 2026-10-03 裁定解除：O3/088 走路线①，复用 `dflash2\gptq3c`（0.545 GiB）**。口径：**解除仅限 O3/088 的 Orca DFlash2 臂**，不代表其它场景可默认复用；已知代价 = 其 GPTQ Hessian 在 GSQ 栈上采 ⇒ 对 Orca 属外推，**判据 = 实测接受率**（GSQ 带 62.82%；参照量级 = 051 只改码本位宽就动了 −0.91pp），**明显掉出该带即回到路线②/③**。
 
 **✅ 步骤 087 已完成第 1-3 项（零显存；工具 `tools/step087_o3_meta_probe.py`，证据 `prod029_logs/step087_o3_meta_probe.txt`）**：
 
 - **第 1 项（盘点）**：12 条假设带 file:line 落在步骤文档。**三条是装饰品**——`dflash_config.block_size: 8` 在 dflash 路径不被读（`speculative.py` 只在 `method=="dspark"` 碰它；草稿块长实为 `1 + num_speculative_tokens`，`qwen3_dflash2.py:268`）、`num_target_layers: 64` 全树唯一消费者是 DSpark、`use_sliding_window`/`max_window_layers` 不读。**"对 GDN state / full-attention 的假设"这一条 = 空集**（草稿 config 无 mamba/linear_attention 字段，5 层纯 Qwen3 滑窗注意力；投机与 GDN 的关系只落在 target 侧页几何 = 必守 28②）。真被读的：`target_layer_ids`（+1 ⇒ (6,20,34,48,62)）、`is_causal=false`、5×`sliding_attention`+`sliding_window 2048`、`mask_token_id 248070`（走共享 target `embed_tokens`，两模型 `vocab.json` 逐字节相同）、`conv_kernel/group`（要求 `hidden % group == 0`）、`selector_rank/top_k`、以及唯一的兼容守卫 `fc` 宽度。
 - **第 3 项（target adapter）前提被推翻 ⇒ 无需实现**：`Qwen3_5ForCausalLM` `supports_eagle3=True`、`set_aux_hidden_state_layers` 可用、tap 捕获本体在 `Qwen3NextModel`（`qwen3_next.py:789, 821-853`），GSQ 生产用的就是同一套。兼容守卫对 Orca 实算 **PASS**：`_get_dflash_fc_input_size = 25600 = 5 × 5120`、`248070 < 248320`、`max(aux)=62 < 64`。runner：`use_v2_model_runner=True` 且 **V1 明确拒绝 dflash2**（`_get_v1_model_runner_unsupported_features() = ['dflash2 drafts']`）⇒ 只能走 V2，而 085/086 的 Orca 臂横幅已是 `Using V2 Model Runner` ⇒ **EXL3 × V2 已被证可用**。`max_num_new_slots_for_drafting = 2` ⇒ 必守 11/28 的 `mbt ≥ 页长 + num_spec` 原样适用。
-- **第 2 项 = 当前真门（待用户裁定）**：全盘只有 `Qwen3.8-27B-3Bit-GSQ\dflash2\` 一个草稿族，**`qwen3.8exl3` 里零 draft**。溯源 = GGUF 元数据 `general.source.url = huggingface.co/z-lab/Qwen3.8-27B-DFlash2`（1.9B）⇒ **草稿权重是按 base Qwen3.8-27B 训练的，不是按 GSQ 训练的**；GSQ 特异性只来自"重量化标定"这一层（gptq* 的 GPTQ Hessian 在 GSQ 栈上用零重叠标定集采，见《DFlash2-混合精度量化-交接文档v4.md:148-157》）。体量实测 = bf16 源 **3.58 GiB** / ct4bit **1.19 GiB** / gptq3c **0.545 GiB**；Orca 权重 11.94 GiB ⇒ **bf16 草稿在 16 GB 卡上装不下，任何 Orca DFlash2 臂只能用量化草稿**。三条候选：
+- **第 2 项 = 当前真门（✅ 用户 2026-10-03 已裁定 = 路线①）**：全盘只有 `Qwen3.8-27B-3Bit-GSQ\dflash2\` 一个草稿族，**`qwen3.8exl3` 里零 draft**。溯源 = GGUF 元数据 `general.source.url = huggingface.co/z-lab/Qwen3.8-27B-DFlash2`（1.9B）⇒ **草稿权重是按 base Qwen3.8-27B 训练的，不是按 GSQ 训练的**；GSQ 特异性只来自"重量化标定"这一层（gptq* 的 GPTQ Hessian 在 GSQ 栈上用零重叠标定集采，见《DFlash2-混合精度量化-交接文档v4.md:148-157》）。体量实测 = bf16 源 **3.58 GiB** / ct4bit **1.19 GiB** / gptq3c **0.545 GiB**；Orca 权重 11.94 GiB ⇒ **bf16 草稿在 16 GB 卡上装不下，任何 Orca DFlash2 臂只能用量化草稿**。三条候选：
 
 | 路线 | 成本 | 与"禁止复用 gptq3c"的关系 |
 |---|---|---|
-| ①复用 `gptq3c`（0.545 GiB，GSQ 接受率 62.82% 已知） | 零准备，直接 boot | **违背**；且 Hessian 属 GSQ 标定，对 Orca hidden 分布是外推 |
+| ①复用 `gptq3c`（0.545 GiB，GSQ 接受率 62.82% 已知） | 零准备，直接 boot | **✅ 用户 2026-10-03 裁定采用（仅限 O3/088）**；已知代价 = Hessian 属 GSQ 标定、对 Orca 分布是外推 ⇒ 判据 = 实测接受率，明显掉出 62.82% 带即回②/③ |
 | ②从 bf16 源做 Orca 线 **RTN 无标定**重量化（`quant_dflash2.py --rtn --bits 3/4 --group 128`，产物 int4 ≈ 1.19 GiB / int3 ≈ 0.8 GiB） | CPU 峰值内存 ~8-10 GB（主机 23.1 GiB + 生产占 8 GiB offload mmap ⇒ 须停生产或夜间跑） | **符合**（新 artefact、独立目录） |
 | ③**用 Orca 自采 Hessian 做 GPTQ** | 一次 Orca boot + capture + 重量化 + ≥3 boot 验收 | **最贴禁令本意**，成本最高 |
 
@@ -212,5 +212,5 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 - Orca native CUDA + auto KV + eager chat：GO，仅作为兼容基线。
 - **Orca NVFP4：GO（084，修复后）**——默认布局 bug 已在 engine core 泛化修复（nvfp4 未钉布局 → LBHNC 优先），O1 launcher = `tools/serve_orcasaq2_029_nvfp4.cmd`；性能只记录（12.2K TTFT 7.15s）。
 - **Orca MTP：GO（085）**——checkpoint 自带 1 层 MTP 头可用，接受率 0.627–0.646、平均接受长度 2.25–2.29、解码 **2.12x**（45.5 vs 21.5 tok/s），正确性 on/off 各 9/9。代价 = KV 池 −36.6%、并发 1.64x→1.04x、权重 +0.21 GiB，且 **16 GB 卡上带投机起不了 16K**（引擎自估上界 12,000），两臂同用 12,000/0.88。**nvfp4 KV 档 = GO（086，限 `num_speculative_tokens=1`）**：16K 上下文保住、解码 **1.78x**、接受率 0.777–0.794、正确性两臂各 15/15，代价 = KV 池 −41.5%、并发 2.17x→1.27x；**`≥2` 步在 nvfp4 上对 ≳10K 长 prompt 停摆 = 判 NEGATIVE**（机制未定罪）。下一头名 = O3。
-- Orca DFlash2：**O3 前三项已完成（087）**——target adapter 无需新写（前提被推翻）、兼容守卫对 Orca PASS、DFlash2 只能走 V2 runner 而该组合已被 085/086 证实可用；**剩下的门 = 草稿资产**（三条路线：复用 gptq3c / 从 bf16 源做 Orca 线 RTN 无标定重量化 / 用 Orca 自采 Hessian 做 GPTQ），**待用户裁定后开 088 boot 臂**。
+- Orca DFlash2：**O3 前三项已完成（087）**——target adapter 无需新写（前提被推翻）、兼容守卫对 Orca PASS、DFlash2 只能走 V2 runner 而该组合已被 085/086 证实可用；**剩下的门 = 草稿资产**（三条路线：①复用 gptq3c / ②从 bf16 源做 Orca 线 RTN 无标定重量化 / ③用 Orca 自采 Hessian 做 GPTQ），**用户 2026-10-03 已裁定走 ①（禁令解除仅限 O3/088）⇒ 开 088 boot 臂**。
 - Orca KVMem：顺延到 GSQ K3 和 Orca O1 之后。
