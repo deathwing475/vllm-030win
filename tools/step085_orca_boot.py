@@ -50,13 +50,19 @@ STATE = os.path.join(LOGS, "step085_boots.json")
 ARMS = {
     "on": os.path.join(TOOLS, "serve_orcasaq2_029_mtp.cmd"),
     "off": os.path.join(TOOLS, "serve_orcasaq2_029_nomtp_12k.cmd"),
+    # step 086: the same speculation on the nvfp4 KV cache (the precision Orca is served in),
+    # with mbt raised over the 2784-token nvfp4 page in BOTH arms (iron rule 11).
+    "on4": os.path.join(TOOLS, "serve_orcasaq2_029_nvfp4_mtp.cmd"),
+    "off4": os.path.join(TOOLS, "serve_orcasaq2_029_nvfp4_nomtp.cmd"),
 }
+# 085's arms run at max-model-len 12000 (auto KV could not afford 16K with a draft head),
+# 086's nvfp4 arms target 16384 again, so the haystack follows O1's 12,206-token needle.
+NEEDLE_TOKENS_BY_ARM = {"on": 9000, "off": 9000, "on4": 12000, "off4": 12000}
 BASE = "http://127.0.0.1:8001"
 
 # The needle haystack size and depths follow 084 boot5, shrunk for this arm's 12,000-token
 # context: build_prompt overshoots its target (asking 11,000 delivered >= 11,905 and the
 # engine answered HTTP 400), so 9,000 is the size that actually fits with 96 output tokens.
-NEEDLE_TOKENS = 9000
 NEEDLE_DEPTHS = "0.25,0.5,0.75"
 DECODE_PROMPT = (
     "Count down from 500 to 400, one number per line, nothing else.\nAnswer:"
@@ -144,6 +150,10 @@ PATTERNS = {
     "draft_arch": r"draft model.*?architectures?=.?\[?'?(\w*MTP\w*)",
     "spec_tokens": r"num_speculative_tokens'?[:=]\s*(\d+)",
     "mamba_cache_mode": r"Mamba cache mode is set to '(\w+)'",
+    # self-attestation that the nvfp4 path is actually live (iron rule 13: a gated path has
+    # to prove it is running, not just that it was not rejected)
+    "nvfp4_layout": r"NVFP4 KV cache: preferring the head-major layout (\w+)",
+    "nvfp4_write_path": r"(NVFP4 KV write path: [A-Za-z ]+)",
 }
 
 
@@ -246,7 +256,7 @@ def boot_and_probe(boot: str, arm: str, keep_up: bool, timeout: float,
             EVID, "%s_chat.json" % boot), ["--max-tokens", "48"])
         rec["needle"] = run_probe("needle", os.path.join(
             EVID, "%s_needle.json" % boot),
-            ["--tokens", str(NEEDLE_TOKENS), "--depths", NEEDLE_DEPTHS,
+            ["--tokens", str(NEEDLE_TOKENS_BY_ARM[arm]), "--depths", NEEDLE_DEPTHS,
              "--max-tokens", "96"])
         rec["decode"] = run_probe("needle", os.path.join(
             EVID, "%s_decode.json" % boot),
@@ -330,7 +340,8 @@ def cmd_probe_only(args) -> int:
         EVID, "%s_chat.json" % args.boot), ["--max-tokens", "48"])}
     rec["needle"] = run_probe("needle", os.path.join(
         EVID, "%s_needle.json" % args.boot),
-        ["--tokens", str(NEEDLE_TOKENS), "--depths", NEEDLE_DEPTHS])
+        ["--tokens", str(NEEDLE_TOKENS_BY_ARM[row.get("arm")]),
+         "--depths", NEEDLE_DEPTHS])
     rec["decode"] = run_probe("needle", os.path.join(
         EVID, "%s_decode.json" % args.boot),
         ["--tokens", "600", "--depths", "0.5", "--max-tokens", str(DECODE_TOKENS)])
@@ -371,7 +382,7 @@ def main() -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     n = sub.add_parser("next")
     n.add_argument("--boot", required=True)
-    n.add_argument("--arm", required=True, choices=("on", "off"))
+    n.add_argument("--arm", required=True, choices=("on", "off", "on4", "off4"))
     n.add_argument("--timeout", type=float, default=600.0)
     n.add_argument("--wait-mib", type=float, default=800.0)
     n.add_argument("--keep-up", action="store_true")
