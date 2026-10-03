@@ -109,6 +109,9 @@ class KVMemWorkspaceWorker:
         self._selftest_max_byte_diff = 0
         self.bytes_stored = 0
         self.store_seconds = 0.0
+        # Step 084 generalisation: capture-hook liveness self check state.
+        self._ingest_prefill_tokens = 0
+        self._capture_hook_warned = False
 
         # vllm-030win step 079 timing instrumentation (env-gated).
         # ``storing`` is the store window as it already stands; ``copy``
@@ -211,6 +214,23 @@ class KVMemWorkspaceWorker:
                 "sliding-window group; the store stays inert"
             )
             return
+        # Step 084 generalisation: the remat/bake channel rebuilds NVFP4
+        # page bytes (fp8 scale per 16 dims, E2M1 nibbles, kernel-block
+        # interleave). Any other KV packing would receive bytes its
+        # attention kernel reads as garbage, so refuse loudly instead of
+        # silently corrupting blocks. Copy-before-free (K1) without the
+        # raw-K capture keeps working on any KV dtype.
+        if config.rawk_enabled():
+            kv_cache_dtype = str(
+                getattr(self.vllm_config.cache_config, "kv_cache_dtype", "") or ""
+            )
+            if not kv_cache_dtype.startswith("nvfp4"):
+                raise ValueError(
+                    "VLLM_KVMEM_RAWK is armed but --kv-cache-dtype is "
+                    f"'{kv_cache_dtype or 'auto'}'; the raw-K capture + "
+                    "rematerialization channel only supports NVFP4-packed "
+                    "KV pages"
+                )
         num_blocks = self.kv_cache_config.num_blocks
         for group_id in self.group_ids:
             group = self.kv_cache_config.kv_cache_groups[group_id]
@@ -844,6 +864,29 @@ class KVMemWorkspaceWorker:
         step = capture.drain()
         self._kvtime_add("drain", _s79)
         if not step:
+            # Step 084 generalisation: a model whose attention layers never
+            # call capture.record() leaves the Mean-K index permanently
+            # empty and every retrieval/bake feature silently dead. Say so
+            # once, after real prefill volume has crossed, instead of
+            # failing quietly.
+            self._ingest_prefill_tokens += sum(
+                span.num_tokens for span in metadata.spans
+            )
+            if (
+                not self._capture_hook_warned
+                and self._ingest_prefill_tokens >= 4096
+                and config.rawk_enabled()
+                and capture.stats().get("record_calls_total", 0) == 0
+            ):
+                self._capture_hook_warned = True
+                logger.warning(
+                    "vllm-030win KVMem (step 084): raw-K capture has seen "
+                    "%d prefill token(s) but 0 record() calls -- this "
+                    "model's attention layers have no pre-RoPE capture "
+                    "hook; the Mean-K index stays empty and retrieval/bake "
+                    "features are dead",
+                    self._ingest_prefill_tokens,
+                )
             return
         if self._index is None:
             geometry = capture.stats().get("geometry")

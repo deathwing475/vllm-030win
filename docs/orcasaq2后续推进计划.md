@@ -16,6 +16,7 @@
 - **KVMem 步骤 060：K1 copy-before-free + K2 准入守卫 = GO**（见 §3 阶段 K1/K2 的完成记录）。滑出窗口的历史页现在会写进 host 工作区（键 `(轨迹, token 偏移)`），往返逐字节一致，零丢页零泄漏；上限不可被越过，视窗装不下在 boot 期响亮失败。
 - **KVMem 步骤 061：K3 前半（raw-K 捕获 + Mean-K 索引 + 页级检索打分）= 机制 GO、R1 部分消解**（见 §3 阶段 K3）。检索有强信号（针页 logit +5.9/+9.2、rank 8→2 / 28→1），**粒度取 32 而不是 128**；**残余"早期页偏置"是新的头号挂账**；**重物化未做**。
 - OrcaSAQ2 步骤 059：ExLlamaV3 1.5.3 native CUDA + OrcaSAQ2 plugin 已跑通，端口 8001 的 chat smoke 通过。
+- **Orca 步骤 084（O1 = NVFP4 KV smoke）：GO（修复后）**。boot 一次成、NVFP4 写路径生效、KV 池 43,690 tokens（auto 21,845 的 2.0x）、attention block 2784 tokens/页（mamba 页约束推导，不能套 GSQ 1456）；chat identity 3/3 + needle 三深度 3/3 HIT（12,206 token）。途中定罪并泛化修复一个**引擎级默认布局 bug**：nvfp4 KV 专用 kernel 假设 head-major 页布局，默认 resolve 的 LBNHC 下页读回乱序（静默乱码零 ERROR）——GSQ 生产靠 launcher 显式 HND 恰好踩对；修复 = engine core 在 nvfp4 且用户未钉布局时优先 LBHNC。同 boot 窗口落地 KVMem 泛化六点（用户授权"顺便修"，为 O3/O4 铺路）。证据 `prod029_logs/orca_o1/`。
 
 ### 1.2 未完成的核心工程
 
@@ -193,7 +194,8 @@ v1/kvmem_workspace/{config,groups,metadata,manager,worker}.py + kvmem_connector.
 - KVMem 阶段 1a 有界 prefill：GO（057）；**K1 copy-before-free：GO（060）**；**K2 准入守卫：GO（060）**；完整 workspace 的**读取侧（检索/重物化）未开工**。
 - 当前真正下一步：**KVMem K3 —— raw-K 捕获 → Mean-K 索引 → softmax-over-pages 检索 → 固定槽位重物化**。
 - Orca native CUDA + auto KV + eager chat：GO，仅作为兼容基线。
-- Orca NVFP4：未测。
+- **Orca NVFP4：GO（084，修复后）**——默认布局 bug 已在 engine core 泛化修复（nvfp4 未钉布局 → LBHNC 优先），O1 launcher = `tools/serve_orcasaq2_029_nvfp4.cmd`；性能只记录（12.2K TTFT 7.15s）。
+- Orca MTP：未测（下一头名 = O2）。
 - Orca MTP：未测。
 - Orca DFlash2：正式纳入，但需要 Orca adapter 和匹配 draft。
 - Orca KVMem：顺延到 GSQ K3 和 Orca O1 之后。

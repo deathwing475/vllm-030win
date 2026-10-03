@@ -155,6 +155,33 @@ class KVMemWorkspaceScheduler:
             group_id: kv_cache_config.kv_cache_groups[group_id].kv_cache_spec.page_size_bytes
             for group_id in self.mamba_group_ids
         }
+        # Step 084 generalisation: the assembly/snapshot channel is defined
+        # by recurrent-state boundaries, which only a MambaSpec group has.
+        # Declare the degenerate case loudly instead of letting LOAD arms
+        # silently degrade to full prefills.
+        if self.load_enabled and not self.mamba_group_ids:
+            logger.warning(
+                "vllm-030win KVMem (step 084): prefix assembly (LOAD) is "
+                "armed but no kv cache group is a MambaSpec group; there "
+                "is no recurrent boundary to snapshot, so assembled "
+                "prefixes cannot be delivered and every load request "
+                "falls back to a full prefill"
+            )
+        if self.load_enabled and self.group_ids:
+            # Step 084 generalisation: surface the snapshot precondition
+            # (page-boundary steps only) at boot, where a wrong
+            # --max-num-batched-tokens for THIS model's page size is
+            # cheapest to notice.
+            logger.info(
+                "vllm-030win KVMem (step 084): assembly snapshots are only "
+                "captured on steps that end exactly on a page boundary "
+                "(page_size=%s); --max-num-batched-tokens=%s not being a "
+                "multiple of the page size just skips mid-page steps",
+                [kv_cache_config.kv_cache_groups[g].kv_cache_spec.block_size
+                 for g in self.group_ids],
+                getattr(vllm_config.scheduler_config, "max_num_batched_tokens",
+                        None),
+            )
         # trajectory -> page-aligned boundaries with a completed snapshot.
         self._snapshots: dict[bytes, set[int]] = {}
         # (trajectory, boundary) pairs already handed to the worker.

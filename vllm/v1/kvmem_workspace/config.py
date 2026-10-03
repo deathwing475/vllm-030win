@@ -11,6 +11,13 @@ manager.
 
 import os
 
+# Step 084 generalisation note: these defaults are tuned for the GSQ
+# production model (1456-token pages, 163,072-token sliding window,
+# 3.4e9-byte KV pool). Everything is overridable via its VLLM_KVMEM_*
+# env; when porting the workspace to another model re-derive at least
+# MAX_WORKSPACE_TOKENS (vs the new pool), RECENT_TOKENS / VIEWPORT_PAGES
+# (vs the new window and page size) and WORKSPACE_MB (vs the new page
+# bytes) from the target spec instead of trusting these values.
 DEFAULT_WORKSPACE_MB = 3072
 DEFAULT_TRAJECTORY_PREFIX_TOKENS = 512
 DEFAULT_MAX_WORKSPACE_TOKENS = 262144

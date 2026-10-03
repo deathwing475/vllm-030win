@@ -35,7 +35,11 @@ def workspace_group_ids(kv_cache_config: KVCacheConfig) -> list[int]:
     When ``VLLM_KVMEM_SW_WINDOW`` is set the window is the selector, so a
     speculative drafter's own (much smaller) sliding window cannot be mistaken
     for the target's KVMem window. Without it every sliding-window group
-    qualifies.
+    qualifies -- so an arm that runs with speculation MUST set the window,
+    otherwise the drafter's groups get stored, host slots are burned on
+    draft pages and the scheduler/worker group sets still agree but store
+    the wrong thing. (The connector recycles drafter pages it sees, but a
+    set window is the real guard.)
     """
     window = _arm_window()
     ids: list[int] = []

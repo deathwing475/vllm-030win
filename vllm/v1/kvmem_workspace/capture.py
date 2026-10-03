@@ -87,6 +87,11 @@ _DRAIN_ACC: dict[str, float] = {"sync": 0.0, "copies": 0.0}
 #   sync_calls = of those, how many paid the torch.equal stream sync
 _REC_ACC: dict[str, float] = {"seconds": 0.0, "calls": 0.0,
                               "sync_calls": 0.0}
+# Boot-lifetime armed-call total (step 084 generalisation): unlike
+# _REC_ACC["calls"] this is never zeroed per drain, so a worker-side self
+# check can tell "the model has no pre-RoPE capture hook at all" (total
+# stays 0 through real prefill steps) from "the step was a decode replay".
+_TOTAL_RECORD_CALLS = 0
 # Resolved once: _record_impl runs 16 times per page step.
 _NOSYNC: bool | None = None
 
@@ -213,6 +218,7 @@ def _record_impl(
     )
     _REC_ACC["seconds"] += time.monotonic() - _t080
     _REC_ACC["calls"] += 1.0
+    _TOTAL_RECORD_CALLS += 1
 
 
 @torch.library.custom_op("vllm_kvmem::record", mutates_args="unknown")
@@ -350,6 +356,7 @@ def stats() -> dict:
         # vllm-030win step 080 capture-record fix
         "record_seconds": round(_REC_ACC["seconds"], 3),
         "record_calls": int(_REC_ACC["calls"]),
+        "record_calls_total": _TOTAL_RECORD_CALLS,
         "record_sync_calls": int(_REC_ACC["sync_calls"]),
         "record_nosync": int(_nosync()),
     }

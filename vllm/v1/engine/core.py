@@ -286,9 +286,32 @@ class EngineCore:
         # capture full cudagraphs initialize a minimal KV cache during it.
         # Attention-free models resolve the default so layout reads never precede
         # resolution.
+        supported_layouts_lists = self.model_executor.get_supported_kv_cache_layouts()
+        # vllm-030win step 084 generalisation: the NVFP4 KV write/read kernels
+        # assume head-major pages (the CUDA writer splits (B, 2H, N, D) on
+        # num_kv_heads at dim 1). On a token-major default the pages come back
+        # scrambled with no error anywhere (Orca O1 boot0 vs boot3: LBNHC
+        # garbage, LBHNC correct, fp8/auto fine on both layouts). When the
+        # user has not pinned a layout, prefer the head-major candidate for
+        # NVFP4 KV. This runs in the engine core only, so it never touches a
+        # compiled region; a pinned VLLM_KV_CACHE_LAYOUT always wins.
+        if (
+            str(vllm_config.cache_config.cache_dtype or "").startswith("nvfp4")
+            and envs.VLLM_KV_CACHE_LAYOUT is None
+            and all("LBHNC" in names for names in supported_layouts_lists)
+        ):
+            supported_layouts_lists = [
+                ["LBHNC"] + [n for n in names if n != "LBHNC"]
+                for names in supported_layouts_lists
+            ]
+            logger.info(
+                "NVFP4 KV cache: preferring the head-major layout LBHNC "
+                "(the NVFP4 kernels read scrambled pages on token-major "
+                "defaults); set VLLM_KV_CACHE_LAYOUT to override"
+            )
         layout = resolve_kv_cache_layout(
             vllm_config,
-            self.model_executor.get_supported_kv_cache_layouts(),
+            supported_layouts_lists,
             [s for specs in kv_cache_specs for s in specs.values()],
         )
         self.model_executor.set_kv_cache_layout(layout.name)
