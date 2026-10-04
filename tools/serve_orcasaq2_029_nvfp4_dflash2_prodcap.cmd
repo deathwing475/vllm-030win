@@ -52,10 +52,28 @@ if "%S089_MBT%"=="" set "S089_MBT=1024"
 if "%S089_UTIL%"=="" set "S089_UTIL=0.922"
 if "%S089_SPEC%"=="" set "S089_SPEC=2"
 if "%S089_OFFLOAD%"=="" set "S089_OFFLOAD=8"
+rem S089_NOEAGER=1 drops --enforce-eager, i.e. the engine default graph mode. Production
+rem (serve_gsq_prod029_n2.cmd) carries NO --compilation-config line at all since step 027,
+rem which means it runs on the engine default FULL_AND_PIECEWISE -- so "graph tier here"
+rem means: no enforce-eager plus --cudagraph-capture-sizes 3, exactly like production.
+rem Iron rule 17: an L/dtype/graph change invalidates the AOT cache, so the FIRST such
+rem boot is the compile boot (首编深塌) and may not be read as a speed number.
+set "EAGERFLAG=--enforce-eager"
+if "%S089_NOEAGER%"=="1" set "EAGERFLAG="
+if "%S089_CGS%"=="" set "S089_CGS=3"
+rem S089_GRAPHPROF=0 -> VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0: the memory profiler
+rem then stops reserving the CUDA-graph capture peak out of the KV pool. Measured on this
+rem arm (s1, L=16,384): graphs-on with the default reservation left only 0.32 GiB of KV
+rem against 0.65 GiB needed, i.e. the graph reservation costs ~1.3 GiB versus the eager
+rem boot's 1.64 GiB. Setting it to 0 is a bet that the real capture peak stays under the
+rem pool, so it must be judged by whether the boot and the probes survive, not by the
+rem banner. Production runs the default (1).
+if "%S089_GRAPHPROF%"=="" set "S089_GRAPHPROF=1"
+set "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=%S089_GRAPHPROF%"
 set "POOLARG="
 if not "%S089_POOL%"=="" set "POOLARG=--kv-cache-memory-bytes %S089_POOL%"
 rem Reclaim stale offload mmaps the way production does (names are per-engine unique).
 del /q "G:\qwen3.8model\_tmp_orcasaq2\vllm_offload_*.mmap" 2>nul
 cd /d G:\qwen3.8model
-"%VENV%\Scripts\python.exe" -m vllm.entrypoints.cli.main serve "%MODEL%" --served-model-name orcasaq2 --host 127.0.0.1 --port 8001 --max-model-len %S089_L% --gpu-memory-utilization %S089_UTIL% --max-num-batched-tokens %S089_MBT% --max-num-seqs 1 --enforce-eager --dtype auto --kv-cache-dtype nvfp4 --mamba-cache-mode align --mamba-ssm-cache-dtype bfloat16 --enable-prefix-caching --kv-offloading-backend native --kv-offloading-size %S089_OFFLOAD% %POOLARG% --speculative-config.method dflash --speculative-config.model "%DRAFT%" --speculative-config.num_speculative_tokens %S089_SPEC%
+"%VENV%\Scripts\python.exe" -m vllm.entrypoints.cli.main serve "%MODEL%" --served-model-name orcasaq2 --host 127.0.0.1 --port 8001 --max-model-len %S089_L% --gpu-memory-utilization %S089_UTIL% --max-num-batched-tokens %S089_MBT% --max-num-seqs 1 %EAGERFLAG% --dtype auto --kv-cache-dtype nvfp4 --cudagraph-capture-sizes %S089_CGS% --mamba-cache-mode align --mamba-ssm-cache-dtype bfloat16 --enable-prefix-caching --kv-offloading-backend native --kv-offloading-size %S089_OFFLOAD% %POOLARG% --speculative-config.method dflash --speculative-config.model "%DRAFT%" --speculative-config.num_speculative_tokens %S089_SPEC%
 exit /b %errorlevel%

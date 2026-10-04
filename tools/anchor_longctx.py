@@ -56,10 +56,10 @@ def build_prompt(target_tokens):
     return "".join(parts)
 
 
-def run_one(base, target):
+def run_one(base, target, model="qwen3.8-27b-gsq"):
     prompt = build_prompt(target)
     payload = {
-        "model": "qwen3.8-27b-gsq",
+        "model": model,
         "prompt": prompt,
         "max_tokens": 256, "temperature": 0, "stream": True,
         "stream_options": {"include_usage": True},
@@ -117,6 +117,9 @@ def main():
     ap.add_argument("--arm", required=True)
     ap.add_argument("--warmup", type=int, default=1)
     ap.add_argument("--repeats", type=int, default=3)
+    # Orca arms are served under a different --served-model-name; the GSQ default
+    # keeps every existing GSQ anchor invocation byte-for-byte unchanged.
+    ap.add_argument("--model", default="qwen3.8-27b-gsq")
     args = ap.parse_args()
 
     models = http_json(args.base + "/v1/models")
@@ -127,7 +130,7 @@ def main():
     # 热身：弃 1 条（runner v2 口径），防首请求 JIT/时钟爬坡污染
     for w in range(args.warmup):
         try:
-            run_one(args.base, args.lengths[0])
+            run_one(args.base, args.lengths[0], args.model)
             print(f"[warmup {w + 1}/{args.warmup}] discarded", flush=True)
         except Exception as e:
             print(f"[warmup {w + 1}] {type(e).__name__}: {e}", flush=True)
@@ -137,7 +140,7 @@ def main():
         reps = []
         for i in range(args.repeats):
             try:
-                r = run_one(args.base, L)
+                r = run_one(args.base, L, args.model)
             except Exception as e:  # 单档失败不弃全盘，照实记录
                 r = {"target_tokens": L, "error": f"{type(e).__name__}: {e}"}
             print(json.dumps(r, ensure_ascii=False), flush=True)
