@@ -1,5 +1,11 @@
 """Offline unit test for the KVMem rematerialisation primitive (step 063).
 
+Step 097 moved the NVFP4 byte geometry and quantiser out of ``remat.py`` and
+into the page-codec registry (``vllm/v1/kvmem_workspace/codec.py``); T0-T9 are
+unchanged and run against that code through the codec, and T10 tests the
+registry itself (which dtype resolves to which codec, and that a placeholder
+refuses instead of guessing).
+
 The design's stage-1 exit criterion for K3's second half is a *unit test*: a
 page re-baked at a displaced position and then moved back must come out inside
 one quantisation step of the original, and the maximum deviation must be
@@ -65,6 +71,18 @@ def check(name: str, ok: bool, detail: str = "") -> bool:
     _results.append((name, bool(ok), detail))
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f" -- {detail}" if detail else ""))
     return bool(ok)
+
+
+def _raises(exc_type: type, call) -> bool:
+    """True when *call* raises this error type -- a guard that stays silent fails."""
+    try:
+        call()
+    except exc_type:
+        return True
+    except Exception as exc:  # noqa: BLE001 - the wrong type is a failure too
+        print(f"    (raised {exc!r}, expected {exc_type.__name__})")
+        return False
+    return False
 
 
 def load_geometry() -> dict:
@@ -152,16 +170,12 @@ def main() -> int:
         side_carve_views,
         write_reference_nvfp4_cache,
     )
+    from vllm.v1.kvmem_workspace import codec as codec_mod
+    from vllm.v1.kvmem_workspace.codec import NVFP4_PAGE_CODEC as nvfp4
     from vllm.v1.kvmem_workspace.remat import (
-        PageGeometry,
         bake_rotated_k,
-        dequantize_rotated,
-        quantize_rotated,
-        read_rotated,
         rematerialize_page,
-        rotated_byte_offsets,
         rotated_prefix_from_packed_k,
-        write_rotated,
     )
 
     cfg = load_geometry()
@@ -170,8 +184,12 @@ def main() -> int:
     rotary_dim = int(head_size * cfg["partial_rotary_factor"])
     rope_parameters = cfg["rope_parameters"]
     mrope_section = list(rope_parameters["mrope_section"])
-    geom = PageGeometry(
-        head_size, num_heads, BLOCK_SIZE, rotary_dim, KERNEL_BLOCK_SIZE
+    geom = nvfp4.page_geometry(
+        head_size=head_size,
+        num_heads=num_heads,
+        block_size=BLOCK_SIZE,
+        rotary_dim=rotary_dim,
+        kernel_block_size=KERNEL_BLOCK_SIZE,
     )
 
     print("KVMem rematerialisation unit test (step 063, real layout per 064)")
@@ -326,12 +344,12 @@ def main() -> int:
 
     ours_page = torch.zeros(geom.page_bytes, dtype=torch.uint8, device=device)
     rematerialize_page(
-        ours_page, geom,
+        ours_page, nvfp4, geom,
         raw_k[..., :rotary_dim].contiguous(), tokens, pos2d, cache,
         k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
         mrope_section=mrope_section,
     )
-    data_off, scale_off = rotated_byte_offsets(geom, tokens)
+    data_off, scale_off = nvfp4.rotated_byte_offsets(geom, tokens)
     e_rot = torch.cat(
         [engine_page[data_off.reshape(-1)], engine_page[scale_off.reshape(-1)]]
     )
@@ -365,7 +383,7 @@ def main() -> int:
         .permute(0, 2, 1, 3)
         .reshape(BLOCK_SIZE, num_heads, geom.rot_scale_bytes)
     )
-    ours_packed, ours_sf = read_rotated(ours_page, geom, tokens)
+    ours_packed, ours_sf = nvfp4.read_rotated(ours_page, geom, tokens)
     check("carve data slice == primitive's view",
           bool(torch.equal(cd.contiguous(), ours_packed.contiguous())),
           f"shape {tuple(ours_packed.shape)}")
@@ -382,13 +400,13 @@ def main() -> int:
     pos_disp = (pos2d + disp).contiguous()
     moved = torch.zeros(geom.page_bytes, dtype=torch.uint8, device=device)
     rematerialize_page(
-        moved, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos_disp, cache,
+        moved, nvfp4, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos_disp, cache,
         k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
         mrope_section=mrope_section,
     )
     back = moved.clone()
     rematerialize_page(
-        back, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos2d, cache,
+        back, nvfp4, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos2d, cache,
         k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
         mrope_section=mrope_section,
     )
@@ -404,13 +422,13 @@ def main() -> int:
     walk = torch.zeros(geom.page_bytes, dtype=torch.uint8, device=device)
     for step in range(8):
         rematerialize_page(
-            walk, geom, raw_k[..., :rotary_dim].contiguous(), tokens,
+            walk, nvfp4, geom, raw_k[..., :rotary_dim].contiguous(), tokens,
             (pos2d + disp * (step + 1)).contiguous(), cache, k_scale=k_scale,
             is_neox_style=bool(rotary_emb.is_neox_style),
             mrope_section=mrope_section,
         )
     rematerialize_page(
-        walk, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos2d, cache,
+        walk, nvfp4, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos2d, cache,
         k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
         mrope_section=mrope_section,
     )
@@ -424,8 +442,8 @@ def main() -> int:
         raw_k[..., :rotary_dim].contiguous(), pos2d, cache,
         is_neox_style=bool(rotary_emb.is_neox_style), mrope_section=mrope_section,
     )
-    packed, sf = quantize_rotated(post, k_scale=k_scale)
-    deq = dequantize_rotated(packed, sf, k_scale=k_scale)
+    packed, sf = nvfp4.quantize_rotated(post, k_scale=k_scale)
+    deq = nvfp4.dequantize_rotated(packed, sf, k_scale=k_scale)
     err = (deq - post.float()).abs()
     # Per-group step at the top of the E2M1 range, in dequantised units.
     sf_value = sf.view(torch.float8_e4m3fn).float().unsqueeze(-1)
@@ -445,7 +463,7 @@ def main() -> int:
     print("\nT6 a re-bake leaves the position-independent bytes alone")
     keep = engine_page.clone()
     rematerialize_page(
-        keep, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos_disp, cache,
+        keep, nvfp4, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos_disp, cache,
         k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
         mrope_section=mrope_section,
     )
@@ -462,7 +480,7 @@ def main() -> int:
     # the untouched bytes, then rebuild and compare to the engine's page.
     rebuilt = engine_page.clone()
     rematerialize_page(
-        rebuilt, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos2d, cache,
+        rebuilt, nvfp4, geom, raw_k[..., :rotary_dim].contiguous(), tokens, pos2d, cache,
         k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
         mrope_section=mrope_section,
     )
@@ -511,6 +529,76 @@ def main() -> int:
           bool(np.array_equal(region.numpy()[offsets], rows)))
     check("offsets nobody wrote stay zero",
           int(region.numpy()[13:500].sum()) == 0)
+
+    # ---------------------------------------------------------------- T10
+    print("\nT10 page codec registry (step 097: what the dtype guard asks)")
+    check("the registry answers nvfp4 with the codec this test just used",
+          codec_mod.select_codec("nvfp4") is nvfp4
+          and codec_mod.codec_for_dtype("nvfp4") is nvfp4)
+    check("the byte geometry now comes from the codec, not a literal",
+          geom.data_dim == head_size // 2
+          and geom.scale_dim == head_size // 16 and geom.scale_group == 16,
+          f"data {geom.data_dim} B + scales {geom.scale_dim} B per head")
+    check("'auto' claims no codec, so an armed raw-K boot refuses it",
+          codec_mod.select_codec("auto") is None
+          and codec_mod.codec_for_dtype("auto") is None)
+    bf16 = codec_mod.select_codec("bfloat16")
+    fp8 = codec_mod.select_codec("fp8_e4m3")
+    check("bfloat16 and fp8 resolve to registered placeholders that may not run",
+          bf16 is not None and bf16.name == "bf16" and bf16.implemented is False
+          and bf16.supported("bfloat16") is False
+          and codec_mod.codec_for_dtype("bfloat16") is None
+          and fp8 is not None and fp8.name == "fp8",
+          codec_mod.describe_registry())
+    refusals = []
+    for label, call in (
+        ("page_geometry", lambda: bf16.page_geometry(
+            head_size=head_size, num_heads=num_heads, block_size=BLOCK_SIZE,
+            rotary_dim=rotary_dim, kernel_block_size=KERNEL_BLOCK_SIZE)),
+        ("encode_rotary_prefix", lambda: bf16.encode_rotary_prefix(
+            None, None, None, None)),
+        ("decode_rotary_prefix", lambda: bf16.decode_rotary_prefix(
+            None, None, None)),
+    ):
+        try:
+            call()
+            refusals.append((label, "did not raise"))
+        except NotImplementedError as exc:
+            refusals.append((label, str(exc)))
+    check("every placeholder entry point refuses with the reason and the gap",
+          all("registered placeholder" in msg for _, msg in refusals),
+          "; ".join(f"{label}: {msg[:60]}" for label, msg in refusals))
+    check("the packing's own divisibility guard still fires",
+          _raises(
+              ValueError,
+              lambda: nvfp4.page_geometry(
+                  head_size=100, num_heads=num_heads, block_size=BLOCK_SIZE,
+                  rotary_dim=rotary_dim, kernel_block_size=KERNEL_BLOCK_SIZE),
+          ))
+    prefix = nvfp4.decode_rotary_prefix(ours_page, geom, tokens)
+    check("decode_rotary_prefix returns the same codes and scales as the reader",
+          bool(torch.equal(prefix.codes, ours_packed))
+          and bool(torch.equal(
+              prefix.scales.view(torch.uint8), ours_sf.view(torch.uint8))))
+    check("its values == dequantising those bytes (no second implementation)",
+          bool(torch.equal(prefix.values, deq)))
+    # The interface has to place bytes like the byte writer does, not merely
+    # quantise the same way: same zero page, same tokens, compare in bulk.
+    via_encode = torch.zeros(geom.page_bytes, dtype=torch.uint8, device=device)
+    nvfp4.encode_rotary_prefix(via_encode, geom, tokens, post, k_scale=k_scale)
+    via_write = torch.zeros(geom.page_bytes, dtype=torch.uint8, device=device)
+    qp, qsf = nvfp4.quantize_rotated(post, k_scale=k_scale)
+    nvfp4.write_rotated(via_write, geom, tokens, qp, qsf)
+    check("encode_rotary_prefix == quantise then write, whole page identical",
+          bool(torch.equal(via_encode, via_write)),
+          f"{int((via_encode != via_write).sum())} byte(s) differ of "
+          f"{via_encode.numel()}")
+    sf_check = sf.view(torch.float8_e4m3fn).float()
+    step_check = float(torch.where(
+        sf_check > 0, 2.0 / sf_check, torch.zeros_like(sf_check)).max())
+    check("its max_step is the step-064 yardstick recomputed here",
+          abs(prefix.max_step - step_check) < 1e-12,
+          f"{prefix.max_step:.6e}")
 
     failed = [name for name, ok, _ in _results if not ok]
     print("\n" + "=" * 72)

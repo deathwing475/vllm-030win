@@ -26,7 +26,7 @@ from vllm import _custom_ops as ops
 from vllm.logger import init_logger
 from vllm.model_executor.models.utils import extract_layer_index
 from vllm.v1.kv_cache_interface import MambaSpec, group_kernel_blocks
-from vllm.v1.kvmem_workspace import capture, config, remat
+from vllm.v1.kvmem_workspace import capture, codec, config, remat
 from vllm.v1.kvmem_workspace.groups import workspace_group_ids
 from vllm.v1.kvmem_workspace.index import KVMemMeanKIndex
 from vllm.v1.kvmem_workspace.metadata import (
@@ -93,7 +93,11 @@ class KVMemWorkspaceWorker:
         self._group_of_layer: dict[str, int] = {}
         self._layer_name_by_index: dict[int, str] = {}
         self._block_size: dict[int, int] = {}
-        self._geometry: dict[int, remat.PageGeometry] = {}
+        # Step 097: the page codec is chosen from the registry by
+        # ``register_kv_caches``; None means no codec can run on this
+        # ``--kv-cache-dtype``, so the remat channel stays unbuilt.
+        self._codec: codec.PageCodec | None = None
+        self._geometry: dict[int, codec.PageGeometry] = {}
         # scratch buffers for the round-trip self test
         self._scratch_gpu: dict[int, torch.Tensor] = {}
         self._scratch_host: dict[int, torch.Tensor] = {}
@@ -214,30 +218,35 @@ class KVMemWorkspaceWorker:
                 "sliding-window group; the store stays inert"
             )
             return
-        # Step 084 generalisation: the remat/bake channel rebuilds NVFP4
-        # page bytes (fp8 scale per 16 dims, E2M1 nibbles, kernel-block
-        # interleave). Any other KV packing would receive bytes its
-        # attention kernel reads as garbage, so refuse loudly instead of
-        # silently corrupting blocks. Copy-before-free (K1) without the
-        # raw-K capture keeps working on any KV dtype.
-        if config.rawk_enabled():
-            # Step 096 fix: the guard added in step 084 read the CacheConfig
-            # field by the wrong name ("kv_cache_dtype" -- the dataclass
-            # field is "cache_dtype"), so getattr always fell back to "" and
-            # every RAWK boot died on a false positive. No KVMem arm ran
-            # between 084 and 096, so it surfaced here first. With the real
-            # field name the guard reads "nvfp4" from the launcher and
-            # passes -- the step-083 arm state this regression anchor needs.
-            kv_cache_dtype = str(
-                getattr(self.vllm_config.cache_config, "cache_dtype", "") or ""
+        # Step 084 generalisation, page-codec half landed in step 097: the
+        # remat/bake channel rebuilds page bytes in the packing the engine's KV
+        # cache actually uses (for NVFP4 that is an fp8 scale per 16 dims, E2M1
+        # nibbles, kernel-block interleave). Which dtype may arm is therefore
+        # the registry's answer, not a hard-coded prefix here -- a page baked by
+        # the wrong codec hands the attention kernel bytes it reads as garbage,
+        # so refuse loudly instead of silently corrupting blocks.
+        # Copy-before-free (K1) without the raw-K capture keeps working on any
+        # KV dtype: it never asks a codec a question.
+        # Step 096 fix kept: the CacheConfig field is "cache_dtype"; reading it
+        # by the wrong name made getattr fall back to "" and killed every RAWK
+        # boot between 084 and 096.
+        kv_cache_dtype = str(
+            getattr(self.vllm_config.cache_config, "cache_dtype", "") or ""
+        )
+        self._codec = codec.codec_for_dtype(kv_cache_dtype)
+        if config.rawk_enabled() and self._codec is None:
+            raise ValueError(
+                "VLLM_KVMEM_RAWK is armed but --kv-cache-dtype "
+                f"'{kv_cache_dtype or 'auto'}' has no page codec that can run "
+                f"({codec.describe_registry()})"
             )
-            if not kv_cache_dtype.startswith("nvfp4"):
-                raise ValueError(
-                    "VLLM_KVMEM_RAWK is armed but --kv-cache-dtype is "
-                    f"'{kv_cache_dtype or 'auto'}'; the raw-K capture + "
-                    "rematerialization channel only supports NVFP4-packed "
-                    "KV pages"
-                )
+        logger.info(
+            "vllm-030win patch (step 097): KVMem page codec for "
+            "--kv-cache-dtype '%s' = %s (%s)",
+            kv_cache_dtype or "auto",
+            self._codec.name if self._codec else "none, copy-before-free only",
+            codec.describe_registry(),
+        )
         num_blocks = self.kv_cache_config.num_blocks
         for group_id in self.group_ids:
             group = self.kv_cache_config.kv_cache_groups[group_id]
@@ -257,13 +266,14 @@ class KVMemWorkspaceWorker:
                     f"cache blocks {first_raw.shape[0]} are not a multiple of "
                     f"num_blocks {num_blocks}"
                 )
-            self._geometry[group_id] = remat.PageGeometry(
-                head_size=spec.head_size,
-                num_heads=spec.num_kv_heads,
-                block_size=spec.block_size,
-                rotary_dim=self._rotary_prefix_width(spec.head_size),
-                kernel_block_size=spec.block_size // ratio,
-            )
+            if self._codec is not None:
+                self._geometry[group_id] = self._codec.page_geometry(
+                    head_size=spec.head_size,
+                    num_heads=spec.num_kv_heads,
+                    block_size=spec.block_size,
+                    rotary_dim=self._rotary_prefix_width(spec.head_size),
+                    kernel_block_size=spec.block_size // ratio,
+                )
             layer_names: list[str] = []
             for layer_name in group.layer_names:
                 ref = group_kernel_blocks(kv_caches[layer_name], num_blocks)
@@ -319,16 +329,21 @@ class KVMemWorkspaceWorker:
             self._scratch_host2[group_id] = torch.zeros(
                 (page,), dtype=torch.int8, device="cpu", pin_memory=False
             )
+            layout = (
+                f"{self._geometry[group_id].chunks_per_page} chunks x "
+                f"{self._geometry[group_id].chunk_bytes} B, kernel block "
+                f"{self._geometry[group_id].kernel_block_size}"
+                if group_id in self._geometry
+                else "no page codec, chunk detail not derived"
+            )
             logger.info(
                 "vllm-030win patch (step 060): KVMem workspace group %d: %d "
-                "layers, page %d B (%d chunks x %d B, kernel block %d), %d "
+                "layers, page %d B (%s), %d "
                 "host slots (%.2f GiB pinned), block_stride %d B",
                 group_id,
                 len(layer_names),
                 page,
-                self._geometry[group_id].chunks_per_page,
-                self._geometry[group_id].chunk_bytes,
-                self._geometry[group_id].kernel_block_size,
+                layout,
                 self.num_slots,
                 self.num_slots * page * len(layer_names) / (1024**3),
                 block_stride_bytes,
@@ -590,6 +605,7 @@ class KVMemWorkspaceWorker:
                 tokens = torch.arange(block, dtype=torch.long)
                 remat.rematerialize_page(
                     rebuilt,
+                    self._codec,
                     geom,
                     raw,
                     tokens,
@@ -599,23 +615,22 @@ class KVMemWorkspaceWorker:
                     mrope_section=getattr(rotary, "mrope_section", None),
                 )
                 n_diff = int((rebuilt != stored_u8).sum())
-                packed_old, sf_old = remat.read_rotated(stored_u8, geom, tokens)
-                packed_new, sf_new = remat.read_rotated(rebuilt, geom, tokens)
+                stored_prefix = self._codec.decode_rotary_prefix(
+                    stored_u8, geom, tokens
+                )
+                rebuilt_prefix = self._codec.decode_rotary_prefix(
+                    rebuilt, geom, tokens
+                )
                 delta = (
-                    remat.dequantize_rotated(packed_old, sf_old)
-                    - remat.dequantize_rotated(packed_new, sf_new)
+                    stored_prefix.values - rebuilt_prefix.values
                 ).abs()
                 nan_count = int(torch.isnan(delta).sum())
                 max_delta = float(torch.nan_to_num(delta, nan=0.0, posinf=0.0).max())
-                # Largest E2M1 step on the page (the 6->4 magnitude rung), so
-                # the report carries a scale-free error measure: a
-                # neighbour-code flip must stay <= 1 step.
-                sf_value = sf_old.view(torch.float8_e4m3fn).float()
-                max_step = float(
-                    torch.where(
-                        sf_value > 0, 2.0 / sf_value, torch.zeros_like(sf_value)
-                    ).max()
-                )
+                # The codec's largest codebook step on the page (for NVFP4 the
+                # 6->4 magnitude rung), so the report carries a scale-free error
+                # measure: a neighbour-code flip must stay <= 1 step. The JSON
+                # key keeps its step-064 name so old evidence stays comparable.
+                max_step = stored_prefix.max_step
                 if n_diff:
                     self._remat_mismatch += 1
                     self._remat_max_byte_diff = max(
@@ -655,10 +670,8 @@ class KVMemWorkspaceWorker:
                         layer_name,
                         stored_u8,
                         rebuilt,
-                        packed_old,
-                        sf_old,
-                        packed_new,
-                        sf_new,
+                        stored_prefix,
+                        rebuilt_prefix,
                         raw,
                         cos_sin,
                         geom,
@@ -683,10 +696,8 @@ class KVMemWorkspaceWorker:
         layer_name,
         stored_u8,
         rebuilt,
-        packed_old,
-        sf_old,
-        packed_new,
-        sf_new,
+        stored_prefix,
+        rebuilt_prefix,
         raw,
         cos_sin,
         geom,
@@ -716,10 +727,10 @@ class KVMemWorkspaceWorker:
                 positions=positions,
                 authority_rows=raw.float().numpy(),
                 baked_from_authority=baked.float().numpy(),
-                stored_packed=packed_old.numpy(),
-                stored_sf=sf_old.view(torch.uint8).numpy(),
-                rebuilt_packed=packed_new.numpy(),
-                rebuilt_sf=sf_new.view(torch.uint8).numpy(),
+                stored_packed=stored_prefix.codes.numpy(),
+                stored_sf=stored_prefix.scales.view(torch.uint8).numpy(),
+                rebuilt_packed=rebuilt_prefix.codes.numpy(),
+                rebuilt_sf=rebuilt_prefix.scales.view(torch.uint8).numpy(),
                 stored_page=stored_u8.numpy(),
                 rebuilt_page=rebuilt.numpy(),
                 geom=np.array(
@@ -750,6 +761,9 @@ class KVMemWorkspaceWorker:
             return
         payload = {
             "rotary": type(self._rotary).__name__ if self._rotary else None,
+            # Step 097: which page codec produced these bytes, so the report
+            # carries the dtype half of the round trip instead of assuming it.
+            "page_codec": self._codec.name if self._codec else None,
             "rotary_dim": self._rotary_prefix_width(
                 next(iter(self._geometry.values())).head_size
             ),
@@ -1157,6 +1171,7 @@ class KVMemWorkspaceWorker:
                     ).to(torch.bfloat16)
                     remat.rematerialize_page(
                         rebuilt,
+                        self._codec,
                         geom,
                         raw,
                         tokens,

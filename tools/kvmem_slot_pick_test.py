@@ -194,11 +194,15 @@ def drive(top_pages, slots=SLOTS, pick=None, needle=None, drop_pages=()):
         rec["rows"].append((layer_name, int(src_positions[0]) // BLOCK))
         return np.zeros(BLOCK * 4 * 64, dtype=np.float16)
 
-    def _rematerialize_page(rebuilt, g, raw, tokens, dst_positions, cache, **kw):
+    def _rematerialize_page(rebuilt, page_codec, g, raw, tokens, dst_positions,
+                            cache, **kw):
         rec["remat"].append(int(dst_positions[0]))
 
     s = types.SimpleNamespace(
         _geometry=geom,
+        # step 097: the assembly path hands its page codec to remat; this test
+        # stubs remat itself, so any sentinel that is not None is enough.
+        _codec=object(),
         _block_size={g: BLOCK for g in GROUPS},
         _layers_per_group=layers,
         _host=host,

@@ -55,13 +55,8 @@ def main() -> int:
     from vllm.v1.attention.reference_nvfp4 import (
         write_reference_nvfp4_cache,
     )
-    from vllm.v1.kvmem_workspace.remat import (
-        PageGeometry,
-        dequantize_rotated,
-        read_rotated,
-        rematerialize_page,
-        rotated_byte_offsets,
-    )
+    from vllm.v1.kvmem_workspace.codec import NVFP4_PAGE_CODEC as nvfp4
+    from vllm.v1.kvmem_workspace.remat import rematerialize_page
 
     cfg = load_geometry()
     head_size = cfg["head_size"]
@@ -69,8 +64,12 @@ def main() -> int:
     rotary_dim = int(head_size * cfg["partial_rotary_factor"])
     rope_parameters = cfg["rope_parameters"]
     mrope_section = list(rope_parameters["mrope_section"])
-    geom = PageGeometry(
-        head_size, num_heads, BLOCK_SIZE, rotary_dim, KERNEL_BLOCK_SIZE
+    geom = nvfp4.page_geometry(
+        head_size=head_size,
+        num_heads=num_heads,
+        block_size=BLOCK_SIZE,
+        rotary_dim=rotary_dim,
+        kernel_block_size=KERNEL_BLOCK_SIZE,
     )
 
     print("KVMem viewport unit test (step 072, fixed-slot compressed window)")
@@ -184,13 +183,13 @@ def main() -> int:
         # step 065 precision contract: fp32 cos/sin, bf16 K); the full cache
         # goes in and rematerialize_page indexes the slot rows itself.
         rematerialize_page(
-            page, geom, raw.cpu(), tokens.cpu(), dst_positions.cpu(),
+            page, nvfp4, geom, raw.cpu(), tokens.cpu(), dst_positions.cpu(),
             cache_fp32.cpu(),
             k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
             mrope_section=mrope_section,
         )
 
-    data_off, scale_off = rotated_byte_offsets(geom, tokens.cpu())
+    data_off, scale_off = nvfp4.rotated_byte_offsets(geom, tokens.cpu())
     rot_mask = torch.zeros(geom.page_bytes, dtype=torch.bool)
     rot_mask[data_off.reshape(-1)] = True
     rot_mask[scale_off.reshape(-1)] = True
@@ -274,7 +273,7 @@ def main() -> int:
         raw = raw.view(BLOCK_SIZE, num_heads, rotary_dim)
         dst_positions = torch.arange(slot_start, slot_start + BLOCK_SIZE)
         rematerialize_page(
-            page, geom, raw, tokens.cpu(), dst_positions, cache_fp32.cpu(),
+            page, nvfp4, geom, raw, tokens.cpu(), dst_positions, cache_fp32.cpu(),
             k_scale=k_scale, is_neox_style=bool(rotary_emb.is_neox_style),
             mrope_section=mrope_section,
         )
@@ -297,8 +296,8 @@ def main() -> int:
 
     # ---------------------------------------------------------------- T5
     print("\nT5 slot bake vs the line-by-line triton port (dequantised)")
-    packed, sf = read_rotated(baked, geom, tokens.cpu())
-    deq = dequantize_rotated(packed, sf)
+    packed, sf = nvfp4.read_rotated(baked, geom, tokens.cpu())
+    deq = nvfp4.dequantize_rotated(packed, sf)
     half = rotary_dim // 2
     cos_sin_t = cache_fp32[torch.arange(
         slot_start, slot_start + BLOCK_SIZE
