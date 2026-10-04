@@ -35,8 +35,11 @@ def _load_json(path: str) -> dict:
         return json.load(fh)
 
 
-def ensure_card(model: str) -> tuple[str, dict]:
-    """Return (card_path, card). model = card name or checkpoint path."""
+def ensure_card(model: str, draft: str | None, num_spec: int) -> tuple[str, dict]:
+    """Return (card_path, card). model = card name or checkpoint path.
+    The card is a function of (model, draft, spec family) - build it with the
+    same intent parameters the launcher will run, or geometry silently
+    describes the wrong tier (no-draft conv states are 2 columns shorter)."""
     name = os.path.basename(os.path.normpath(model))
     card_path = os.path.join(PROFILE_DIR, f"{name}.json")
     if os.path.isfile(card_path):
@@ -44,7 +47,10 @@ def ensure_card(model: str) -> tuple[str, dict]:
     if os.path.isdir(model):
         print(f"[gen_launch] no card for {name}; building one (zero-boot)...")
         cmd = [sys.executable, os.path.join(HERE, "build_card.py"), model,
-               "--name", name, "--out-dir", PROFILE_DIR]
+               "--name", name, "--out-dir", PROFILE_DIR,
+               "--num-spec", str(num_spec)]
+        if draft:
+            cmd += ["--draft", draft]
         subprocess.run(cmd, check=True)
         return card_path, _load_json(card_path)
     raise FileNotFoundError(f"no card {card_path} and {model} is not a directory")
@@ -80,13 +86,19 @@ def main() -> None:
     ap.add_argument("--tier", default="speed",
                     choices=["speed", "capacity", "auto"])
     ap.add_argument("--family", default="dflash2", choices=["dflash2", "none"])
+    ap.add_argument("--draft", default=r"G:\qwen3.8model\Qwen3.8-27B-3Bit-GSQ\dflash2\gptq3c",
+                    help="draft checkpoint; the only draft family on this "
+                         "stack today (debt: default is a project fact, not "
+                         "a derivation)")
     ap.add_argument("--spec", type=int, default=None)
     ap.add_argument("--pool", type=int, default=None)
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--out", required=True, help="generated .cmd path")
     args = ap.parse_args()
 
-    card_path, card = ensure_card(args.model)
+    card_path, card = ensure_card(
+        args.model, args.draft if args.family != "none" else None,
+        args.spec or 2)
     platform = _load_json(PLATFORM_CARD)
     warnings: list[str] = []
 
@@ -200,6 +212,12 @@ def main() -> None:
              f"pool={pool} mbt={mbt} spec={num_spec}", ""]
     for k, v in env_lines:
         lines.append(f'set "{k}={v}"')
+    # self-contained: the generated cmd must boot alone (autoprobe launches it
+    # directly), so it carries the vcvars64 + LIB contract like production.
+    lines.append(
+        'call "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022'
+        '\\BuildTools\\VC\\Auxiliary\\Build\\vcvars64.bat" >nul 2>&1')
+    lines.append('set "LIB=C:\\PROGRA~1\\NVIDIA~2\\CUDA\\v13.3\\lib\\x64;%LIB%"')
     lines += ["",
               'del /q "G:\\qwen3.8model\\_tmp_prod029\\vllm_offload_*.mmap" 2>nul',
               'del /q "G:\\qwen3.8model\\_tmp_orcasaq2\\vllm_offload_*.mmap" 2>nul',

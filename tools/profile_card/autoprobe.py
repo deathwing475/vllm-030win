@@ -83,18 +83,59 @@ def kill_engine() -> None:
                    capture_output=True, text=True)
 
 
-def guard(card: dict, measured: dict) -> dict:
-    a = card["page_geometry"]["block_size_tokens"]
-    cap_a = card["capacity"]["capacity_tokens"]
+def parse_launch(cmd_path: str) -> dict:
+    """Pull the literal launch parameters back out of the generated cmd so
+    rail A can be recomputed for THIS boot (same config both rails)."""
+    with open(cmd_path, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    serve = [l for l in text.splitlines() if "vllm.entrypoints.cli.main" in l]
+    out: dict = {}
+    if serve:
+        s = serve[0]
+        def grab(flag):
+            m = re.search(flag + r"[ =](\S+)", s)
+            return m.group(1).strip('"') if m else None
+        out["model"] = grab("--served-model-name") and None or None
+        m = re.search(r'serve "(.+?)"', s)
+        out["model"] = m.group(1) if m else None
+        out["max_model_len"] = int(grab("--max-model-len") or 0)
+        mbt = grab("--max-num-batched-tokens")
+        out["mbt"] = int(mbt) if mbt else None
+        pool = grab("--kv-cache-memory-bytes")
+        out["pool"] = int(pool) if pool else None
+        out["draft"] = (re.search(r'--speculative-config\.model "(.+?)"', s)
+                        or [None, None])[1]
+        spec = grab("--speculative-config.num_speculative_tokens")
+        out["num_spec"] = int(spec) if spec else None
+    return out
+
+
+def guard(card: dict, measured: dict, launch: dict) -> dict:
     checks = []
     if "attn_block_size" in measured:
+        a = card["page_geometry"]["block_size_tokens"]
         checks.append({"name": "attention_block_size",
                        "rail_a": a, "rail_b": measured["attn_block_size"],
                        "ok": a == measured["attn_block_size"]})
-    if "kv_cache_tokens" in measured and cap_a is not None:
-        checks.append({"name": "capacity_tokens",
-                       "rail_a": cap_a, "rail_b": measured["kv_cache_tokens"],
-                       "ok": cap_a == measured["kv_cache_tokens"]})
+    if "kv_cache_tokens" in measured and launch.get("max_model_len"):
+        # rail A recomputed for THIS boot's (L, pool, mbt, spec) - the same
+        # config on both rails, per design doc §5
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from geometry import derive
+            g = derive(model=launch["model"], draft=launch["draft"],
+                       num_spec=launch["num_spec"] or 2, group_size=8,
+                       mbt=launch["mbt"] or 1024, mamba_ssm_dtype="bfloat16",
+                       max_model_len=launch["max_model_len"],
+                       kv_cache_bytes=launch["pool"])
+            cap_a = g["capacity"]["capacity_tokens"]
+            checks.append({"name": "capacity_tokens",
+                           "rail_a": cap_a, "rail_b": measured["kv_cache_tokens"],
+                           "ok": cap_a == measured["kv_cache_tokens"]})
+        except Exception as e:  # rail A unavailable: report, don't fake
+            checks.append({"name": "capacity_tokens", "rail_a": None,
+                           "rail_b": measured["kv_cache_tokens"],
+                           "ok": False, "error": str(e)})
     ok = bool(checks) and all(c["ok"] for c in checks)
     return {"ok": ok, "checks": checks,
             "note": "empty checks = engine printed no comparable banner"}
@@ -120,12 +161,14 @@ def main() -> None:
         healthy = wait_health(args.port, args.health_timeout, proc)
         time.sleep(2)  # let the capacity banners land
         measured = scrape(log_path)
+        launch = parse_launch(args.launch)
         with open(args.card, encoding="utf-8") as fh:
             card = json.load(fh)
-        result = guard(card, measured)
+        result = guard(card, measured, launch)
         card.setdefault("measured", {})
         card["measured"][ts] = {
             "launch": args.launch, "port": args.port,
+            "launch_params": launch,
             "healthy": healthy, "log": log_path,
             "rail_b": measured, "guard": result,
             "source": "measured (autoprobe, engine banners)",

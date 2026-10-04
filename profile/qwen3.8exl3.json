@@ -1,7 +1,7 @@
 {
   "schema": "profile-card/1",
   "name": "qwen3.8exl3",
-  "created": "2026-10-04T14:38:30",
+  "created": "2026-10-04T15:09:54",
   "tool": "tools/profile_card/build_card.py",
   "model": {
     "path": "G:\\qwen3.8model\\qwen3.8exl3",
@@ -78,13 +78,13 @@
         "layers": 8,
         "page_bytes": 1677312,
         "example": "model.layers.3.self_attn",
-        "blocks_per_request": 91
+        "blocks_per_request": 23
       },
       {
         "layers": 8,
         "page_bytes": 1677312,
         "example": "model.layers.7.self_attn",
-        "blocks_per_request": 91
+        "blocks_per_request": 23
       },
       {
         "layers": 5,
@@ -97,11 +97,11 @@
     "source": "derived"
   },
   "capacity": {
-    "kv_cache_bytes": 3400000000,
-    "num_blocks": 253,
-    "blocks_per_request_total": 210,
-    "max_concurrency": 1.2047619047619047,
-    "capacity_tokens": 157910,
+    "kv_cache_bytes": null,
+    "num_blocks": null,
+    "blocks_per_request_total": null,
+    "max_concurrency": null,
+    "capacity_tokens": null,
     "source": "derived"
   },
   "need_decomposition": {
@@ -109,7 +109,7 @@
     "a_bytes": 375717888,
     "b_bytes_per_token": 18432.0,
     "mbt_min": 1458,
-    "single_request_l_ceiling": 163072,
+    "single_request_l_ceiling": null,
     "source": "derived"
   },
   "draft": {
@@ -181,7 +181,7 @@
   },
   "candidates": {
     "mbt_min": 1458,
-    "single_request_l_ceiling": 163072,
+    "single_request_l_ceiling": null,
     "kv_cache_bytes": "autoprobe decides from the residency-cliff search (design doc §4); auto sizing is a KNOWN speed trap on this card (step 090)",
     "kv_offloading_backend": {
       "value": "native",
@@ -198,5 +198,48 @@
       "088-arm reject readings: residual 1.0% / 3.8% < 5% (accept §6.2)"
     ],
     "mtp_visual_verdict": "mtp.* and visual.* never reach VRAM (step 092); no skip patch required"
+  },
+  "measured": {
+    "20261004_150711_recovered": {
+      "launch": "G:\\qwen3.8model\\_tmp_line_b\\sgen_orca_check.cmd",
+      "port": 8001,
+      "launch_params": {
+        "model": "G:\\qwen3.8model\\qwen3.8exl3",
+        "max_model_len": 16384,
+        "mbt": 1024,
+        "pool": 813249331,
+        "draft": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ\\dflash2\\gptq3c",
+        "num_spec": 2
+      },
+      "healthy": true,
+      "log": "G:\\qwen3.8model\\_tmp_line_b\\o92_pin1_b1.log",
+      "rail_b": {
+        "model_loading_gib": 12.35,
+        "attn_block_size": 1456,
+        "kv_cache_tokens": 18904,
+        "concurrency_at_len": 16384,
+        "max_concurrency": 1.15
+      },
+      "guard": {
+        "ok": true,
+        "checks": [
+          {
+            "name": "attention_block_size",
+            "rail_a": 1456,
+            "rail_b": 1456,
+            "ok": true
+          },
+          {
+            "name": "capacity_tokens",
+            "rail_a": 18904,
+            "rail_b": 18904,
+            "ok": true
+          }
+        ],
+        "note": "empty checks = engine printed no comparable banner"
+      },
+      "source": "measured (recovered from o92_pin1_b1 boot log; same generated launcher as autoprobe run)",
+      "note": "card was rebuilt (draft fix) after the original autoprobe run; readings recovered instead of re-booting"
+    }
   }
 }

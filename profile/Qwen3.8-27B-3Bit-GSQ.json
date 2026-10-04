@@ -209,5 +209,47 @@
       "088-arm reject readings: residual 1.0% / 3.8% < 5% (accept §6.2)"
     ],
     "mtp_visual_verdict": "mtp.* and visual.* never reach VRAM (step 092); no skip patch required"
+  },
+  "measured": {
+    "20261004_151222": {
+      "launch": "G:\\qwen3.8model\\_tmp_line_b\\sgen_gsq_check.cmd",
+      "port": 8080,
+      "launch_params": {
+        "model": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ",
+        "max_model_len": 163072,
+        "mbt": 1024,
+        "pool": 3400000000,
+        "draft": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ\\dflash2\\gptq3c",
+        "num_spec": 2
+      },
+      "healthy": true,
+      "log": "G:\\qwen3.8model\\_tmp_line_b\\autoprobe_20261004_151222.log",
+      "rail_b": {
+        "model_loading_gib": 11.3,
+        "attn_block_size": 1456,
+        "kv_cache_tokens": 163719,
+        "concurrency_at_len": 163072,
+        "max_concurrency": 1.0
+      },
+      "guard": {
+        "ok": true,
+        "checks": [
+          {
+            "name": "attention_block_size",
+            "rail_a": 1456,
+            "rail_b": 1456,
+            "ok": true
+          },
+          {
+            "name": "capacity_tokens",
+            "rail_a": 163719,
+            "rail_b": 163719,
+            "ok": true
+          }
+        ],
+        "note": "empty checks = engine printed no comparable banner"
+      },
+      "source": "measured (autoprobe, engine banners)"
+    }
   }
 }
