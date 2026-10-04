@@ -58,11 +58,14 @@ ARMS = {
     "d2": os.path.join(TOOLS, "serve_orcasaq2_029_dflash2.cmd"),
     # step 088 b2: same draft on the nvfp4 KV tier (the precision Orca is served in).
     "d24": os.path.join(TOOLS, "serve_orcasaq2_029_nvfp4_dflash2.cmd"),
+    # step 089: the same draft with production's five capacity levers ported over
+    # (VLLM_KV_GROUP_SIZE=8 / bf16 ssm / prefix caching / 8 GiB KV offload / util 0.922).
+    "d2p": os.path.join(TOOLS, "serve_orcasaq2_029_nvfp4_dflash2_prodcap.cmd"),
 }
 # 085's arms run at max-model-len 12000 (auto KV could not afford 16K with a draft head),
 # 086's nvfp4 arms target 16384 again, so the haystack follows O1's 12,206-token needle.
 NEEDLE_TOKENS_BY_ARM = {"on": 9000, "off": 9000, "on4": 12000, "off4": 12000,
-                        "d2": 9000, "d24": 12000}
+                        "d2": 9000, "d24": 12000, "d2p": 12000}
 # S088_NEEDLE caps the haystack for arms whose context is smaller than the default tier
 # (085's lesson: build_prompt overshoots its target, so the cap must stay well under L).
 if os.environ.get("S088_NEEDLE"):
@@ -406,7 +409,7 @@ def main() -> int:
     n = sub.add_parser("next")
     n.add_argument("--boot", required=True)
     n.add_argument("--arm", required=True,
-                   choices=("on", "off", "on4", "off4", "d2", "d24"))
+                   choices=("on", "off", "on4", "off4", "d2", "d24", "d2p"))
     n.add_argument("--timeout", type=float, default=600.0)
     n.add_argument("--wait-mib", type=float, default=800.0)
     n.add_argument("--keep-up", action="store_true")
