@@ -1615,17 +1615,20 @@ class MambaManager(SingleTypeKVCacheManager):
         num_local_computed_tokens: int,
         num_external_computed_tokens: int,
     ) -> None:
-        # vllm-030win patch (step 066): a mamba external load needs ONE state
-        # block, at the boundary position. The base class allocates
-        # cdiv(total_computed, block_size) real state slots for the loaded
-        # prefix; for a recurrent cache that is both wasteful and unread --
-        # only the boundary block (position E-1) is ever anchored on
-        # (``preprocess_mamba`` uses (num_computed_tokens - 1) // block_size),
-        # and at one ~13.4 MiB slot per block per group the base behaviour
-        # burns the whole pool before the assembly step runs. This mirrors the
-        # shape ``find_longest_cache_hit`` returns for a local mamba hit:
-        # null placeholders up to the boundary, then the one real block whose
-        # slot the KVMem load fills with the state snapshot.
+        # vllm-030win fix (step 066; recharacterized in step 095 as an
+        # upstream shape fix, not a KVMem-specific hack): a mamba external
+        # load needs ONE state block, at the boundary position. The base
+        # class allocates cdiv(total_computed, block_size) real state slots
+        # for the loaded prefix; for a recurrent cache that is both wasteful
+        # and unread -- only the boundary block (position E-1) is ever
+        # anchored on (``preprocess_mamba`` uses
+        # (num_computed_tokens - 1) // block_size), and at one ~13.4 MiB slot
+        # per block per group the base behaviour burns the whole pool. This
+        # mirrors the shape ``find_longest_cache_hit`` returns for a local
+        # mamba hit: null placeholders up to the boundary, then the one real
+        # block. Consumers: any external KV load on a mamba group, incl. the
+        # KVMem assembly fill (KVMem is one consumer, not the reason for
+        # this override).
         assert isinstance(self.kv_cache_spec, MambaSpec)
         num_total = num_local_computed_tokens + num_external_computed_tokens
         num_skipped_tokens = self.get_num_skipped_tokens(num_total)
