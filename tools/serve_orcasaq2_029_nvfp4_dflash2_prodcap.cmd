@@ -4,7 +4,10 @@ rem step 089 (Orca O3 correction): the 088 DFlash2 arm rebuilt with the capacity
 rem GSQ production actually uses on THIS SAME 16 GB card with THIS SAME draft (gptq3c, N=2) at
 rem max-model-len 163,072. Step 088 concluded "DFlash2 does not fit on 16 GB", but that was a
 rem verdict about 088's OWN arm configuration, not about the card: 088 ran without any of the
-rem five levers below, so the per-request floor it measured (198 KiB/token) is an artifact.
+rem five levers below. Step 091 corrected the arithmetic behind that verdict: the engine's
+rem per-request need is a + b*L (a = the per-request GDN recurrent state, measured 0.68 GiB on
+rem the nvfp4+N=2 arm; b = 22.2 KiB/token), so 088's "198 KiB/token" was 89% intercept, and the
+rem two levers that matter most are exactly the ones that shrink a.
 rem
 rem The levers, taken from tools/serve_gsq_prod029_n2.cmd (each one is a measured step, not a
 rem guess):
