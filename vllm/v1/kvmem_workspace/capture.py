@@ -160,7 +160,13 @@ def _record_impl(
     between ``k_norm`` and ``self.rotary_emb``. Must stay cheap and
     allocation-only: it runs inside the forward.
     """
+    # Step 096 fix: _TOTAL_RECORD_CALLS was missing from this global list
+    # since step 084 added the boot-lifetime counter, so the += 1 below
+    # compiled to a local-store and every first record call died with
+    # UnboundLocalError. No KVMem arm ran between 084 and 096, so it
+    # surfaced here first.
     global _GEOMETRY, _SKIPPED_DECODE, _SKIPPED_UNARMED, _MROPE_AXES_DIFFER
+    global _TOTAL_RECORD_CALLS
 
     num_tokens = k.shape[0]
     if num_tokens <= 1:

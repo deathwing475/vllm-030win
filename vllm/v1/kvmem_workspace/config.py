@@ -9,7 +9,30 @@ its documented defaults; the whole subsystem stays inert unless
 manager.
 """
 
+import json
+import math
 import os
+
+# Step 096 generalisation (design doc "KVMem泛用化" §1.2-B): the numeric
+# defaults below were tuned for the GSQ production model (1456-token pages,
+# 163,072-token sliding window, 3.4e9-byte KV pool) and are human-copied debt
+# (iron rule 34). Each knob now resolves through a three-level chain:
+#
+#     env override  >  profile card derivation  >  historical fallback
+#
+# The card section ("kvmem_workspace", built by tools/profile_card/
+# build_card.py) carries the derivation ledger per knob: `value` plus
+# `formula`/`source`. Card-derived entries reproduce the GSQ defaults
+# bit-for-bit (steps 060/066/072 ledgers), so arming the card is a
+# no-behavioural-change refactor on this model and the *derivation* (not the
+# number) is what generalises to the next sliding-window hybrid.
+# Card discovery is explicit only: VLLM_PROFILE_CARD must name the card
+# file. A missing card never fails the boot -- it warns once, naming the
+# knobs that stay on their human-copied fallbacks.
+
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Step 084 generalisation note: these defaults are tuned for the GSQ
 # production model (1456-token pages, 163,072-token sliding window,
@@ -27,6 +50,128 @@ DEFAULT_RETRIEVAL_TOPN = 16
 DEFAULT_RECENT_TOKENS = 32768
 DEFAULT_AUTHORITY_TRAJECTORIES = 2
 
+# Step 096: knobs whose card row is `source: human-copied` (no model
+# geometry behind the number; the card records the value and its ledger
+# but nothing derives it). Listed so the missing-card warning can name
+# what stays on the fallback.
+_HUMAN_COPIED_KNOBS = (
+    "query_span",
+    "trajectory_prefix_tokens",
+    "index_subblock",
+)
+
+# Step 096: the generation reserve of the §7.1 budget ledger (main config:
+# 163,072 window = context budget + 32,768 generation reserve). It is a
+# design constant of the fixed-slot layout, not a model measurement, so it
+# lives here and is recorded in the card's kvmem_workspace ledger.
+GEN_RESERVE_TOKENS = 32768
+
+_CARD_CACHE: dict = {"loaded": False, "section": None, "capacity": None}
+
+
+def _load_profile_card() -> None:
+    """Load VLLM_PROFILE_CARD once (step 096). Missing card is not an error.
+
+    Two sections are kept: ``kvmem_workspace`` (the knob ledger) and
+    ``need_decomposition`` (the pool's single-request ceiling L, which the
+    runtime VIEWPORT_PAGES derivation needs -- the card cannot precompute
+    that knob because the workspace page size is a sliding-window-spec
+    property only known at engine assembly time).
+    """
+    _CARD_CACHE["loaded"] = True
+    path = os.environ.get("VLLM_PROFILE_CARD", "").strip()
+    if not path:
+        logger.warning(
+            "vllm-030win KVMem (step 096): no VLLM_PROFILE_CARD set -- "
+            "numeric defaults stay on their human-copied fallbacks (%s); "
+            "set the env to a tools/profile_card card to activate the "
+            "derived chain",
+            ", ".join(_HUMAN_COPIED_KNOBS + ("all derived knobs",)),
+        )
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            card = json.load(fh)
+    except (OSError, ValueError) as exc:
+        logger.warning(
+            "vllm-030win KVMem (step 096): VLLM_PROFILE_CARD=%s unreadable "
+            "(%s) -- numeric defaults stay on their human-copied fallbacks",
+            path,
+            exc,
+        )
+        return
+    section = card.get("kvmem_workspace")
+    capacity = card.get("need_decomposition")
+    if not isinstance(section, dict) or not section:
+        logger.warning(
+            "vllm-030win KVMem (step 096): VLLM_PROFILE_CARD=%s has no "
+            "kvmem_workspace section -- numeric defaults stay on their "
+            "human-copied fallbacks (rebuild the card with "
+            "tools/profile_card/build_card.py)",
+            path,
+        )
+        section = None
+    _CARD_CACHE["section"] = section
+    _CARD_CACHE["capacity"] = (
+        capacity if isinstance(capacity, dict) else None
+    )
+    if section is not None:
+        derived = sorted(
+            key for key, row in section.items()
+            if isinstance(row, dict) and row.get("source") == "derived")
+        logger.info(
+            "vllm-030win KVMem (step 096): profile card %s loaded -- "
+            "derived knobs: %s (env overrides still win)",
+            os.path.basename(path), ", ".join(derived))
+
+
+def _card_row(key: str) -> int | None:
+    """The integer `value` of one kvmem_workspace card row, or None."""
+    if not _CARD_CACHE["loaded"]:
+        _load_profile_card()
+    section = _CARD_CACHE["section"]
+    if section is None:
+        return None
+    row = section.get(key)
+    if isinstance(row, dict) and isinstance(row.get("value"), int):
+        return row["value"]
+    return None
+
+
+def _card_ceiling_tokens() -> int | None:
+    """The pool's single-request ceiling L from the card, or None."""
+    if not _CARD_CACHE["loaded"]:
+        _load_profile_card()
+    capacity = _CARD_CACHE["capacity"]
+    if capacity is None:
+        return None
+    value = capacity.get("single_request_l_ceiling")
+    return value if isinstance(value, int) else None
+
+
+def _derived_viewport_pages(page_tokens: int | None) -> int | None:
+    """Step 072 ledger re-derived (step 096): the §7.1 budget cut in pages.
+
+    ``floor((L - gen) / p)`` context-budget pages minus one sink page minus
+    the recent tail (rounded *up*: the recent segment must hold all R tokens)
+    minus the generation reserve (rounded *down*: it is a ceiling to respect,
+    the 16-token slack goes to the spare margin). GSQ: 91 - 1 - 12 - 23 = 55,
+    the step-072 filing. Needs the workspace page size, which is a
+    sliding-window-spec property -- the caller (manager assembly) passes the
+    engine-resolved block size.
+    """
+    ceiling = _card_ceiling_tokens()
+    recent = _card_row("viewport_recent_tokens")
+    if ceiling is None or recent is None or not page_tokens:
+        return None
+    budget_pages = (ceiling - GEN_RESERVE_TOKENS) // page_tokens
+    return (
+        budget_pages
+        - 1  # sink page
+        - math.ceil(recent / page_tokens)
+        - GEN_RESERVE_TOKENS // page_tokens
+    )
+
 
 def _env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
@@ -42,8 +187,14 @@ def _env_int(name: str, default: int) -> int:
 
 
 def workspace_host_bytes() -> int:
-    """Host bytes the workspace may occupy (the pinned store's budget)."""
-    return _env_int("VLLM_KVMEM_WORKSPACE_MB", DEFAULT_WORKSPACE_MB) << 20
+    """Host bytes the workspace may occupy (the pinned store's budget).
+
+    Card derivation (step 096): ``ceil(host_ram_total_gib / 8) GiB`` from
+    the platform card's machine section -- the host-budget policy value.
+    GSQ: ceil(23.1/8) = 3 GiB = 3,072 MiB, the step-060 filing.
+    """
+    return _env_int("VLLM_KVMEM_WORKSPACE_MB",
+                    _card_row("workspace_mb") or DEFAULT_WORKSPACE_MB) << 20
 
 
 def trajectory_prefix_tokens() -> int:
@@ -53,15 +204,28 @@ def trajectory_prefix_tokens() -> int:
     task message: they stay fixed while the conversation grows, and differ
     between conversations. That is the design's "hash(root task message
     identity)" without touching the client.
+
+    Step 096: structural constant (no model geometry behind it); the card
+    records the value with ``source: human-copied`` and it resolves through
+    the same chain so a future card can carry a better-argued number.
     """
     return _env_int(
-        "VLLM_KVMEM_TRAJ_PREFIX", DEFAULT_TRAJECTORY_PREFIX_TOKENS
+        "VLLM_KVMEM_TRAJ_PREFIX",
+        _card_row("trajectory_prefix_tokens")
+        or DEFAULT_TRAJECTORY_PREFIX_TOKENS,
     )
 
 
 def max_workspace_tokens() -> int:
-    """Workspace capacity ceiling in tokens (design §7.2: 262,144)."""
-    return _env_int("VLLM_KVMEM_WORKSPACE_TOKENS", DEFAULT_MAX_WORKSPACE_TOKENS)
+    """Workspace capacity ceiling in tokens (design §7.2: 262,144).
+
+    Card derivation (step 096): the model's ``max_position_embeddings`` --
+    §7.2's "capability ceiling = max_position_embeddings; not a code hard
+    limit, a host-budget configuration quantity".
+    """
+    return _env_int("VLLM_KVMEM_WORKSPACE_TOKENS",
+                    _card_row("workspace_tokens")
+                    or DEFAULT_MAX_WORKSPACE_TOKENS)
 
 
 def roundtrip_selftest() -> bool:
@@ -156,8 +320,14 @@ def snapshot_keep() -> int:
     max_num_batched_tokens`` steps -- with a sparse capture interval (see
     :func:`snapshot_every_pages`) that turns into ``interval_pages x block
     size / max_num_batched_tokens + 2`` rows.
+
+    Card derivation (step 096, step-066 ledger): the ring budget is the
+    workspace host budget spread over the trajectory rings --
+    ``floor(workspace_mb * 2^20 / (snapshot_traj * mamba_group_state_bytes))``.
+    GSQ: floor(3,072 MiB / (2 x 76.7 MiB)) = 20.
     """
-    return _env_int("VLLM_KVMEM_SNAPSHOT_KEEP", 20)
+    return _env_int("VLLM_KVMEM_SNAPSHOT_KEEP",
+                    _card_row("snapshot_keep") or 20)
 
 
 def snapshot_trajectories() -> int:
@@ -196,8 +366,14 @@ def authority_trajectories() -> int:
     One region is 2.0 GiB at full workspace length, so this is a host-memory
     bound rather than a semantic one; past it the pages are still stored and
     simply cannot be rematerialised, which is counted and reported.
+
+    Card derivation (step 096): same trajectory count as the snapshot rings
+    (``snapshot_trajectories``) -- the two host regions are provisioned for
+    the same concurrency.
     """
-    return _env_int("VLLM_KVMEM_AUTHORITY_TRAJ", DEFAULT_AUTHORITY_TRAJECTORIES)
+    return _env_int("VLLM_KVMEM_AUTHORITY_TRAJ",
+                    _card_row("authority_trajectories")
+                    or snapshot_trajectories())
 
 
 def index_subblock() -> int:
@@ -207,8 +383,13 @@ def index_subblock() -> int:
     fp32 running sum per sub-block and coarser score granularities are obtained
     by summing groups of these, so one run can report several granularities at
     once. One 1424-token page holds 11 of the design's sub-blocks.
+
+    Step 096: design §5.3 constant (R1 mitigation; 64 is the filed
+    alternative) -- no model geometry behind it; the card records it with
+    ``source: human-copied``.
     """
-    return _env_int("VLLM_KVMEM_INDEX_SUBBLOCK", DEFAULT_INDEX_SUBBLOCK)
+    return _env_int("VLLM_KVMEM_INDEX_SUBBLOCK",
+                    _card_row("index_subblock") or DEFAULT_INDEX_SUBBLOCK)
 
 
 def _env_int_list(name: str, default: list[int]) -> list[int]:
@@ -270,8 +451,12 @@ def query_span() -> int:
     an agent turn that is the tail, which is where the question sits. Only the
     tail is captured because the full pre-RoPE q of a 262K prompt would be
     3.2 GiB.
+
+    Step 096: step-061 filing, a 2^8 constant -- no model geometry behind it;
+    the card records it with ``source: human-copied``.
     """
-    return _env_int("VLLM_KVMEM_QUERY_SPAN", DEFAULT_QUERY_SPAN)
+    return _env_int("VLLM_KVMEM_QUERY_SPAN",
+                    _card_row("query_span") or DEFAULT_QUERY_SPAN)
 
 
 def retrieval_topn() -> int:
@@ -286,8 +471,14 @@ def recent_tokens() -> int:
     [16K, 64K]; until that distribution is measured, the midpoint is used and
     the value is reported with every score dump so a ranking can be re-judged
     under another policy offline.
+
+    Card derivation (step 096): the geometric midpoint of the §7.1 clamp
+    band [R, 4R] is 2R (R = the compressed window's recent tail), which is
+    the "midpoint" the 060-era filing actually used. GSQ: 2 x 16,384 =
+    32,768.
     """
-    return _env_int("VLLM_KVMEM_RECENT", DEFAULT_RECENT_TOKENS)
+    return _env_int("VLLM_KVMEM_RECENT",
+                    _card_row("recent_tokens") or DEFAULT_RECENT_TOKENS)
 
 
 def debug_enabled() -> bool:
@@ -340,11 +531,17 @@ def viewport_recent_tokens() -> int:
     the prompt's last R tokens. R is what keeps the question (and the nearest
     context) verbatim; the mid-section it displaces is what retrieval has to
     re-represent.
+
+    Card derivation (step 096): the §7.1 clamp band's lower end --
+    ``2^(floor(log2(L - gen)) - 2)``, i.e. a quarter of the context budget
+    rounded down to a power of two. GSQ: 2^(17-2) over L=163,072 /
+    gen=32,768 = 16,384.
     """
-    return _env_int("VLLM_KVMEM_VIEWPORT_RECENT", 16384)
+    return _env_int("VLLM_KVMEM_VIEWPORT_RECENT",
+                    _card_row("viewport_recent_tokens") or 16384)
 
 
-def viewport_retrieval_pages() -> int:
+def viewport_retrieval_pages(page_tokens: int | None = None) -> int:
     """Number N of retrieval slots, in whole pages (design §5.1: time-ordered).
 
     55 pages x 1424 = 78,320 tokens of retrieval budget: with S=1456 and
@@ -352,7 +549,19 @@ def viewport_retrieval_pages() -> int:
     reserve fits the 163,072 pool with room to spare. Every slot is rewritten
     from the authority on every scored request, so N is also the per-request
     bake volume.
+
+    Card derivation (step 096, step-072 ledger): the §7.1 budget cut in
+    pages -- ``floor((L - gen)/p) - 1 - ceil(R/p) - ceil(gen/p)``. The page
+    size is a sliding-window-spec property only known at engine assembly,
+    so the manager passes it (:func:`_derived_viewport_pages`). GSQ at
+    p=1,424: 91 - 1 - 12 - 23 = 55.
     """
+    card_pages = _card_row("viewport_pages")
+    if card_pages is not None:
+        return _env_int("VLLM_KVMEM_VIEWPORT_PAGES", card_pages)
+    derived = _derived_viewport_pages(page_tokens)
+    if derived is not None and derived > 0:
+        return _env_int("VLLM_KVMEM_VIEWPORT_PAGES", derived)
     return _env_int("VLLM_KVMEM_VIEWPORT_PAGES", 55)
 
 

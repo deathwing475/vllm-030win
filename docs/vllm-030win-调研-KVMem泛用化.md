@@ -34,6 +34,8 @@
 ### 1.2 四个工作面的抽象设计
 - **A. 页编解码器（page codec）**：`remat.py` 的 NVFP4 字节几何 + `worker.py:223-233` 的 dtype 门槛收敛为接口 `PageCodec`（`page_geometry(head_size) → data_dim/scale_dim/scale_group`、`decode_rotary_prefix(page_bytes) → pre-RoPE 前缀`、`encode_rotary_prefix(...)`、`supported(kv_cache_dtype)`）。nvfp4 实现 = 现有代码搬家；bf16/fp8 codec 占位（bf16 天然 trivial：整 head 连续、无 scale 组，rotary prefix 重建同理）。`worker.py` 门槛改查 codec 注册表。
 - **B. config 派生化**：§0-2 的 7+3 个默认值改为派生链——优先级 env 显式 > profile card 派生（`WORKSPACE_TOKENS`←池容量派生、`VIEWPORT_PAGES/RECENT`←池 tokens 与页几何派生、`SNAPSHOT_KEEP`←mamba 组状态字节派生、`WORKSPACE_MB`←主机预算策略值）> 现值 fallback + `human-copied` WARNING（必守 34 记账转 derived）。card 缺失时不 fail（保持现行为），但 WARNING 指名道姓。
+
+  > **⭐已执行（2026-10-04，步骤 096 GO）**：落地 = `config.py` 十函数接三层链（lazy card 加载器 + `_card_row()` + `_derived_viewport_pages()`）+ `manager.py:120` 传引擎块长 + `build_card.py` 新增 `kvmem_workspace` 段 + 新工具 `tools/profile_card/verify_kvmem_defaults.py`。**定案账 → 派生公式**（对 GSQ 逐位复现）：WORKSPACE_TOKENS = `max_position_embeddings`；WORKSPACE_MB = `⌈host_ram_total_gib/8⌉ GiB`（platform_card）；SNAPSHOT_KEEP = `⌊WS_MB×2²⁰/(snapshot_traj × mamba 组状态字节)⌋`；VIEWPORT_RECENT = `2^(⌊log2(L−gen)⌋−2)`；RECENT = 2×R；AUTHORITY_TRAJ = snapshot_traj；**VIEWPORT_PAGES = `⌊(L−gen)/p⌋ − 1 − ⌈R/p⌉ − ⌊gen/p⌋`（p = 滑窗 spec 的引擎块长 1,424，**运行时**派生——card 侧无页长，故 `viewport_retrieval_pages(page_tokens)` 由 manager 传块长，card 行 value=null/source=derived-runtime）**；QUERY_SPAN/TRAJ_PREFIX/INDEX_SUBBLOCK = 无几何式，card 显式 `human-copied` 记账。静态对照三支 13/13（fallback/GSQ card/Orca card 降级）；boot 回归 083 五项 card 态与 fallback 态全 GO + autoprobe 双轨 GO。**附带排雷**：084 在 `worker.py` RAWK 门槛读错字段名（`kv_cache_dtype`→真名 `cache_dtype`）与 `capture.py` record 计数漏 global 声明，两处在 GSQ RAWK 路径必炸、因 083 后 KVMem 臂冻结潜伏，096 回归首轮即炸即修（详见步骤 096）。
 - **C. 模型钩子接口**：`qwen3_next.py` 两个钩子提为 `v1/kvmem_workspace/hooks.py` 的注册表（键 = attention 类名或 config 架构名）：`per_layer_sliding_window(config, prefix)` 与 `rawk_layer(config, prefix)` + `record 点`描述（模块、k_norm 后、rotary_emb 前、gate qkv 布局）。Qwen3Next 条目 = 现逻辑搬家；模型文件里只剩一行注册表查询。**对 Orca 零改动自证**（Qwen3NextAttention 复用 ⇒ 同一注册条目命中）。异构模型 = 实现接口 + 注册，不复制函数。
 - **D. MambaManager 补丁门控**：`single_type_kv_cache_manager.py:1612-1657` 补 `kvmem_workspace_enabled()`（或独立 `VLLM_KVMEM_MAMBA_EXTALLOC` 门）——KVMem 臂行为不变；非 KVMem 臂走回上游整块分配。**风险（最高优先）**：生产 GSQ 不带 KVMem env ⇒ 门控后生产公共路径行为改变（从"补丁行为"回到"上游行为"）——必须先跑生产 watchdog + 8k anchor 回归证明无感，否则改为"门控反向"（补丁仅在 KVMem connector 在场时生效，按 connector 存在性而非 env 判定）。
 
@@ -57,7 +59,7 @@
 |---|---|---|---|
 | **094**（本步） | 盘点落档 + 本设计档 + 授权边界声明 | 零代码 | 零 boot |
 | **095** ✅ GO（2026-10-04） | MambaManager 外部分配补丁**上游化定性**（§1.2-D 判读更新块改判，原"门控"方案作废） | `single_type_kv_cache_manager.py` 注释改写一处（代码零行为变化） | 生产 watchdog 两支全 FAST（121.13/121.82）✅ |
-| **096**（下一步） | config.py 默认值派生化（§1.2-B） | `config.py` + `tools/profile_card` 派生入口 | 083 五项 + autoprobe + 派生值与现默认逐位对照 |
+| **096** ✅ GO（2026-10-04） | config.py 默认值派生化（§1.2-B） | `config.py`（十函数三层链）+ `manager.py:120`（传块长）+ `build_card.py`（kvmem_workspace 段）+ `tools/profile_card/verify_kvmem_defaults.py` | 静态对照三支 13/13（派生值逐位）+ 083 五项 card 态与 fallback 态全 GO + autoprobe 双轨 GO ✅ |
 | **097** | PageCodec 抽象（§1.2-A） | `remat.py`/`worker.py` 拆 nvfp4 codec + 注册表 + bf16 占位 | 083 五项（nvfp4 路径逐字节回归）+ remat 离线单测 18/18 |
 | **098** | 模型钩子注册表（§1.2-C） | `hooks.py` 新增 + `qwen3_next.py` 收敛为一行查询 | 083 五项 + Orca 臂 boot 自证（同一注册条目命中） |
 | **099**（按需） | manager 代表组/混合页大小泛化 | `manager.py` | 同上 |
@@ -68,4 +70,4 @@
 1. ~~**095 触生产公共路径**（最高）~~ **已解除（2026-10-04）**：判读改判为"上游化定性"（零代码零门控，见 §1.2-D），生产公共路径行为零变化；watchdog 两支全 FAST 回归确认。遗留尾巴 = 若未来发现补丁行为对某场景错误，再回门控方案并按本条原缓解清单走。
 2. **重构引入行为漂移**：KVMem 已冻结验收，任何"顺手改"都可能破 083 判据。缓解 = 每步只动一个工作面 + 回归锚四件套。
 3. **Orca × KVMem 组合未知**：EXL3 权重 + nvfp4 KV + KVMem 工作区从未同臂跑过；池字节与 pinned 快照区在 Orca 的账未算（必守 27 的 WDDM 提交预算风险在 3.4e9 池下更紧）。缓解 = 100 步 smoke 按必守 27 查 pinned 横幅。
-4. **authored defaults 的派生精度**：profile card 轨 A 已双锚点逐位，但 KVMem 参数（RECENT/VIEWPORT_PAGES）是策略值不是几何值，派生 = "几何约束下取合法值"，不承诺与 GSQ 调参值同优。缓解 = 派生值仅在 card 存在时生效，env 显式值永远最高优先。
+4. **authored defaults 的派生精度**：profile card 轨 A 已双锚点逐位，但 KVMem 参数（RECENT/VIEWPORT_PAGES）是策略值不是几何值，派生 = "几何约束下取合法值"，不承诺与 GSQ 调参值同优。缓解 = 派生值仅在 card 存在时生效，env 显式值永远最高优先。**（⭐2026-10-04 步骤 096 实测：对 GSQ 本模型，派生式恰好逐位复现全部定档值——16,384/32,768/55 都从 §7.1 的 L/gen/页长几何重算出来，说明这些"策略值"在本模型上其实就是几何约束下的唯一取整解；缓解条款仍对"其他模型调参值可能不同"有效。）**

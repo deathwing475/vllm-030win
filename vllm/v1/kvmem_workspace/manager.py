@@ -117,7 +117,14 @@ class KVMemWorkspaceScheduler:
             and bool(self.group_ids)
         )
         self.viewport_recent_tokens = config.viewport_recent_tokens()
-        self.viewport_retrieval_pages = config.viewport_retrieval_pages()
+        # Step 096: the VIEWPORT_PAGES derivation (§7.1 budget cut in pages)
+        # needs the workspace page size, a sliding-window-spec property only
+        # known at engine assembly -- pass the engine-resolved block size
+        # (the stored groups share one block size; min() is conservative).
+        self.viewport_retrieval_pages = config.viewport_retrieval_pages(
+            page_tokens=min(self.block_size.values())
+            if self.block_size else None
+        )
         # Step 073: read-only observation of what the scheduler does to a
         # rewritten request (see config.debug_enabled). Off by default.
         self.debug = config.debug_enabled()

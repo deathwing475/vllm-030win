@@ -221,8 +221,15 @@ class KVMemWorkspaceWorker:
         # silently corrupting blocks. Copy-before-free (K1) without the
         # raw-K capture keeps working on any KV dtype.
         if config.rawk_enabled():
+            # Step 096 fix: the guard added in step 084 read the CacheConfig
+            # field by the wrong name ("kv_cache_dtype" -- the dataclass
+            # field is "cache_dtype"), so getattr always fell back to "" and
+            # every RAWK boot died on a false positive. No KVMem arm ran
+            # between 084 and 096, so it surfaced here first. With the real
+            # field name the guard reads "nvfp4" from the launcher and
+            # passes -- the step-083 arm state this regression anchor needs.
             kv_cache_dtype = str(
-                getattr(self.vllm_config.cache_config, "kv_cache_dtype", "") or ""
+                getattr(self.vllm_config.cache_config, "cache_dtype", "") or ""
             )
             if not kv_cache_dtype.startswith("nvfp4"):
                 raise ValueError(

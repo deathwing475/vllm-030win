@@ -1,7 +1,7 @@
 {
   "schema": "profile-card/1",
   "name": "qwen3.8exl3",
-  "created": "2026-10-04T15:09:54",
+  "created": "2026-10-04T19:32:26",
   "tool": "tools/profile_card/build_card.py",
   "model": {
     "path": "G:\\qwen3.8model\\qwen3.8exl3",
@@ -12,6 +12,7 @@
     "vocab_size": 248320,
     "head_dim": 256,
     "num_key_value_heads": 4,
+    "max_position_embeddings": 262144,
     "source": "derived"
   },
   "source_flags": {
@@ -30,70 +31,64 @@
   },
   "page_geometry": {
     "attn_page_bytes_per_token_per_layer": 1152,
-    "mamba_page_raw_bytes": 1675264,
-    "block_size_tokens": 1456,
-    "unified_page_bytes": 1677312,
+    "mamba_page_raw_bytes": 1634304,
+    "block_size_tokens": 1424,
+    "unified_page_bytes": 1640448,
     "source": "derived"
   },
   "groups": {
-    "count": 9,
+    "count": 8,
     "rows": [
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.0.linear_attn",
-        "blocks_per_request": 4
+        "blocks_per_request": 2
       },
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.1.linear_attn",
-        "blocks_per_request": 4
+        "blocks_per_request": 2
       },
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.2.linear_attn",
-        "blocks_per_request": 4
+        "blocks_per_request": 2
       },
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.4.linear_attn",
-        "blocks_per_request": 4
+        "blocks_per_request": 2
       },
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.5.linear_attn",
-        "blocks_per_request": 4
+        "blocks_per_request": 2
       },
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.6.linear_attn",
-        "blocks_per_request": 4
+        "blocks_per_request": 2
       },
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.3.self_attn",
-        "blocks_per_request": 23
+        "blocks_per_request": 24
       },
       {
         "layers": 8,
-        "page_bytes": 1677312,
+        "page_bytes": 1640448,
         "example": "model.layers.7.self_attn",
-        "blocks_per_request": 23
-      },
-      {
-        "layers": 5,
-        "page_bytes": 1677312,
-        "example": "draft.layers.0.self_attn",
-        "blocks_per_request": 4
+        "blocks_per_request": 24
       }
     ],
-    "bytes_per_block": 13418496,
+    "bytes_per_block": 13123584,
     "source": "derived"
   },
   "capacity": {
@@ -106,37 +101,64 @@
   },
   "need_decomposition": {
     "formula": "need(L) = a + b*L  (per-request pool bytes)",
-    "a_bytes": 375717888,
+    "a_bytes": 157483008,
     "b_bytes_per_token": 18432.0,
-    "mbt_min": 1458,
+    "mbt_min": 1424,
     "single_request_l_ceiling": null,
     "source": "derived"
   },
-  "draft": {
-    "path": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ\\dflash2\\gptq3c",
-    "architecture": "DFlash2DraftModel",
-    "num_hidden_layers": 5,
-    "sliding_window": 2048,
-    "spec": "SlidingWindowSpec",
-    "per_request_blocks": 4
+  "kvmem_workspace": {
+    "workspace_tokens": {
+      "value": 262144,
+      "formula": "max_position_embeddings (design §7.2 capability ceiling; a host-budget quantity, not a code limit)",
+      "source": "derived"
+    },
+    "workspace_mb": {
+      "value": 3072,
+      "formula": "ceil(host_ram_total_gib / 8) GiB -- pinned host budget policy from the platform card",
+      "source": "derived"
+    },
+    "snapshot_keep": {
+      "value": 20,
+      "formula": "floor(workspace_mb * 2^20 / (snapshot_traj=2 * mamba group state 78446592 B)) -- step-066 ring ledger",
+      "source": "derived"
+    },
+    "viewport_recent_tokens": {
+      "value": null,
+      "source": "missing (no single_request_l_ceiling: pool size unknown without --kv-bytes)"
+    },
+    "recent_tokens": {
+      "value": null,
+      "source": "missing (no viewport_recent anchor)"
+    },
+    "viewport_pages": {
+      "value": null,
+      "source": "missing (no single_request_l_ceiling)"
+    },
+    "authority_trajectories": {
+      "value": 2,
+      "formula": "= snapshot_trajectories -- both host regions are provisioned for the same trajectory concurrency",
+      "source": "derived"
+    },
+    "gen_reserve_tokens": {
+      "value": 32768,
+      "source": "human-copied (§7.1 layout design constant)"
+    },
+    "query_span": {
+      "value": 256,
+      "source": "human-copied (step-061 2^8 filing)"
+    },
+    "trajectory_prefix_tokens": {
+      "value": 512,
+      "source": "human-copied (structural constant)"
+    },
+    "index_subblock": {
+      "value": 128,
+      "source": "human-copied (§5.3 R1-mitigation constant; 64 filed alternative)"
+    }
   },
-  "spec_family": {
-    "family": "dflash2",
-    "aux_taps": [
-      6,
-      20,
-      34,
-      48,
-      62
-    ],
-    "fc_width": 25600,
-    "mask_token_id": 248070,
-    "mask_token_ok": true,
-    "aux_max_below_target_depth": true,
-    "supports_eagle3_interface": true,
-    "v2_model_runner_required": true,
-    "draft_slots": 2
-  },
+  "draft": null,
+  "spec_family": null,
   "weight_census": {
     "model_dir": "G:\\qwen3.8model\\qwen3.8exl3",
     "files": 4,
@@ -180,7 +202,7 @@
     }
   },
   "candidates": {
-    "mbt_min": 1458,
+    "mbt_min": 1424,
     "single_request_l_ceiling": null,
     "kv_cache_bytes": "autoprobe decides from the residency-cliff search (design doc §4); auto sizing is a KNOWN speed trap on this card (step 090)",
     "kv_offloading_backend": {
@@ -198,48 +220,5 @@
       "088-arm reject readings: residual 1.0% / 3.8% < 5% (accept §6.2)"
     ],
     "mtp_visual_verdict": "mtp.* and visual.* never reach VRAM (step 092); no skip patch required"
-  },
-  "measured": {
-    "20261004_150711_recovered": {
-      "launch": "G:\\qwen3.8model\\_tmp_line_b\\sgen_orca_check.cmd",
-      "port": 8001,
-      "launch_params": {
-        "model": "G:\\qwen3.8model\\qwen3.8exl3",
-        "max_model_len": 16384,
-        "mbt": 1024,
-        "pool": 813249331,
-        "draft": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ\\dflash2\\gptq3c",
-        "num_spec": 2
-      },
-      "healthy": true,
-      "log": "G:\\qwen3.8model\\_tmp_line_b\\o92_pin1_b1.log",
-      "rail_b": {
-        "model_loading_gib": 12.35,
-        "attn_block_size": 1456,
-        "kv_cache_tokens": 18904,
-        "concurrency_at_len": 16384,
-        "max_concurrency": 1.15
-      },
-      "guard": {
-        "ok": true,
-        "checks": [
-          {
-            "name": "attention_block_size",
-            "rail_a": 1456,
-            "rail_b": 1456,
-            "ok": true
-          },
-          {
-            "name": "capacity_tokens",
-            "rail_a": 18904,
-            "rail_b": 18904,
-            "ok": true
-          }
-        ],
-        "note": "empty checks = engine printed no comparable banner"
-      },
-      "source": "measured (recovered from o92_pin1_b1 boot log; same generated launcher as autoprobe run)",
-      "note": "card was rebuilt (draft fix) after the original autoprobe run; readings recovered instead of re-booting"
-    }
   }
 }

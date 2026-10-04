@@ -1,7 +1,7 @@
 {
   "schema": "profile-card/1",
   "name": "Qwen3.8-27B-3Bit-GSQ",
-  "created": "2026-10-04T14:38:22",
+  "created": "2026-10-04T19:32:18",
   "tool": "tools/profile_card/build_card.py",
   "model": {
     "path": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ",
@@ -12,6 +12,7 @@
     "vocab_size": 248320,
     "head_dim": 256,
     "num_key_value_heads": 4,
+    "max_position_embeddings": 262144,
     "source": "derived"
   },
   "source_flags": {
@@ -112,6 +113,59 @@
     "single_request_l_ceiling": 163072,
     "source": "derived"
   },
+  "kvmem_workspace": {
+    "workspace_tokens": {
+      "value": 262144,
+      "formula": "max_position_embeddings (design §7.2 capability ceiling; a host-budget quantity, not a code limit)",
+      "source": "derived"
+    },
+    "workspace_mb": {
+      "value": 3072,
+      "formula": "ceil(host_ram_total_gib / 8) GiB -- pinned host budget policy from the platform card",
+      "source": "derived"
+    },
+    "snapshot_keep": {
+      "value": 20,
+      "formula": "floor(workspace_mb * 2^20 / (snapshot_traj=2 * mamba group state 80412672 B)) -- step-066 ring ledger",
+      "source": "derived"
+    },
+    "viewport_recent_tokens": {
+      "value": 16384,
+      "formula": "2^(floor(log2(L - gen)) - 2) with L=163072, gen=32768 -- §7.1 clamp band lower end",
+      "source": "derived"
+    },
+    "recent_tokens": {
+      "value": 32768,
+      "formula": "2 x viewport_recent -- geometric midpoint of the §7.1 clamp band [R, 4R]",
+      "source": "derived"
+    },
+    "viewport_pages": {
+      "value": null,
+      "formula": "floor((L - gen)/p) - 1 - ceil(R/p) - ceil(gen/p) with L=163072, gen=32768 -- §7.1 budget cut in pages; p = the engine-resolved workspace block size, passed at runtime",
+      "source": "derived-runtime"
+    },
+    "authority_trajectories": {
+      "value": 2,
+      "formula": "= snapshot_trajectories -- both host regions are provisioned for the same trajectory concurrency",
+      "source": "derived"
+    },
+    "gen_reserve_tokens": {
+      "value": 32768,
+      "source": "human-copied (§7.1 layout design constant)"
+    },
+    "query_span": {
+      "value": 256,
+      "source": "human-copied (step-061 2^8 filing)"
+    },
+    "trajectory_prefix_tokens": {
+      "value": 512,
+      "source": "human-copied (structural constant)"
+    },
+    "index_subblock": {
+      "value": 128,
+      "source": "human-copied (§5.3 R1-mitigation constant; 64 filed alternative)"
+    }
+  },
   "draft": {
     "path": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ\\dflash2\\gptq3c",
     "architecture": "DFlash2DraftModel",
@@ -211,9 +265,9 @@
     "mtp_visual_verdict": "mtp.* and visual.* never reach VRAM (step 092); no skip patch required"
   },
   "measured": {
-    "20261004_151222": {
-      "launch": "G:\\qwen3.8model\\_tmp_line_b\\sgen_gsq_check.cmd",
-      "port": 8080,
+    "20261004_210400": {
+      "launch": "G:\\qwen3.8model\\_tmp_line_b\\sgen_gsq_096check.cmd",
+      "port": 8001,
       "launch_params": {
         "model": "G:\\qwen3.8model\\Qwen3.8-27B-3Bit-GSQ",
         "max_model_len": 163072,
@@ -223,7 +277,7 @@
         "num_spec": 2
       },
       "healthy": true,
-      "log": "G:\\qwen3.8model\\_tmp_line_b\\autoprobe_20261004_151222.log",
+      "log": "G:\\qwen3.8model\\_tmp_line_b\\autoprobe_20261004_210400.log",
       "rail_b": {
         "model_loading_gib": 11.3,
         "attn_block_size": 1456,
