@@ -1,0 +1,46 @@
+{
+  "_comment": "Platform card (step 092): environment contract + machine facts shared by ALL models. Extracted from tools/serve_gsq_prod029_n2.cmd and the step-085 boot readings so launchers stop hand-copying them per model. Every value carries source: platform = this card's own fact, measured = read off a boot, human-copied = debt awaiting derivation.",
+  "venv": {"path": "G:\\qwen3.8model\\vllm-win029", "source": "platform"},
+  "env": {
+    "HOME": "C:\\fi",
+    "USERPROFILE": "C:\\fi",
+    "TMP": "G:\\qwen3.8model\\_tmp_prod029",
+    "TEMP": "G:\\qwen3.8model\\_tmp_prod029",
+    "HF_HOME": "G:\\qwen3.8model\\hub",
+    "HF_HUB_OFFLINE": "1",
+    "CUDA_HOME": "C:\\PROGRA~1\\NVIDIA~2\\CUDA\\v13.3",
+    "CUDA_PATH": "C:\\PROGRA~1\\NVIDIA~2\\CUDA\\v13.3",
+    "CXX": "C:\\Program Files\\LLVM\\bin\\clang++",
+    "VLLM_KV_CACHE_LAYOUT": "HND",
+    "FLASHINFER_WORKSPACE_BASE": "C:/fw",
+    "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": "67108864",
+    "FLASHINFER_EXTRA_LDFLAGS": "-LG:/qwen3.8model/vllm-win029/Lib/site-packages/tvm_ffi/lib -ltvm_ffi",
+    "VLLM_LOGGING_LEVEL": "INFO",
+    "_note": "source=platform (model-independent, 交接文档 §2 contract); vcvars64 must be called before launch; LIB prepends CUDA lib\\x64"
+  },
+  "machine": {
+    "gpu": "RTX 5070 Ti 16 GB (16303 MiB total)",
+    "host_ram_total_gib": 23.1,
+    "startup_free_gib": {"value": [14.68, 15.89], "source": "measured (step 085 boots; util 0.95 unreachable)"},
+    "gpu_memory_utilization_cap": {"value": 0.922, "source": "human-copied (production daily value; NOT derived)"},
+    "kv_pool_speed_switch": {
+      "fact": "auto-sized pool walks into the residency cliff on this card under graphs+DFlash2; a hand-pinned --kv-cache-memory-bytes is the speed lever (step 090: auto 1.72 GiB -> 4.83/5.49 tok/s vs pinned 0.745 GiB -> 79.9-86.6)",
+      "source": "measured (step 090, 7 boots)"
+    },
+    "graph_capture_reservation_gib": {"value": 1.3, "source": "measured (step 090 s1; VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 skips it at own risk)"}
+  },
+  "engine_contract": {
+    "pin_shim": {"path": "G:\\qwen3.8model\\vllm-030win-git\\tools\\pin_shim", "source": "platform"},
+    "pin_env": {"VLLM_DBG_TRACE": "1", "VLLM_DBG_MIN": "1", "VLLM_DBG_PIN": "1",
+      "_note": "GSQ production carries these; Orca arms ran with shim but doors OFF (step 091 diff). Un-proven as the 090 slow-mode cause - pending the 092 single-variable experiment",
+      "source": "human-copied"},
+    "orcasaq2_sitecustomize": {"path": "G:\\qwen3.8model\\vllm-030win-git\\tools\\orcasaq2_sitecustomize", "needed_when": "EXL3 quantization (exl3 quant_method)", "source": "derived (quant method in checkpoint config)"},
+    "exl3_empty_shared_flag": {"name": "ORCA_EXL3_ALLOW_EMPTY_SHARED", "value": "1",
+      "needed_when": "EXL3 checkpoint x speculative family (MTP/EAGLE/DFlash2 draft shares embed/lm_head after load)",
+      "source": "derived (step 085 verdict, rule 28(3))"}
+  },
+  "probes": {
+    "anchor": "tools/anchor_longctx.py (8k anchor, production-watchdog compatible, --model for non-GSQ)",
+    "speed_sampler": "tools/step090_orca_speed.py (1 Hz utilization.gpu/memory, power.draw, clocks)"
+  }
+}
