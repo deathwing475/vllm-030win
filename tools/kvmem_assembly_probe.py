@@ -168,6 +168,108 @@ def run(args) -> dict:
     return out
 
 
+def run_ab(args) -> dict:
+    """Same-boot, same-state A/B of the assembly gain (step 102, rule 36-iii).
+
+    Cross-boot TTFT comparisons are confounded by the boot-level speed state
+    (step 079: 540 vs ~13K tok/s prefill between boots of the same arm), so
+    the gain must be paired inside ONE boot. Legs, in order, each preceded by
+    a deterministic native reset (rule 36-ii):
+      A   serve the ingest prefix + tail            -> assembly (LOAD=1 boot)
+      B   serve a DIFFERENT-nonce prefix of the same length + tail; the
+          workspace has no snapshot for that nonce, so this is a full prefill
+          = the deterministic "assembly off" control (no LOAD env flip, which
+          would need a second boot and reintroduce the state confound)
+      A2  serve the ingest prefix again             -> assembly repeatability
+    The JSON carries raw TTFTs, the paired deltas and per-leg token counts so
+    the caller can reconcile delta ~= skipped_tokens / prefill_throughput.
+    """
+    base = args.base
+    ingest_prompt, _ = build(args.tokens, args.depth, args.nonce, True, "summary")
+    serve_prompt = build_serve_prompt(ingest_prompt, args.tail_tokens)
+    flush_prompt, _ = build(args.tokens, args.depth, args.nonce + "-flush", True,
+                            "summary")
+    alt_ingest_prompt, _ = build(args.tokens, args.depth,
+                                 args.nonce + "-abfull", True, "summary")
+    alt_serve_prompt = build_serve_prompt(alt_ingest_prompt, args.tail_tokens)
+    tok = tokenizer()
+    n_ingest = len(tok.encode(ingest_prompt, add_special_tokens=False))
+    n_serve = len(tok.encode(serve_prompt, add_special_tokens=False))
+    n_alt = len(tok.encode(alt_serve_prompt, add_special_tokens=False))
+
+    print(f"[ingest] ~{n_ingest} tokens, needle at depth {args.depth}")
+    r1 = post(base, ingest_prompt, args.ingest_max_tokens, ignore_eos=True)
+    time.sleep(1.0)
+    print(f"[flush ] ~{n_ingest} tokens (different nonce)")
+    r2 = post(base, flush_prompt, 1, ignore_eos=True)
+    time.sleep(1.0)
+
+    legs: dict = {}
+    # a -> a2 -> b (step 102 k102e finding): every prefill captures workspace
+    # snapshots for its own trajectory, so a different-nonce leg running
+    # BETWEEN the two assembly legs evicts the ingest trajectory's snapshots
+    # (snapshot_traj=3, auth slots) and the repeat leg degrades to a full
+    # prefill. Keeping the repeat adjacent to leg a keeps it a true repeat;
+    # the control goes last because its own full prefill is order-insensitive.
+    for name, prompt, n_tok in (("a", serve_prompt, n_serve),
+                                ("a2", serve_prompt, n_serve),
+                                ("b", alt_serve_prompt, n_alt)):
+        reset_ok = reset_prefix_cache(base)
+        print(f"[reset ] before leg {name}: ok={reset_ok}")
+        print(f"[leg {name}] ~{n_tok} tokens")
+        r = post(base, prompt, args.max_tokens)
+        legs[name] = {
+            "tokens": n_tok,
+            "reset_prefix_cache": reset_ok,
+            "ttft_s": r.get("ttft_s"),
+            "total_s": r.get("total_s"),
+            "ok": r.get("ok"),
+            "sample": r.get("sample", ""),
+            "text": r.get("text", ""),
+            "needle_hit": NEEDLE_CODE in (r.get("sample") or ""),
+        }
+
+    ta = legs["a"]["ttft_s"]
+    tb = legs["b"]["ttft_s"]
+    ta2 = legs["a2"]["ttft_s"]
+    paired = {
+        "ttft_a_s": ta,
+        "ttft_b_s": tb,
+        "ttft_a2_s": ta2,
+        "ttft_b_minus_a_s": (tb - ta) if ta is not None and tb is not None else None,
+        "ttft_b_minus_a2_s": (tb - ta2) if ta2 is not None and tb is not None else None,
+        "ttft_a_vs_a2_s": (ta2 - ta) if ta is not None and ta2 is not None else None,
+        "skipped_tokens_note": "assembled boundary per leg a/a2 comes from the "
+                               "engine log line 'matches at N tokens'",
+    }
+    out = {
+        "tag": args.tag,
+        "mode": "ab",
+        "tokens_ingest": n_ingest,
+        "tokens_serve_a": n_serve,
+        "tokens_serve_b": n_alt,
+        "tail_tokens": n_serve - n_ingest,
+        "depth": args.depth,
+        "ingest": {
+            "ttft_s": r1.get("ttft_s"),
+            "total_s": r1.get("total_s"),
+            "ok": r1.get("ok"),
+            "sample": r1.get("sample", "")[:200],
+        },
+        "flush": {
+            "ok": r2.get("ok"),
+            "total_s": r2.get("total_s"),
+        },
+        "legs": legs,
+        "paired": paired,
+    }
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as handle:
+        json.dump(out, handle, ensure_ascii=False, indent=2)
+    print(json.dumps(paired, indent=2))
+    return out
+
+
 def compare(args) -> dict:
     a = json.load(open(args.a, encoding="utf-8"))
     b = json.load(open(args.b, encoding="utf-8"))
@@ -241,6 +343,28 @@ def main():
     )
     p.add_argument("--out", default=r"G:\qwen3.8model\prod029_logs\kvmem_k4a\asm.json")
     p.set_defaults(func=run)
+
+    p = sub.add_parser("ab")
+    p.add_argument("--base", default="http://127.0.0.1:8080")
+    p.add_argument("--tokens", type=int, default=200000)
+    p.add_argument("--depth", type=float, default=0.50)
+    p.add_argument("--tail-tokens", type=int, default=768)
+    p.add_argument("--nonce", default="asml")
+    p.add_argument("--ingest-max-tokens", type=int, default=16)
+    p.add_argument("--max-tokens", type=int, default=32)
+    p.add_argument("--tag", default="ab")
+    p.add_argument(
+        "--reset-prefix-cache",
+        action="store_true",
+        help="POST /reset_prefix_cache before EACH leg. Rule 36-ii: native "
+        "hit volume drifts per boot (0%%..98.4%%), a deterministic reset "
+        "before every leg is what makes the A/B pairing valid.",
+    )
+    p.add_argument(
+        "--out",
+        default=r"G:\qwen3.8model\prod029_logs\kvmem_k4a\asm_ab.json",
+    )
+    p.set_defaults(func=run_ab)
 
     c = sub.add_parser("compare")
     c.add_argument("--a", required=True, help="LOAD=1 run output")
