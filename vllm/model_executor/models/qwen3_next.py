@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only Qwen3Next model."""
 
-import os
 from collections.abc import Iterable
 from itertools import islice
 
@@ -61,6 +60,7 @@ from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_next import Qwen3NextConfig
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.kvmem_workspace.hooks import model_hooks_for
 
 from .interfaces import (
     EagleModelMixin,
@@ -271,86 +271,6 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         return final_hidden_states.view(orig_shape)
 
 
-_KVMEM_SW_LOGGED = False
-_KVMEM_RAWK_LOGGED = False
-
-
-def _kvmem_rawk_layer(config: Qwen3NextConfig, layer_idx: int) -> bool:
-    """vllm-030win patch (step 061): is this layer captured for the KVMem index?
-
-    Only the ``full_attention`` layers own a KV cache to index; the 48
-    ``linear_attention`` layers carry recurrent state instead. Returns False
-    unless ``VLLM_KVMEM_RAWK`` is armed, so an unarmed boot is unaffected.
-    """
-    global _KVMEM_RAWK_LOGGED
-    from vllm.v1.kvmem_workspace import capture
-
-    if not capture.enabled():
-        return False
-    layer_types = getattr(config, "layer_types", None)
-    if (
-        layer_types is None
-        or layer_idx >= len(layer_types)
-        or layer_types[layer_idx] != "full_attention"
-    ):
-        return False
-    if not _KVMEM_RAWK_LOGGED:
-        _KVMEM_RAWK_LOGGED = True
-        logger.info(
-            "vllm-030win patch (step 061): raw-K capture on the full_attention "
-            "layers (VLLM_KVMEM_RAWK); those layers use the eager norm+RoPE "
-            "path because the fused kernel exposes no pre-RoPE K"
-        )
-    return True
-
-
-def _kvmem_per_layer_sliding_window(
-    config: Qwen3NextConfig, prefix: str
-) -> int | None:
-    """vllm-030win patch (step 057): optional sliding window on the
-    full-attention layers, for the KVMem arm.
-
-    ``CacheConfig.sliding_window`` is only populated for models whose
-    ``layer_types`` are ALL sliding_attention (see ``arg_utils``); it is
-    deliberately left None for interleaved hybrids so it cannot override the
-    per-layer windows of a global/sliding mix. An interleaved model like this
-    one can therefore only obtain a window through ``per_layer_sliding_window``.
-
-    ``VLLM_KVMEM_SW_WINDOW=N`` applies N to every ``full_attention`` layer,
-    which bounds the per-request KV of the attention group to ~N tokens and so
-    lets a prompt longer than the KV pool prefill by rolling the window
-    (step 057 / KVMem stage 1a). Only ``full_attention`` layers are touched:
-    a speculative drafter sharing this class declares its own
-    ``sliding_attention`` layers and keeps its own window. Unset keeps upstream
-    behaviour byte-for-byte.
-    """
-    global _KVMEM_SW_LOGGED
-    raw = os.environ.get("VLLM_KVMEM_SW_WINDOW", "").strip()
-    if not raw:
-        return None
-    layer_types = getattr(config, "layer_types", None)
-    if layer_types is None:
-        return None
-    if layer_types[extract_layer_index(prefix)] != "full_attention":
-        return None
-    try:
-        window = int(raw)
-    except ValueError:
-        raise ValueError(
-            "VLLM_KVMEM_SW_WINDOW must be a positive integer, got %r" % (raw,)
-        ) from None
-    if window < 1:
-        raise ValueError("VLLM_KVMEM_SW_WINDOW must be >= 1, got %d" % window)
-    if not _KVMEM_SW_LOGGED:
-        _KVMEM_SW_LOGGED = True
-        logger.info(
-            "vllm-030win patch (step 057): full_attention layers get a %d-token "
-            "sliding window (VLLM_KVMEM_SW_WINDOW)",
-            window,
-        )
-    return window
-
-
 class Qwen3NextAttention(nn.Module):
     def __init__(
         self,
@@ -362,6 +282,13 @@ class Qwen3NextAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # vllm-030win patch (step 098): the model-side KVMem decisions live in
+        # the kvmem_workspace hooks registry, keyed by attention class name.
+        # One lookup serves both the per-layer window below and the raw-K
+        # capture arm further down; models that reuse this class (qwen3_5,
+        # interns2_mobius, qwen4_exp) hit the same entry. None = nobody opted
+        # in, upstream behaviour byte-for-byte.
+        kvmem_hooks = model_hooks_for(type(self).__name__)
         self.config = config
         self.hidden_size = config.hidden_size
         tp_size = get_tensor_model_parallel_world_size()
@@ -429,8 +356,9 @@ class Qwen3NextAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             cache_config=cache_config,
             quant_config=quant_config,
-            per_layer_sliding_window=_kvmem_per_layer_sliding_window(
-                config, prefix
+            per_layer_sliding_window=(
+                kvmem_hooks.per_layer_sliding_window(config, prefix)
+                if kvmem_hooks is not None else None
             ),
             prefix=f"{prefix}.attn",
             attn_type=attn_type,
@@ -474,7 +402,10 @@ class Qwen3NextAttention(nn.Module):
         # full_attention layers while the capture is armed; the 48 GDN layers
         # keep the fused kernel. Unset keeps upstream behaviour byte-for-byte.
         self._kvmem_layer_idx = extract_layer_index(prefix)
-        self._kvmem_capture = _kvmem_rawk_layer(config, self._kvmem_layer_idx)
+        self._kvmem_capture = (
+            kvmem_hooks.rawk_layer(config, prefix)
+            if kvmem_hooks is not None else False
+        )
         if self._kvmem_capture:
             self.use_fused_qk_norm_rope_gate = False
 
