@@ -1082,11 +1082,16 @@ class KVMemWorkspaceScheduler:
         if num_computed_tokens > 0:
             # Assembly must own the whole prefix; a local prefix-cache hit
             # would interleave blocks this connector does not manage.
+            self._debug_window(
+                "asm-miss", request, reason="local-prefix-hit",
+                num_computed=num_computed_tokens,
+            )
             return 0
         token_ids = getattr(request, "prompt_token_ids", None)
         if token_ids is None:
             token_ids = getattr(request, "all_token_ids", None)
         if not token_ids:
+            self._debug_window("asm-miss", request, reason="no-token-ids")
             return 0
         trajectory = self.trajectory_key(token_ids, self.trajectory_prefix_tokens)
         group_id = self.group_ids[0]
@@ -1118,15 +1123,31 @@ class KVMemWorkspaceScheduler:
         ):
             num_pages += 1
         if num_pages == 0:
+            self._debug_window(
+                "asm-miss", request, reason="no-page-run",
+                prompt_len=prompt_len, evict_edge=evict_edge,
+                page0=(trajectory, 0) in self._page_table,
+                table_keys=len(self._page_table),
+            )
             return 0
         page_boundary = num_pages * block_size
         available = self._snapshots.get(trajectory)
         if not available:
+            self._debug_window(
+                "asm-miss", request, reason="no-snapshot",
+                num_pages=num_pages, page_boundary=page_boundary,
+                snapshot_traj=len(self._snapshots),
+            )
             return 0
         # The recurrent state must be exact at the boundary we jump to, so the
         # assembly boundary is a *snapshot* boundary, capped by the page run.
         candidates = [b for b in available if b <= page_boundary]
         if not candidates:
+            self._debug_window(
+                "asm-miss", request, reason="no-snapshot-candidate",
+                page_boundary=page_boundary,
+                boundaries=sorted(available)[:6],
+            )
             return 0
         boundary = max(candidates)
         if boundary < block_size:
@@ -1152,6 +1173,10 @@ class KVMemWorkspaceScheduler:
         if boundary < block_size or boundary >= prompt_len:
             # Never claim the whole prompt: the scheduler clamps a full hit
             # back to num_tokens - 1, which is not page aligned.
+            self._debug_window(
+                "asm-miss", request, reason="boundary-empty-after-cap",
+                boundary=boundary, prompt_len=prompt_len,
+            )
             return 0
         return boundary
 

@@ -51,6 +51,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -80,6 +81,25 @@ def build_serve_prompt(ingest_prompt: str, tail_tokens: int):
     return ingest_prompt + tail
 
 
+def reset_prefix_cache(base: str) -> bool:
+    """Drop the engine's native prefix-cache hashes (step 101).
+
+    Default query parameters: reset_running_requests=False and
+    reset_external=False -- the connector-managed KVMem workspace is not
+    touched, only the engine's own block-hash table.
+    """
+    req = urllib.request.Request(
+        base + "/reset_prefix_cache", data=b"", method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status == 200
+    except Exception as exc:  # noqa: BLE001
+        print(f"[reset ] POST /reset_prefix_cache failed: {exc}")
+        return False
+
+
+
 def run(args) -> dict:
     base = args.base
     # The ingest prompt ends on a plain summary instruction; the question the
@@ -98,6 +118,18 @@ def run(args) -> dict:
     print(f"[flush ] ~{n_ingest} tokens (different nonce, overwrites the pool)")
     r2 = post(base, flush_prompt, 1, ignore_eos=True)
     time.sleep(1.0)
+    # Step 101: the flush only invalidates the blocks it actually OVERWRITES.
+    # On a pool bigger than ingest+flush combined (Orca arm: 276,187 tokens
+    # vs 2 x ~129K) the engine never evicts request 1's cached blocks, the
+    # serve request then hits the native prefix cache (k1d: 32.9%), and
+    # _assembly_match short-circuits on num_computed_tokens > 0: the
+    # connector only assembles a prefix it fully owns. Resetting the native
+    # hashes makes the serve request arrive with num_computed_tokens == 0,
+    # which is exactly the residual scenario this probe exists to exercise.
+    reset_ok = None
+    if args.reset_prefix_cache:
+        reset_ok = reset_prefix_cache(base)
+        print(f"[reset ] prefix cache reset ok={reset_ok}")
     print(f"[serve ] ~{n_serve} tokens (tail ~{n_serve - n_ingest})")
     r3 = post(base, serve_prompt, args.max_tokens)
 
@@ -107,6 +139,7 @@ def run(args) -> dict:
         "tokens_serve": n_serve,
         "tail_tokens": n_serve - n_ingest,
         "depth": args.depth,
+        "reset_prefix_cache": reset_ok,
         "ingest": {
             "ttft_s": r1.get("ttft_s"),
             "total_s": r1.get("total_s"),
@@ -198,6 +231,14 @@ def main():
     p.add_argument("--ingest-max-tokens", type=int, default=16)
     p.add_argument("--max-tokens", type=int, default=32)
     p.add_argument("--tag", default="run")
+    p.add_argument(
+        "--reset-prefix-cache",
+        action="store_true",
+        help="POST /reset_prefix_cache before the serve request. Step 101: "
+        "on a pool bigger than ingest+flush combined the flush never evicts "
+        "the ingest hashes and the serve request short-circuits the assembly "
+        "via a native prefix-cache hit.",
+    )
     p.add_argument("--out", default=r"G:\qwen3.8model\prod029_logs\kvmem_k4a\asm.json")
     p.set_defaults(func=run)
 
