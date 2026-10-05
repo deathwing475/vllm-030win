@@ -469,6 +469,13 @@ class Qwen3NextAttention(nn.Module):
             -1, self.num_kv_heads * self.head_dim
         )
         if self._kvmem_capture:
+            if positions.ndim == 2 and not getattr(
+                self.rotary_emb, "mrope_section", None
+            ):
+                # Mirror the fused branch above: a rotary instance without
+                # mrope_section cannot take [3, T] positions, and the
+                # capture/remat chain is built on the 1-D position protocol.
+                positions = positions[0]
             # RoPE below rotates in place, so the pre-RoPE value has to be
             # cloned out here. record() only stashes references; the host copy
             # happens after the forward, outside any CUDA graph.

@@ -57,7 +57,9 @@ CADENCE = os.path.join(TOOLS, "kvmem_ingest_cadence.py")
 ANCHOR = os.path.join(TOOLS, "anchor_longctx.py")
 VPROBE = os.path.join(TOOLS, "kvmem_viewport_probe.py")
 STATE = os.path.join(LOGS, "step080_boots.json")
-BASE = "http://127.0.0.1:8080"
+# GSQ arms serve on 8080; Orca arms on 8001 (098 tooling debt: a hard-wired
+# port made every Orca-leg health() poll fail, so h1b was verified by hand).
+BASE = os.environ.get("KVMEM_RUNNER_BASE", "http://127.0.0.1:8080")
 FAST_MAX = 2.0     # s per 1456-token page step
 SLOW_MIN = 5.0
 

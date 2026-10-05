@@ -126,6 +126,9 @@ def run(args) -> dict:
             "needle_hit": NEEDLE_CODE in (r3.get("sample") or ""),
         },
     }
+    # The engine only creates VLLM_KVMEM_DUMP on first write; on an arm whose
+    # requests produced no retrieval dump the directory may not exist yet.
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as handle:
         json.dump(out, handle, ensure_ascii=False, indent=2)
     print(json.dumps(out["serve"], indent=2))

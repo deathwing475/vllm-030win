@@ -79,7 +79,10 @@ def build_prompt(target_tokens: int, depth: float, nonce: str) -> str:
 
 def post(base: str, prompt: str, max_tokens: int, ignore_eos: bool = False) -> dict:
     payload = {
-        "model": "qwen3.8-27b-gsq",
+        # GSQ production name by default; Orca arms set KVMEM_PROBE_MODEL (a
+        # served-model-name mismatch surfaces as a swallowed HTTPError with
+        # ok=false and null timings - step-100 lesson).
+        "model": os.environ.get("KVMEM_PROBE_MODEL", "qwen3.8-27b-gsq"),
         "prompt": prompt,
         "max_tokens": max_tokens,
         "temperature": 0.0,
