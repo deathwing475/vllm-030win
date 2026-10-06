@@ -25,6 +25,8 @@ rem probe's compare needs both), S100_ML / S100_KVMB / S100_MBT / S100_WSMB /
 rem S100_EVERY / S100_KEEP (snapshot knobs, 12/10 = the 083 mitigation).
 rem S100_SLOTPOLICY (step 103 trajectory-slot replacement: unset = legacy /
 rem engine default, "lru" = whole-trajectory LRU eviction, design §5.4).
+rem S100_INTERLEAVE (step 104 guard-(a) interleave: 1 = assembly resumes from
+rem a native prefix-cache hit, design §5.7; unset = guard (a) byte-for-byte).
 rem
 rem Judgement: engine log "KVMem assembly: request ... matches" -> "issued"
 rem -> "prefix landed"; remat self-test gates (pages=8, delta/step <= 0.25);
@@ -83,6 +85,7 @@ set "VLLM_KVMEM_TOPN=64"
 set "VLLM_KVMEM_SNAPSHOT_EVERY_PAGES=%S100_EVERY%"
 set "VLLM_KVMEM_SNAPSHOT_KEEP=%S100_KEEP%"
 if not "%S100_SLOTPOLICY%"=="" set "VLLM_KVMEM_SLOT_POLICY=%S100_SLOTPOLICY%"
+if not "%S100_INTERLEAVE%"=="" set "VLLM_KVMEM_ASM_INTERLEAVE=%S100_INTERLEAVE%"
 set "VLLM_KVMEM_DEBUG=1"
 set "VLLM_KVMEM_BAKE_VERIFY=1"
 set "VLLM_KVMEM_INDEX_SUBBLOCK=32"

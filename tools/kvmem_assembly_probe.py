@@ -197,6 +197,33 @@ def run_ab(args) -> dict:
     n_serve = len(tok.encode(serve_prompt, add_special_tokens=False))
     n_alt = len(tok.encode(alt_serve_prompt, add_special_tokens=False))
 
+    # O4 step 104 (design §5.7): the deterministic interleave legs.
+    #   W   reset, then prefill a PAGE-ALIGNED truncation of the ingest prompt
+    #       (same leading 512 tokens = the same KVMem trajectory): the native
+    #       hash chain now ends exactly at the warm-up's last page while the
+    #       KVMem page table still holds the ingest's evicted run.
+    #   I   NO reset -- the warm-up's hash chain must survive. The serve
+    #       request arrives with num_computed_tokens == warm-up pages and the
+    #       interleaved assembly resumes from there (guard (a) off). With the
+    #       guard on this leg short-circuits (asm-miss local-prefix-hit).
+    warm_prompt = None
+    n_warm = 0
+    if args.partial_warmup_tokens > 0:
+        warm_ids = tok.encode(ingest_prompt, add_special_tokens=False)
+        if args.partial_warmup_tokens > len(warm_ids):
+            raise SystemExit(
+                f"--partial-warmup-tokens {args.partial_warmup_tokens} "
+                f"exceeds the ingest prompt ({len(warm_ids)} tokens)"
+            )
+        warm_prompt = tok.decode(warm_ids[: args.partial_warmup_tokens])
+        n_warm = len(tok.encode(warm_prompt, add_special_tokens=False))
+        if n_warm != args.partial_warmup_tokens:
+            raise SystemExit(
+                f"round-trip of the {args.partial_warmup_tokens}-token "
+                f"truncation re-tokenizes to {n_warm}; pick a page-aligned "
+                "token count that survives decode/encode"
+            )
+
     print(f"[ingest] ~{n_ingest} tokens, needle at depth {args.depth}")
     r1 = post(base, ingest_prompt, args.ingest_max_tokens, ignore_eos=True)
     time.sleep(1.0)
@@ -218,16 +245,26 @@ def run_ab(args) -> dict:
     seq = {"a": (serve_prompt, n_serve),
            "a2": (serve_prompt, n_serve),
            "b": (alt_serve_prompt, n_alt)}
+    if warm_prompt is not None:
+        seq["w"] = (warm_prompt, n_warm)
+        seq["i"] = (serve_prompt, n_serve)
     order = [x.strip() for x in args.leg_order.split("->")]
     unknown = [x for x in order if x not in seq]
     if unknown:
         raise SystemExit(
-            f"--leg-order has unknown legs {unknown}; legs are a/a2/b"
+            f"--leg-order has unknown legs {unknown}; legs are "
+            "a/a2/b" + ("/w/i" if warm_prompt is not None else "")
         )
+    # The interleave leg must keep the warm-up's native hash chain; every
+    # other leg gets the deterministic reset (rule 36-ii) as before.
+    no_reset_legs = {"i"} if warm_prompt is not None else set()
     for name in order:
         prompt, n_tok = seq[name]
-        reset_ok = reset_prefix_cache(base)
-        print(f"[reset ] before leg {name}: ok={reset_ok}")
+        reset_ok = (
+            None if name in no_reset_legs else reset_prefix_cache(base)
+        )
+        print(f"[reset ] before leg {name}: "
+              f"{'skipped (interleave)' if reset_ok is None else f'ok={reset_ok}'}")
         print(f"[leg {name}] ~{n_tok} tokens")
         r = post(base, prompt, args.max_tokens)
         legs[name] = {
@@ -241,18 +278,23 @@ def run_ab(args) -> dict:
             "needle_hit": NEEDLE_CODE in (r.get("sample") or ""),
         }
 
-    ta = legs["a"]["ttft_s"]
-    tb = legs["b"]["ttft_s"]
-    ta2 = legs["a2"]["ttft_s"]
+    ta = legs.get("a", {}).get("ttft_s")
+    tb = legs.get("b", {}).get("ttft_s")
+    ta2 = legs.get("a2", {}).get("ttft_s")
+    ti = legs.get("i", {}).get("ttft_s")
     paired = {
         "ttft_a_s": ta,
         "ttft_b_s": tb,
         "ttft_a2_s": ta2,
+        "ttft_i_s": ti,
         "ttft_b_minus_a_s": (tb - ta) if ta is not None and tb is not None else None,
         "ttft_b_minus_a2_s": (tb - ta2) if ta2 is not None and tb is not None else None,
         "ttft_a_vs_a2_s": (ta2 - ta) if ta is not None and ta2 is not None else None,
+        "ttft_i_minus_a_s": (ti - ta) if ti is not None and ta is not None else None,
         "skipped_tokens_note": "assembled boundary per leg a/a2 comes from the "
-                               "engine log line 'matches at N tokens'",
+                               "engine log line 'matches at N tokens'; the "
+                               "interleave leg from 'interleaves at N tokens "
+                               "over a H-token native hit'",
     }
     out = {
         "tag": args.tag,
@@ -260,6 +302,8 @@ def run_ab(args) -> dict:
         "tokens_ingest": n_ingest,
         "tokens_serve_a": n_serve,
         "tokens_serve_b": n_alt,
+        "tokens_warmup": n_warm or None,
+        "partial_warmup_tokens": args.partial_warmup_tokens or None,
         "tail_tokens": n_serve - n_ingest,
         "depth": args.depth,
         "ingest": {
@@ -379,7 +423,21 @@ def main():
         "adjacent to leg a (step 102: a foreign prefill between them evicts "
         "the ingest snapshots). a->b->a2 is the step-103 eviction-order "
         "probe: legacy slots must reproduce the A2 miss, lru must survive "
-        "it.",
+        "it. w/i (step 104, needs --partial-warmup-tokens) are the "
+        "interleave legs: w resets and prefills a page-aligned truncation "
+        "(native hash chain ends at its last page), i serves the full "
+        "prompt WITHOUT a reset so the assembly must resume from the "
+        "native hit.",
+    )
+    p.add_argument(
+        "--partial-warmup-tokens",
+        type=int,
+        default=0,
+        help="Page-aligned token count of the w (warm-up) leg's truncation "
+        "of the ingest prompt; 0 (default) disables the w/i legs. The warm "
+        "up prefill re-caches only the first N tokens natively, so leg i "
+        "arrives with num_computed_tokens == N and the interleaved "
+        "assembly (VLLM_KVMEM_ASM_INTERLEAVE=1) resumes from there.",
     )
     p.add_argument(
         "--out",

@@ -308,6 +308,27 @@ def load_enabled() -> bool:
     return bool(int(os.environ.get("VLLM_KVMEM_LOAD", "0")))
 
 
+def asm_interleave() -> bool:
+    """Interleave the assembly with native prefix-cache hits (O4 step 104).
+
+    Step 101 convicted the assembly short-circuit: any local prefix-cache hit
+    (``num_computed_tokens > 0``) trips guard (a) -- "the assembly must own
+    the whole prefix" -- so the connector only ever assembles into a scrubbed
+    cache (the probe needs ``--reset-prefix-cache`` to work at all). With this
+    on, the assembly resumes from the native hit instead: the page-run scan
+    starts at the hit's page, only snapshot boundaries strictly deeper than
+    the hit qualify, the page-hash check covers the assembled segment only,
+    and ``get_num_new_matched_tokens`` returns the INCREMENT (boundary minus
+    hit) that the scheduler merges as ``num_computed = local + external``.
+    The externally allocated blocks already sit at block-table positions
+    ``[hit_pages, total_pages)`` (the base allocator appends after the local
+    hit) and the mamba state block stays at ``total_pages - 1`` (the step 066
+    patch), so load jobs only need to start writing at ``start_page``.
+    Default off = guard (a) byte-for-byte.
+    """
+    return bool(int(os.environ.get("VLLM_KVMEM_ASM_INTERLEAVE", "0")))
+
+
 def snapshot_keep() -> int:
     """How many page-aligned mamba snapshots to keep per trajectory (066).
 

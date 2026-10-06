@@ -109,6 +109,10 @@ class KVMemWorkspaceScheduler:
         # only valid if the recurrent state at its boundary is restored too, so
         # the worker snapshots those slots at page-aligned boundaries.
         self.load_enabled = config.load_enabled() and bool(self.group_ids)
+        # O4 step 104 (design §5.7): interleave the assembly with a native
+        # prefix-cache hit instead of letting guard (a) veto it. Off by
+        # default = the step 101 semantics byte-for-byte.
+        self.asm_interleave = config.asm_interleave() and bool(self.group_ids)
         # Step 072: the fixed-slot compressed window (design §5.1 re-bake).
         self.viewport_enabled = (
             config.viewport_enabled()
@@ -199,6 +203,13 @@ class KVMemWorkspaceScheduler:
         self._page_hashes: dict[tuple[bytes, int], bytes] = {}
         # request_id -> (KVCacheBlocks, matched tokens) awaiting the load job.
         self._pending_loads: dict[str, tuple] = {}
+        # O4 step 104 (§5.7): request_id -> (start_page, boundary tokens) of
+        # the interleaved assembly plan. start_page is the native prefix-cache
+        # hit's page (load pages begin there), boundary the global token edge
+        # the scheduler will adopt (local hit + external increment). Absent
+        # key = a legacy whole-prefix assembly (start_page 0, boundary = the
+        # external token count itself).
+        self._assembly_plan: dict[str, tuple[int, int]] = {}
         self.loads_requested = 0
         self.loads_completed = 0
         self.snapshots_requested = 0
@@ -296,10 +307,14 @@ class KVMemWorkspaceScheduler:
             # only the assembly plan needs refreshing, and only for a fresh
             # external allocation.
             if num_external_tokens > 0 and request.request_id in self._pending_loads:
+                start_page, boundary = self._assembly_plan.get(
+                    request.request_id, (0, num_external_tokens)
+                )
                 self._pending_loads[request.request_id] = (
                     blocks,
-                    num_external_tokens,
+                    boundary,
                     self._req_trajectory[request.request_id],
+                    start_page,
                 )
             return
         token_ids = getattr(request, "prompt_token_ids", None)
@@ -320,10 +335,14 @@ class KVMemWorkspaceScheduler:
             self.pages_dropped,
         )
         if num_external_tokens > 0 and self.load_enabled:
+            start_page, boundary = self._assembly_plan.get(
+                request.request_id, (0, num_external_tokens)
+            )
             self._pending_loads[request.request_id] = (
                 blocks,
-                num_external_tokens,
+                boundary,
                 self._req_trajectory[request.request_id],
+                start_page,
             )
         if request.request_id in self._req_viewport:
             # The state the window request really starts from: how much of the
@@ -987,14 +1006,16 @@ class KVMemWorkspaceScheduler:
 
         Runs in the same schedule() step as ``update_state_after_alloc``, so
         the ``KVCacheBlocks`` handed over there still describe this request's
-        block table: attention rows 0..E-1 are the freshly allocated blocks the
-        workspace pages go into, and the mamba rows carry exactly one real
-        block (position E-1, from the MambaManager external-allocation patch)
-        that receives the boundary snapshot.
+        block table: attention rows ``start_page..E-1`` are the freshly
+        allocated blocks the workspace pages go into (rows ``0..start_page-1``
+        are the native prefix-cache hit's own blocks, O4 step 104 §5.7), and
+        the mamba rows carry exactly one real block (position E-1, from the
+        MambaManager external-allocation patch) that receives the boundary
+        snapshot.
         """
         if not self._pending_loads:
             return
-        for req_id, (blocks, matched, trajectory) in list(
+        for req_id, (blocks, matched, trajectory, start_page) in list(
             self._pending_loads.items()
         ):
             self._pending_loads.pop(req_id, None)
@@ -1005,7 +1026,7 @@ class KVMemWorkspaceScheduler:
             missing_slot = False
             for gid in self.group_ids:
                 group_blocks = blocks.blocks[gid]
-                for page_index in range(num_pages):
+                for page_index in range(start_page, num_pages):
                     if page_index >= len(group_blocks) or group_blocks[
                         page_index
                     ].is_null:
@@ -1083,8 +1104,16 @@ class KVMemWorkspaceScheduler:
         stored pages, (b) a boundary whose mamba snapshot has landed, and (c)
         built from pages whose tokens are provably identical to this request's
         prompt at the same offsets.
+
+        With ``asm_interleave`` (O4 step 104, design §5.7) a native
+        prefix-cache hit no longer vetoes the assembly: the run scan starts at
+        the hit's page (the hit segment is the engine's own), only snapshot
+        boundaries strictly deeper than the hit qualify, and the hash check
+        covers the assembled segment only -- the caller returns the increment
+        and the scheduler merges it (num_computed = local + external). Without
+        it, guard (a) stands byte-for-byte: any local hit short-circuits to 0.
         """
-        if num_computed_tokens > 0:
+        if num_computed_tokens > 0 and not self.asm_interleave:
             # Assembly must own the whole prefix; a local prefix-cache hit
             # would interleave blocks this connector does not manage.
             self._debug_window(
@@ -1120,37 +1149,50 @@ class KVMemWorkspaceScheduler:
             "sliding_window", None,
         )
         evict_edge = max(0, prompt_len - sw) if sw else prompt_len
+        # O4 step 104 (§5.7): with a native prefix-cache hit the run scan
+        # starts at the hit's page -- the hit segment is the engine's own and
+        # needs no loading; only the pages after it do.
+        start_page = 0
+        if num_computed_tokens > 0:
+            start_page = num_computed_tokens // block_size
+        run_edge = start_page * block_size
         num_pages = 0
         while (
-            num_pages * block_size + block_size <= prompt_len
-            and num_pages * block_size + block_size <= evict_edge
-            and (trajectory, num_pages * block_size) in self._page_table
+            (start_page + num_pages) * block_size + block_size <= prompt_len
+            and (start_page + num_pages) * block_size + block_size <= evict_edge
+            and (trajectory, (start_page + num_pages) * block_size)
+            in self._page_table
         ):
             num_pages += 1
         if num_pages == 0:
             self._debug_window(
                 "asm-miss", request, reason="no-page-run",
                 prompt_len=prompt_len, evict_edge=evict_edge,
-                page0=(trajectory, 0) in self._page_table,
+                start_page=start_page,
+                page0=(trajectory, run_edge) in self._page_table,
                 table_keys=len(self._page_table),
             )
             return 0
-        page_boundary = num_pages * block_size
+        page_boundary = (start_page + num_pages) * block_size
         available = self._snapshots.get(trajectory)
         if not available:
             self._debug_window(
                 "asm-miss", request, reason="no-snapshot",
                 num_pages=num_pages, page_boundary=page_boundary,
+                start_page=start_page,
                 snapshot_traj=len(self._snapshots),
             )
             return 0
         # The recurrent state must be exact at the boundary we jump to, so the
         # assembly boundary is a *snapshot* boundary, capped by the page run.
-        candidates = [b for b in available if b <= page_boundary]
+        # Interleaved (§5.7): the hit segment's state is the engine's own, so
+        # only boundaries strictly deeper than the hit add anything.
+        candidates = [b for b in available if run_edge < b <= page_boundary]
         if not candidates:
             self._debug_window(
                 "asm-miss", request, reason="no-snapshot-candidate",
                 page_boundary=page_boundary,
+                run_edge=run_edge,
                 boundaries=sorted(available)[:6],
             )
             return 0
@@ -1158,7 +1200,7 @@ class KVMemWorkspaceScheduler:
         if boundary < block_size:
             return 0
         pages = boundary // block_size
-        for page_index in range(pages):
+        for page_index in range(start_page, pages):
             key = (trajectory, page_index * block_size)
             recorded = self._page_hashes.get(key)
             if recorded is None or recorded != self._page_token_hash(
@@ -1206,6 +1248,27 @@ class KVMemWorkspaceScheduler:
         boundary = self._assembly_match(request, num_computed_tokens)
         if not boundary:
             return 0, False
+        group_id = self.group_ids[0]
+        block_size = self.block_size[group_id]
+        if num_computed_tokens > 0:
+            # O4 step 104 (§5.7): return the INCREMENT; the scheduler merges
+            # it with its own local hit (num_computed = local + external) and
+            # allocates the external blocks at table positions
+            # [hit_pages, total_pages). The plan carries the global boundary
+            # (snapshot row addressing) and the start page (page-write loop).
+            start_page = num_computed_tokens // block_size
+            self._assembly_plan[request.request_id] = (start_page, boundary)
+            logger.info(
+                "vllm-030win KVMem assembly: request %s interleaves at %d "
+                "tokens over a %d-token native hit (%d stored page(s) from "
+                "page %d); async load",
+                request.request_id,
+                boundary,
+                num_computed_tokens,
+                boundary // block_size - start_page,
+                start_page,
+            )
+            return boundary - num_computed_tokens, True
         logger.info(
             "vllm-030win KVMem assembly: request %s matches at %d tokens "
             "(%d stored page(s)); async load",
@@ -1414,6 +1477,7 @@ class KVMemWorkspaceScheduler:
         self._req_prompt_len.pop(request.request_id, None)
         self._req_scored.discard(request.request_id)
         self._pending_loads.pop(request.request_id, None)
+        self._assembly_plan.pop(request.request_id, None)
         self._req_viewport.pop(request.request_id, None)
         self._debug_window_steps.pop(request.request_id, None)
         base = self._req_baseline.pop(request.request_id, None)
@@ -1480,6 +1544,7 @@ class KVMemWorkspaceScheduler:
         self._snapshot_sent.clear()
         self._page_hashes.clear()
         self._pending_loads.clear()
+        self._assembly_plan.clear()
         self._req_viewport.clear()
         self._debug_window_steps.clear()
         self.slots_used = 0

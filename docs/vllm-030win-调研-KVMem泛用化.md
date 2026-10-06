@@ -70,6 +70,7 @@
 | **100** ✅ GO（2026-10-05） | 终验收：Orca KVMem smoke | eager 捕获分支补 [3,T]→[T] 归一（qwen3_next.py +7 行，镜像 fused 既有逻辑）+ 工具债三修（KVMEM_RUNNER_BASE / KVMEM_PROBE_MODEL env / assembly probe makedirs）+ 新臂 `serve_orcasaq2_029_kvmem100.cmd` | boot 6 支（Orca 4 + GSQ K0 双 boot）+ watchdog 双支全 FAST；remat 0.1396484538272484 四腿逐位 + 页往返 byte-identical + 检索指纹 recent_tokens=16384 + needle 3 HIT + 紧预算 MISS；**装配三行未触发 = INCOMPLETE 挂账 O4 首项** ✅ |
 | **101** ✅ GO（2026-10-05，O4 首项） | O4 首项：定罪 Orca 装配短路并打通（步骤 100 的"快照无条目"归因被日志否定） | 探针 `--reset-prefix-cache`（默认关）+ kvmem100 臂 `VLLM_SERVER_DEV_MODE=1`（`/reset_prefix_cache` = dev 路由，不开必 404）+ `manager.py` `_assembly_match` asm-miss 门控诊断行 | 日志考古定罪（k1d serve 段 hit rate 32.9% / k101g 诊断行 `num_computed=128160` = 98.4% 命中，逐 boot 漂移 0%↔98.4%）+ k101h 装配三行完整出现（matches 51,264 = 36 页，与 GSQ 083 同结构边界）+ needle HIT + remat 逐位零回归；boot 5 支（重启前 k101a/k101c OOM = 旧会话设备侧压力，重启后 4 支同参数全过）；新纪律 = 必守 36 ✅ |
 | **103** ✅ GO（2026-10-06，O4 ③ 第一问） | prefix cache 共存策略第一问：轨迹槽替换语义（§5，lru 门控） | `config.py` `slot_policy()` + `worker.py`（`_slot_touch`/`_step_active`/`_evictable_victim`/`_evict_ring`/两驱逐点）+ `manager.py` removed 空键删除 + 探针 `--leg-order` + 臂 `S100_SLOTPOLICY` + 新测试 `tools/kvmem_slot_policy_test.py`（13 项） | 主判据 lru ×3（k103e/f/g）驱逐序 a→b→a2 下 A2 全 landed（matches 51,264，TTFT 154-159s）+ 阴性对照 legacy（k103a）复现 miss（A2 224.09s ≈ 全量、驱逐者 = P）+ 驱逐者换位正确（lru = flush 轨迹 + authority 2 GiB freed）+ remat 0.15039064100710628 四支逐位 + needle 12/12 + 既存 8 套件全绿 + sync_venv 2736；k103b/c/d 三连崩 = 第一版 assert 前提错误（authority 先满驱逐场景），修复 = 快照认领已交接 base + 幽灵防御（T12/T13），教训升级必守 36⑥ ✅ |
+| **104** ✅ GO（2026-10-06，O4 ③ 第二问） | prefix cache 共存策略第二问：守卫 (a) 交插（§5.7，`VLLM_KVMEM_ASM_INTERLEAVE` 门控） | `config.py` `asm_interleave()` + `manager.py`（守卫交插分支 / `_assembly_plan` 记账 / `get_num_new_matched_tokens` 增量 / pending 4 元组 / `_emit_load_jobs` 页循环偏移 / 两清理点）+ 探针 `--partial-warmup-tokens` + w/i 腿 + 臂 `S100_INTERLEAVE` + 新测试 `tools/kvmem_asm_interleave_test.py`（15 项）+ runner roundL104.py | 主判据交开 ×3（k104a/b/c）i 腿 landed 逐字 `interleaves at 51264 over a 15664-token native hit (25 stored page(s) from page 11)` + needle HIT + 阴性对照 k104d 复现守卫（asm-miss local-prefix-hit，i TTFT 209.7 ≈ 全量带 218.8）+ 机制零回归（段 1 reset 腿序 a/a2 landed ×4 + remat 0.15039064100710628 四支逐位 + needle 16/16 + boot 健康）+ 收益 i 交开 159.7-160.4 vs 交关 209.7 = −24%（记录）+ 既存 9 套件全绿 + sync_venv 2736 ✅ |
 
 ## §4 风险登记
 
@@ -129,6 +130,47 @@
 
 ### 5.6 明确不做的（本轮边界）
 
-- **守卫 (a) 不动**：`_assembly_match` 的"装配必须拥有整个前缀"（`manager.py:1082`）保持——native 命中块与 KVMem 装配块交插需要连接器接管 native 块的 num_computed 语义，是共存策略的下一问，超出"槽替换语义"授权范围。
+- ~~**守卫 (a) 不动**~~ **（2026-10-06 更新：守卫 (a) = 第二问已获用户裁定推进，设计 = §5.7；本条对 103 轮有效）**：`_assembly_match` 的"装配必须拥有整个前缀"（`manager.py:1082`）在 103 轮保持原样。
 - 页区（host slots）驱逐策略不动；`trajectory_key` 定义与 `TRAJ_PREFIX` 不动；检索/视窗语义不动。
 - 本设计不触 GSQ 臂（kvmem100 臂专属验证；GSQ 侧 `AUTHORITY_TRAJ` 同样生效但 GSQ 探针流量天然两轨迹，行为面不变，回归由 083 判据链兜底）。
+
+### 5.7 O4③ 第二问 —— 守卫 (a)：native 命中块与装配块交插（2026-10-06 立项，设计权威节）
+
+> 授权 = 用户 2026-10-06 裁定"继续推进① O4③ 第二问 = 守卫 (a) 的 native 命中块与装配块交插"。101 定罪的根因（native prefix cache 部分命中逐 boot 漂移 0%↔98.4%，命中即触发守卫 (a) 短路装配）当时用探针 `--reset-prefix-cache` 绕开；本问把"命中态下装配仍工作"做成产品语义。
+
+**5.7.1 引擎侧已有能力（读码定案，零改动）**：
+
+1. **调度器原生支持"本地命中 + 外部补充"合并**（`sched/scheduler.py:838-910`）：首次调度做 `_get_local_prefix_cache_hit` → connector 收到**块对齐的**本地命中数 `block_aligned_local` → connector 返回增量 `ext_tokens` → `num_computed_tokens = local + ext`；`partial_tail` 分支（:870-890）协调"子块尾巴 vs 外部加载"（外部更深则砍尾巴让 load 覆盖，反之弃外部）。
+2. **KVMem connector 未覆盖 `supports_divergent_local_hybrid_hits`**（基类默认 False，`kv_connector/v1/base.py:178`）⇒ connector 收到的 `num_computed_tokens` = `get_computed_blocks` 的**全组协调统一边界**（各组命中取公共前缀），`hit_diverged` 恒 False ⇒ 交插时各组块表在该边界处形状自洽，无需处理组间分叉。
+3. **外部块分配天然交插布局**：attention 组基类 `allocate_external_computed_blocks`（`single_type_kv_cache_manager.py:320-358`）= `len(req_blocks)`（本地命中块）之后 append 新真实块到 `cdiv(total, bs)` ⇒ 位置 `[hit_pages, total_pages)`；mamba 组 066 补丁（`:1612-1651`）= append `null × (n-1)` + 1 真实 state 块 ⇒ 真实块恒在 `total_pages - 1`，与 `_emit_load_jobs` 的 `position = num_pages - 1`（按**全局边界**算）对齐。
+4. **SW skip 死角不受影响**：装配边界 ≤ evict_edge ≤ sw（本臂探针场景）⇒ `get_num_skipped_tokens = 0`；通用场景（快照边界 > sw）现状同样存在，不在本问扩大范围（missing_slot 防御已在）。
+
+**5.7.2 交插语义（`VLLM_KVMEM_ASM_INTERLEAVE`，默认 `0`）**：
+
+- **关（默认）**：守卫 (a) 逐字节（`num_computed_tokens > 0` → asm-miss `local-prefix-hit` → 0）。
+- **开**：`_assembly_match` 在 `num_computed_tokens > 0` 时不再短路，改为：
+  1. `start_page = num_computed_tokens // block_size`（native 命中已块对齐）；
+  2. 页 run 扫描**从 `start_page` 起**（`[0, start_page)` 段由 native 哈希链负责，KVMem 页表有没有那几页无关紧要）；
+  3. 快照候选 = `num_computed_tokens < b ≤ 页 run 边界`（严格大于命中边界——命中段的 recurrent state 由 native 管；无候选 = native 已盖过全部快照边界，装配无增益 → miss）；
+  4. 页哈希校验段 = `[start_page, boundary)`（只校验要装配的段）；
+  5. 返回**全局 boundary**（约束不变：`< prompt_len`、页对齐、`≥ block_size`）。
+- **返回值改增量**：`get_num_new_matched_tokens` 返回 `(boundary - num_computed_tokens, True)`——`num_computed_tokens == 0` 时增量 = 全局 boundary = 现状值逐字节不变。
+- **plan 记账**：命中时 `_assembly_plan[req_id] = (start_page, boundary)`；`update_state_after_alloc` 合并进 `_pending_loads`（legacy 无 plan 键 = `(0, num_external_tokens)` = 现状元组）；`_emit_load_jobs` 页循环 `range(start_page, num_pages)`（`num_pages = boundary // bs` 按全局边界）、mamba position 不变、`job.num_tokens = boundary`（快照行寻址不变）。worker 零改动（pages 已带具体 block_id）。
+- **残键防御**：调度器 `partial_tail` 分支可把 ext 清零（`ext ≤ tail`）⇒ `update_state_after_alloc` 不记 pending、不发 job；plan 键随请求 finish 清理（与 `_pending_loads` 同点）+ boot 清空。
+
+**5.7.3 探针（确定性交插腿）**：交插需要一个"native 命中恰好落在 KVMem 快照边界之间"的场景。101 现场的自然命中逐 boot 漂移赌不得（必守 36②）⇒ 主动构造：`ab` 子命令加 `--partial-warmup-tokens X`（默认 0 = 不跑）与 `w`/`i` 腿：
+
+- `w`（warm-up）腿：**先 reset**（清 native 哈希，`reset_external=False` 不触 KVMem）→ 发 ingest prompt 的**前 X tokens 页对齐截断**（实跑 `X = 17,088 = 12 页`，`decode∘encode` 后断言 token 数不变）→ native 缓存 `[0, X)` 哈希链；KVMem 侧该腿与 ingest 同轨迹（TRAJ_PREFIX=512）⇒ 快照 12 页边界同值覆盖写幂等、touch P 轨迹（lru 保护）、无页存储（X < sw 无驱逐）。
+- `i`（interleave）腿：**不 reset** → 发 P+tail → native 命中 w 腿的链（实跑 = 15,664 = 页 11，链在页 11 断）→ 交插装配 `[15,664, 51,264)` = **25 页 ext**（快照候选 {24,36 页} 取最大 36 页边界）——matches = 51,264 与现状 reset 装配同结构边界，但**命中段 15,664 由 native 管、装配段 35,600 由 KVMem 补** = 交插生效的结构证据（`interleaves at` 行）。
+- 腿序 `ingest → w → i`；机制零回归在**同一支 boot** 先跑 103 口径 reset 腿序 `a → a2 → b`（51,264 landed）再跑交插段。
+
+**5.7.4 判据（步骤 104，⭐2026-10-06 全部达成）**：
+
+1. **主判据**：交插开 ×3 支，i 腿 landed + needle HIT——**✅ k104a/b/c 三支逐字 `interleaves at 51264 tokens over a 15664-token native hit (25 stored page(s) from page 11)`**（native 命中 15,664 = w 腿哈希链止于页 11，装配从页 11 补 25 页到 51,264 快照边界）；
+2. **阴性对照**：交插关（默认）同腿序，i 腿复现 asm-miss `local-prefix-hit` + TTFT ≈ 全量带——**✅ k104d**（`num_computed=15664` 守卫原文，i TTFT 209.67 ≈ b 218.8）；
+3. **机制零回归**：每支 reset 腿序 a/a2 landed + remat 误差尺逐位 + needle 全 HIT + boot 健康——**✅ 四支全绿**（a/a2 matches 51,264 ×3 行/支、remat 0.15039064100710628 逐位、needle 16/16（w 腿无针 = 预期）、boot 41.7-54.3s err=0）；
+4. **收益可观测**：i 腿 TTFT vs a 腿——**✅ i 交开 159.65-160.42s vs 交关 209.67s = 交插省 ~49s（−24%）**；i 交开 vs a（146.2s）的 ~14s 差在支内漂移带内（a2−a = 26.8s），两者 skip 总量相同，不判系统性差异（记录不作主结论）。
+
+**实现期事实记账**：w 腿 17,088 tokens（12 页）round-trip 精确，但 i 腿实际命中 = 15,664（页 11）——w 链最后一页未进哈希表（页对齐链在页 11 断），交插语义不受影响（`start_page` 取命中页，run 从那里扫）；四支 i 腿命中逐支同值 = 确定性成立。
+
+**5.7.5 明确不做的（本问边界）**：页表/host 淘汰语义不动；`partial_tail` 上游协调逻辑不动；SW skip > 0 的快照边界死角（现状已有）不扩大；GSQ 臂不触；交插与 viewport 重写的组合不构造实验（viewport 分支在交插之前 return，语义互斥）。
