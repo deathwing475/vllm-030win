@@ -211,9 +211,21 @@ def run_ab(args) -> dict:
     # (snapshot_traj=3, auth slots) and the repeat leg degrades to a full
     # prefill. Keeping the repeat adjacent to leg a keeps it a true repeat;
     # the control goes last because its own full prefill is order-insensitive.
-    for name, prompt, n_tok in (("a", serve_prompt, n_serve),
-                                ("a2", serve_prompt, n_serve),
-                                ("b", alt_serve_prompt, n_alt)):
+    # --leg-order a-b-a2 (step 103) restores the k102e eviction order on
+    # purpose: it is the negative probe for the slot policy (legacy must
+    # reproduce the A2 miss; lru must survive it by evicting the flush
+    # trajectory instead).
+    seq = {"a": (serve_prompt, n_serve),
+           "a2": (serve_prompt, n_serve),
+           "b": (alt_serve_prompt, n_alt)}
+    order = [x.strip() for x in args.leg_order.split("->")]
+    unknown = [x for x in order if x not in seq]
+    if unknown:
+        raise SystemExit(
+            f"--leg-order has unknown legs {unknown}; legs are a/a2/b"
+        )
+    for name in order:
+        prompt, n_tok = seq[name]
         reset_ok = reset_prefix_cache(base)
         print(f"[reset ] before leg {name}: ok={reset_ok}")
         print(f"[leg {name}] ~{n_tok} tokens")
@@ -359,6 +371,15 @@ def main():
         help="POST /reset_prefix_cache before EACH leg. Rule 36-ii: native "
         "hit volume drifts per boot (0%%..98.4%%), a deterministic reset "
         "before every leg is what makes the A/B pairing valid.",
+    )
+    p.add_argument(
+        "--leg-order",
+        default="a->a2->b",
+        help="Leg sequence. Default a->a2->b keeps the assembly repeat "
+        "adjacent to leg a (step 102: a foreign prefill between them evicts "
+        "the ingest snapshots). a->b->a2 is the step-103 eviction-order "
+        "probe: legacy slots must reproduce the A2 miss, lru must survive "
+        "it.",
     )
     p.add_argument(
         "--out",

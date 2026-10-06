@@ -23,6 +23,8 @@ rem Injectables: S100_TAG (dump dir, MUST be fresh per boot, iron rule 16-viii),
 rem S100_LOAD (1 = assembly line on, 0 = full-prefill control; the assembly
 rem probe's compare needs both), S100_ML / S100_KVMB / S100_MBT / S100_WSMB /
 rem S100_EVERY / S100_KEEP (snapshot knobs, 12/10 = the 083 mitigation).
+rem S100_SLOTPOLICY (step 103 trajectory-slot replacement: unset = legacy /
+rem engine default, "lru" = whole-trajectory LRU eviction, design §5.4).
 rem
 rem Judgement: engine log "KVMem assembly: request ... matches" -> "issued"
 rem -> "prefix landed"; remat self-test gates (pages=8, delta/step <= 0.25);
@@ -80,6 +82,7 @@ set "VLLM_KVMEM_RECENT=%S100_RECENT%"
 set "VLLM_KVMEM_TOPN=64"
 set "VLLM_KVMEM_SNAPSHOT_EVERY_PAGES=%S100_EVERY%"
 set "VLLM_KVMEM_SNAPSHOT_KEEP=%S100_KEEP%"
+if not "%S100_SLOTPOLICY%"=="" set "VLLM_KVMEM_SLOT_POLICY=%S100_SLOTPOLICY%"
 set "VLLM_KVMEM_DEBUG=1"
 set "VLLM_KVMEM_BAKE_VERIFY=1"
 set "VLLM_KVMEM_INDEX_SUBBLOCK=32"

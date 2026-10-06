@@ -69,6 +69,7 @@
 | **099**（按需） | manager 代表组/混合页大小泛化 | `manager.py` | 同上 |
 | **100** ✅ GO（2026-10-05） | 终验收：Orca KVMem smoke | eager 捕获分支补 [3,T]→[T] 归一（qwen3_next.py +7 行，镜像 fused 既有逻辑）+ 工具债三修（KVMEM_RUNNER_BASE / KVMEM_PROBE_MODEL env / assembly probe makedirs）+ 新臂 `serve_orcasaq2_029_kvmem100.cmd` | boot 6 支（Orca 4 + GSQ K0 双 boot）+ watchdog 双支全 FAST；remat 0.1396484538272484 四腿逐位 + 页往返 byte-identical + 检索指纹 recent_tokens=16384 + needle 3 HIT + 紧预算 MISS；**装配三行未触发 = INCOMPLETE 挂账 O4 首项** ✅ |
 | **101** ✅ GO（2026-10-05，O4 首项） | O4 首项：定罪 Orca 装配短路并打通（步骤 100 的"快照无条目"归因被日志否定） | 探针 `--reset-prefix-cache`（默认关）+ kvmem100 臂 `VLLM_SERVER_DEV_MODE=1`（`/reset_prefix_cache` = dev 路由，不开必 404）+ `manager.py` `_assembly_match` asm-miss 门控诊断行 | 日志考古定罪（k1d serve 段 hit rate 32.9% / k101g 诊断行 `num_computed=128160` = 98.4% 命中，逐 boot 漂移 0%↔98.4%）+ k101h 装配三行完整出现（matches 51,264 = 36 页，与 GSQ 083 同结构边界）+ needle HIT + remat 逐位零回归；boot 5 支（重启前 k101a/k101c OOM = 旧会话设备侧压力，重启后 4 支同参数全过）；新纪律 = 必守 36 ✅ |
+| **103** ✅ GO（2026-10-06，O4 ③ 第一问） | prefix cache 共存策略第一问：轨迹槽替换语义（§5，lru 门控） | `config.py` `slot_policy()` + `worker.py`（`_slot_touch`/`_step_active`/`_evictable_victim`/`_evict_ring`/两驱逐点）+ `manager.py` removed 空键删除 + 探针 `--leg-order` + 臂 `S100_SLOTPOLICY` + 新测试 `tools/kvmem_slot_policy_test.py`（13 项） | 主判据 lru ×3（k103e/f/g）驱逐序 a→b→a2 下 A2 全 landed（matches 51,264，TTFT 154-159s）+ 阴性对照 legacy（k103a）复现 miss（A2 224.09s ≈ 全量、驱逐者 = P）+ 驱逐者换位正确（lru = flush 轨迹 + authority 2 GiB freed）+ remat 0.15039064100710628 四支逐位 + needle 12/12 + 既存 8 套件全绿 + sync_venv 2736；k103b/c/d 三连崩 = 第一版 assert 前提错误（authority 先满驱逐场景），修复 = 快照认领已交接 base + 幽灵防御（T12/T13），教训升级必守 36⑥ ✅ |
 
 ## §4 风险登记
 
@@ -76,3 +77,58 @@
 2. **重构引入行为漂移**：KVMem 已冻结验收，任何"顺手改"都可能破 083 判据。缓解 = 每步只动一个工作面 + 回归锚四件套。
 3. ~~**Orca × KVMem 组合未知**~~ **已验收（2026-10-05 步骤 100）**：EXL3 + nvfp4 KV + KVMem 同臂 boot 成、remat/检索/needle 全绿；pinned 账与 GSQ 同构（workspace 5.00 GiB + 快照区 1.47 GiB，页账逐字）。**现场教训两条**：①Orca EXL3 的 `apply` 每次 prefill 动态 reconstruct dense 权重（shard_gemm 170 MiB 级）= GSQ kernel 不存在的设备侧工作区 ⇒ 手压池值不可跨量化栈照抄（3.4e9 池 OOM，3.1e9 实证可 boot）；②~~装配三行未触发（`self._snapshots` 对 ingest 轨迹无条目）= O4 首项定罪对象~~ **⭐101 已定罪并打通（2026-10-05）**："快照无条目"归因不成立（快照每 12 页正常捕捉登记）；真断点 = native prefix cache 部分命中（逐 boot 漂移 0%↔98.4%）触发 `_assembly_match` 的整前缀守卫，根因 = Orca 池 276,187 tokens 装得下 ingest+flush 两请求、探针 flush"覆盖全部池块"前提失效（GSQ 083 能过纯因池 163,719 < 200K 请求）；修复 = 探针 `--reset-prefix-cache` + 臂 `VLLM_SERVER_DEV_MODE=1` + asm-miss 门控诊断行；k101h 装配三行完整出现（matches 51,264 与 GSQ 083 同结构边界）+ remat 逐位零回归；纪律 = 必守 36；读数 = 步骤 101 + 详版 ⭐101。
 4. **authored defaults 的派生精度**：profile card 轨 A 已双锚点逐位，但 KVMem 参数（RECENT/VIEWPORT_PAGES）是策略值不是几何值，派生 = "几何约束下取合法值"，不承诺与 GSQ 调参值同优。缓解 = 派生值仅在 card 存在时生效，env 显式值永远最高优先。**（⭐2026-10-04 步骤 096 实测：对 GSQ 本模型，派生式恰好逐位复现全部定档值——16,384/32,768/55 都从 §7.1 的 L/gen/页长几何重算出来，说明这些"策略值"在本模型上其实就是几何约束下的唯一取整解；缓解条款仍对"其他模型调参值可能不同"有效。）**
+
+## §5 O4③ prefix cache 共存策略 —— 轨迹槽替换语义（2026-10-06 立项，设计权威节）
+
+> 授权 = 用户 2026-10-06 指令"推进 O4③ prefix cache 共存策略"（102 判定④的关键输入已到手）。本节先定**槽替换语义**（102 指名的首个设计问题）；共存策略的另一半（守卫 (a) 的"native 命中块与装配块交插"）**明确不在本轮**（见 §5.6 边界）。
+
+### 5.1 机制链定案（k102e 日志逐行归因，2026-10-06）
+
+102 e 支（腿序 ingest→flush→reset→A→B→A2，`AUTHORITY_TRAJ=2`）的授权槽挤出全程：
+
+1. ingest P（轨迹 `f09f08686187`）→ authority 槽 1（`worker.py:473`，262,144 tokens × 512 B/层）、快照环槽 1，7 条边界快照（`manager.py:953` captured 行）；
+2. flush 段请求（129,453 tokens，**独立内容 = 独立轨迹** `61d85ad75299`）→ authority 槽 2、快照环槽 2，7 条快照——flush 不是 P 重发，三轨迹并存是探针结构自带的；
+3. A 腿（P+tail）00:37:07 装配三行完整（matches 51,264 → issued → landed），P 环与 authority 完好；
+4. B 腿（P'+tail，轨迹 `6497e3a87ba2`）首调度 no-page-run（P' 无页，正常 defer）；P' prefill 每 12 页捕获快照，worker 需要第 3 条轨迹环 ⇒ **`worker.py:1545-1562` FIFO-by-start 整环驱逐 P**（"evicting the whole ring of trajectory f09f08686187 (7 boundary(ies))"，00:40:22 WARNING）——`next(iter(self._snapshot_bases))` 拿的是最早**开始**的环，不是最不最近使用的；
+5. manager 收 `removed_snapshots` 逐条 `discard`（`manager.py:960-965`），**空键不删** ⇒ `_snapshots[P]` = 空集仍占键（e 支 A2 诊断行 `snapshot_traj=3` 的出处——该字段 = `len(self._snapshots)`，语义是"见过的轨迹数"非"活跃数"）；
+6. A2 腿（P+tail）00:44:06 asm-miss `no-snapshot`（45 页命中、快照空）→ 143-169s 全量。**authority 区域此时仍持有 P**（`worker.py:468` 满则拒绝新轨迹不驱逐）——同一"授权槽"概念两侧行为分叉：mamba 环挤最老、authority 拒最新。
+
+### 5.2 现状语义的三处缺陷（设计输入）
+
+1. **两侧不一致**：mamba 快照环 FIFO 驱逐最老开始轨迹（`worker.py:1549`），authority 区域满则拒绝新轨迹（`worker.py:468-470`）⇒ 同一轨迹可能"环没了 authority 还在"（不可装配的孤儿态）或反之（remat 无 authority，自检必炸）。
+2. **无使用感知**：驱逐选择 = 按环开始时间，不看装配命中（A 腿 00:37:07 刚用 P 装配过，00:40:22 照挤）——在"服务里反复复用同前缀"的真实流量下会系统性挤掉最有装配价值的轨迹。
+3. **无生命周期绑定**：轨迹槽从不因请求结束释放（`_req_trajectory` 只跟 in-flight 请求，环与 authority 长存）。
+
+### 5.3 候选方案与裁定
+
+| 方案 | 语义 | e 支场景 | 裁定 |
+|---|---|---|---|
+| A 现状 legacy | 环 FIFO-by-start 整环驱逐 + authority 拒新 | A2 仍 miss | 默认保底（行为逐字节不变） |
+| B **LRU 整轨迹驱逐 + 活跃保护** | 环与 authority **同生共死**整轨迹驱逐；候选 = 无本步活动者中 touch 最老；候选空则拒绝新快照 | 驱逐 P-flush（touch 00:36:48 < P 00:37:07 装配 touch）→ A2 landed | **⭐裁定采用** |
+| C 拒绝新轨迹（环也拒） | 与 authority 侧对齐成"满即拒" | A2 landed（P 快照保住） | 并入 B 作候选空时的回退；单独采用 = 早期轨迹死占、新前缀永远进不了快照区，不可取 |
+| D in-flight FIFO | 驱逐选择加"无 in-flight"过滤但不看 touch | 候选含 P（A 腿已完）→ 仍驱逐 P → miss | 不解决 102 场景，弃 |
+| E 扩容 AUTHORITY_TRAJ | 4 条 = +2 authority 区（每条 262,144×8,192 B ≈ 2.0 GiB host）+ 2 环（每条 keep×80.4 MiB） | A2 landed | host pinned/常驻 +5 GiB 级，撞必守 27 家族，治标不治本（N+1 条轨迹总会来），弃 |
+
+### 5.4 设计（方案 B 落地面）
+
+- **开关**：`VLLM_KVMEM_SLOT_POLICY` ∈ {`legacy`（默认，现状逐字节）| `lru`}；`config.slot_policy()`。
+- **驱逐单位 = 轨迹整体**：mamba 快照环（边界全部上报 removed，manager 清空键）+ authority 区域（全部层的 region tensor，host 引用删除即释放）+ touch 记录，三者一起摘除。**页表/页哈希不动**（页区有自己的逐槽容量语义，被挤轨迹的页继续可被 no-snapshot 之外路径使用，A2 的 45 页命中证明两者独立）。
+- **touch 事件三点记账**（worker，`time.monotonic()`）：快照捕获（`_take_snapshots` 处理到该轨迹）、装配 load（job 执行处）、页存储提交（store 路径）——三点齐 = "在捕获/在被装配/在滚动 prefill"三种活跃形态都有 touch。
+- **活跃保护**：worker step 入口收集本步活跃轨迹集合 = store 数据轨迹 ∪ snapshot_requests 轨迹 ∪ load job 轨迹；驱逐候选 = 持槽轨迹 − 活跃集 − 来者自身。**候选空 ⇒ 拒绝本次快照/authority 分配**（回退 C 行为，`snapshots_refused` 计数 + 门控 WARNING；该轨迹页照存、可走全量）。并发 prefill 条数 > AUTHORITY_TRAJ 的超订场景即落此回退，语义安全（正在跑的请求不缺装配，缺也轮不到）。
+- **removed 上报链不变**：整环驱逐仍走 `_removed_snapshots` → manager `discard`；附带修正 = manager 侧删空键（诊断口径从"见过的轨迹数"改"活跃快照轨迹数"，`if not available` 对空集与缺键行为等价，零行为影响）。
+- **诊断**：驱逐 WARNING 保留并附候选 touch 值；拒绝计数进 worker 报告。
+
+### 5.5 判据（步骤 103 协议，⭐2026-10-06 全部达成）
+
+1. **主判据**：Orca kvmem100 臂 + 探针五段 a→b→a2，`lru` 模式下 A2 landed（matches = 51,264 同结构边界）≥ 3 支 boot（必守 7）——**✅ k103e/f/g 三支全 landed**（TTFT 154.3-158.6s = A 腿带 +9s 内支内漂移）；
+2. **阴性对照**：`legacy`（默认）下同腿序复现 A2 no-snapshot = 默认行为不变的直接证据——**✅ k103a**（A2 224.09s ≈ 全量带，asm-miss no-snapshot，驱逐者 = P = 102 根因逐字复现）；
+3. **机制零回归**：每支 needle HIT（A/A2/B）、remat 误差尺逐位（0.15039064100710628）、页账横幅逐字——**✅ 4 支全绿，boot 40.2-47.2s 健康 err=0**；
+4. **驱逐可观测**：lru 支整环驱逐 WARNING 且被驱逐者 = P-flush（非 P）——**✅ 三支统一 `policy=lru, authority 2147483648 B freed`**（环 + authority 同生共死 + host 真归还）；`snapshots_refused` 超订腿未实测 = 挂账（离线 T6 钉死语义）。
+
+**实现期事故记账**：第一版实现的防御 assert `incoming not in _snapshot_bases` 被 k103b/c/d 三连崩当场拦截——capture 每 span 都发生而快照每 12 页才发生 ⇒ **authority 表先满**，authority 满分支驱逐把 base 交接给 incoming 后，其第一条快照建环时 assert 炸（设计时"进驱逐分支的 incoming 必无 base"只对快照侧成立）。修复 = `_take_snapshots` ring None 分支先认领已交接 base + `_evict_ring` 幽灵 base 防御（base 在环不在可干净驱逐）；离线 T12/T13 钉死两场景。教训升级**必守 36⑥**（门控新路径必须连同全部触发序离线走一遍，084 双死雷同型）。崩支日志保留 `prod029_logs/kvmem_k103b|c|d/`。
+
+### 5.6 明确不做的（本轮边界）
+
+- **守卫 (a) 不动**：`_assembly_match` 的"装配必须拥有整个前缀"（`manager.py:1082`）保持——native 命中块与 KVMem 装配块交插需要连接器接管 native 块的 num_computed 语义，是共存策略的下一问，超出"槽替换语义"授权范围。
+- 页区（host slots）驱逐策略不动；`trajectory_key` 定义与 `TRAJ_PREFIX` 不动；检索/视窗语义不动。
+- 本设计不触 GSQ 臂（kvmem100 臂专属验证；GSQ 侧 `AUTHORITY_TRAJ` 同样生效但 GSQ 探针流量天然两轨迹，行为面不变，回归由 083 判据链兜底）。

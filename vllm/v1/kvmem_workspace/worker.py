@@ -199,6 +199,21 @@ class KVMemWorkspaceWorker:
         self.snapshots_evicted = 0
         self.loads_served = 0
         self.bytes_loaded = 0
+        # O4 step 103: trajectory-slot replacement policy. The per-trajectory
+        # rings above protect a ring's rows from *global* FIFO, but the
+        # trajectory slots themselves are still FIFO-by-start (step 102: a
+        # third trajectory's prefill evicts the assembly source's whole ring
+        # one step after it matched). "lru" evicts whole trajectories (ring +
+        # authority together) by least-recent-touch instead.
+        self.slot_policy = config.slot_policy()
+        # trajectory -> last monotonic touch (snapshot capture, assembly
+        # load, page-store commit); drives the "lru" eviction pick.
+        self._slot_touch: dict[bytes, float] = {}
+        # Trajectories with in-flight activity this step (spans, snapshot
+        # requests, load jobs), collected at bind time -- never eviction
+        # candidates.
+        self._step_active: set[bytes] = set()
+        self.snapshots_refused = 0
 
     def _snapshot_row(self, trajectory: bytes, boundary: int) -> int | None:
         """Row of a captured boundary, or None if it is not resident."""
@@ -466,8 +481,21 @@ class KVMemWorkspaceWorker:
         if per_trajectory is None:
             limit = config.authority_trajectories()
             if len(self._authority) >= limit:
-                self._authority_missing += 1
-                return None
+                # O4 step 103: under "lru" a full authority table first tries
+                # to evict a whole idle trajectory (ring + authority together,
+                # so the two host regions never disagree about who is
+                # resident). A trajectory reaching this branch owns no ring
+                # yet (it has captured no data, or its ring would have
+                # claimed an authority slot already), so the base-row
+                # handover in _evict_ring stays valid. With no candidate the
+                # legacy refusal applies, counted as before.
+                if self.slot_policy == "lru":
+                    victim = self._evictable_victim(trajectory)
+                    if victim is not None:
+                        self._evict_ring(victim, trajectory)
+                if len(self._authority) >= limit:
+                    self._authority_missing += 1
+                    return None
             per_trajectory = {}
             self._authority[trajectory] = per_trajectory
             logger.info(
@@ -818,6 +846,15 @@ class KVMemWorkspaceWorker:
         if isinstance(metadata, KVMemConnectorMetadata):
             self._pending = metadata
             self._loads_issued = False
+            # O4 step 103: trajectories with in-flight activity this step are
+            # never eviction candidates. Spans cover capture/store prefills,
+            # snapshot requests the boundaries being copied this step, load
+            # jobs the assemblies reading their snapshot rows.
+            self._step_active = (
+                {span.trajectory for span in metadata.spans}
+                | {snap.trajectory for snap in metadata.snapshot_requests}
+                | {job.trajectory for job in metadata.load_jobs}
+            )
             # Step 075: tell the raw-K capture which token counts belong to this
             # step's prefill spans *before* the forward runs. Speculative decode
             # makes a verify step 1 + num_spec_tokens tokens, so "more than one
@@ -1411,6 +1448,7 @@ class KVMemWorkspaceWorker:
             started = time.monotonic()
             for job in metadata.store_jobs:
                 entries: list[tuple[int, int, int]] = []
+                self._touch(job.trajectory)
                 for page in job.pages:
                     for layer_name in self._layers_per_group.get(page.group_id, ()):
                         src_view = self._gpu_views[(page.group_id, layer_name)]
@@ -1466,6 +1504,7 @@ class KVMemWorkspaceWorker:
         for job in load_jobs:
             entries: list[tuple[int, int, int]] = []
             missing_snapshot = False
+            self._touch(job.trajectory)
             snapshot_slot = self._snapshot_row(job.trajectory, job.num_tokens)
             if job.mamba_snapshots and snapshot_slot is None:
                 logger.error(
@@ -1529,6 +1568,82 @@ class KVMemWorkspaceWorker:
         self.store_seconds += time.monotonic() - started
         self._kvtime_add("load", started)
 
+    def _touch(self, trajectory: bytes) -> None:
+        """Record activity on this trajectory (drives ``lru`` eviction)."""
+        if self.slot_policy != "lru":
+            return
+        self._slot_touch[trajectory] = time.monotonic()
+
+    def _evictable_victim(self, incoming: bytes) -> bytes | None:
+        """Pick the trajectory slot that gives way to ``incoming``.
+
+        ``legacy``: the earliest-started ring (insertion order), exactly the
+        pre-103 behaviour. ``lru``: the least recently touched holder with no
+        in-flight activity -- not this step's active set (capturing / loading
+        trajectories), not a trajectory with an unresolved snapshot copy event
+        (its rows may still be read by an assembly load), and not the incoming
+        trajectory itself. ``None`` = nothing may be evicted; the caller
+        refuses the incoming snapshot instead.
+        """
+        holders = [t for t in self._snapshot_bases if t != incoming]
+        if self.slot_policy == "legacy":
+            return holders[0] if holders else None
+        inflight = {t for (t, _boundary) in self._snapshot_events}
+        candidates = [
+            t
+            for t in holders
+            if t not in self._step_active and t not in inflight
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda t: self._slot_touch.get(t, 0.0))
+
+    def _evict_ring(self, victim: bytes, incoming: bytes) -> int:
+        """Drop ``victim``'s snapshot ring (and, under ``lru``, its authority
+        region) and hand its base row range to ``incoming``.
+
+        The caller must ensure ``incoming`` has no ring yet (both call sites
+        guarantee this: a trajectory that captured data always owns an
+        authority region first, and one that captured data always has a ring
+        by its first snapshot boundary), so the base-row continuity invariant
+        (``base == index * snapshot_keep`` over insertion order) survives.
+        Boundaries are reported as removed so the scheduler stops matching
+        them. Returns the recycled base row.
+        """
+        assert incoming not in self._snapshot_bases
+        # A base without a ring is possible under lru: the authority side
+        # hands the base to a trajectory that captured data but ended its
+        # prefill before the first snapshot boundary. Evicting such a ghost
+        # frees the slot with nothing to report.
+        old_ring = self._snapshot_rings.pop(victim, OrderedDict())
+        for boundary in old_ring:
+            self._removed_snapshots.append((victim, boundary))
+        base = self._snapshot_bases.pop(victim)
+        self._snapshot_bases[incoming] = base
+        evicted_authority_bytes = 0
+        if self.slot_policy == "lru":
+            regions = self._authority.pop(victim, None)
+            if regions:
+                evicted_authority_bytes = sum(
+                    region.numel() * region.element_size()
+                    for region in regions.values()
+                )
+                self._authority_bytes -= evicted_authority_bytes
+            self._slot_touch.pop(victim, None)
+        logger.warning(
+            "vllm-030win KVMem snapshot: evicting the whole ring of "
+            "trajectory %s (%d boundary(ies), policy=%s%s) to make room for "
+            "%s; raise VLLM_KVMEM_SNAPSHOT_TRAJ to keep more",
+            victim.hex()[:12],
+            len(old_ring),
+            self.slot_policy,
+            f", authority {evicted_authority_bytes} B freed"
+            if evicted_authority_bytes
+            else "",
+            incoming.hex()[:12],
+        )
+        return base
+
     def _take_snapshots(self, snapshot_requests) -> None:
         """Copy the mamba state slots at page-aligned boundaries to the host.
 
@@ -1542,29 +1657,44 @@ class KVMemWorkspaceWorker:
             trajectory = snapshot.trajectory
             ring = self._snapshot_rings.get(trajectory)
             if ring is None:
-                if len(self._snapshot_bases) >= self.snapshot_traj:
-                    # All trajectory slots taken: evict the least recently
-                    # started ring whole. Its boundaries are reported as
-                    # removed so the scheduler stops matching them.
-                    oldest = next(iter(self._snapshot_bases))
-                    old_ring = self._snapshot_rings.pop(oldest)
-                    for boundary in old_ring:
-                        self._removed_snapshots.append((oldest, boundary))
-                    logger.warning(
-                        "vllm-030win KVMem snapshot: evicting the whole ring "
-                        "of trajectory %s (%d boundary(ies)) to make room for "
-                        "%s; raise VLLM_KVMEM_SNAPSHOT_TRAJ to keep more",
-                        oldest.hex()[:12],
-                        len(old_ring),
-                        trajectory.hex()[:12],
-                    )
-                    base = self._snapshot_bases.pop(oldest)
-                    self._snapshot_bases[trajectory] = base
+                if trajectory in self._snapshot_bases:
+                    # The authority side evicted a slot for us earlier in
+                    # this trajectory's life (capture precedes the first
+                    # snapshot boundary, so a full authority table fires
+                    # first): our base row range is already reserved -- just
+                    # claim it, no eviction needed.
+                    base = self._snapshot_bases[trajectory]
+                elif len(self._snapshot_bases) >= self.snapshot_traj:
+                    victim = self._evictable_victim(trajectory)
+                    if victim is None:
+                        # lru with every holder busy: refuse this snapshot
+                        # rather than evict a working trajectory. The pages
+                        # are still stored; only the recurrent-state jump is
+                        # lost, and the boundary cannot fire again anyway
+                        # (the manager marked it sent).
+                        self.snapshots_refused += 1
+                        if self.snapshots_refused <= 3:
+                            logger.warning(
+                                "vllm-030win KVMem snapshot: refusing the "
+                                "snapshot of trajectory %s at boundary %d "
+                                "(policy=%s, all %d slot(s) busy); assembly "
+                                "for this trajectory is unavailable until a "
+                                "slot frees up",
+                                trajectory.hex()[:12],
+                                snapshot.boundary,
+                                self.slot_policy,
+                                self.snapshot_traj,
+                            )
+                        continue
+                    # _evict_ring hands the recycled base row to this
+                    # trajectory and (under lru) drops its authority region.
+                    self._evict_ring(victim, trajectory)
                 else:
                     base = len(self._snapshot_bases) * self.snapshot_keep
                     self._snapshot_bases[trajectory] = base
                 ring = OrderedDict()
                 self._snapshot_rings[trajectory] = ring
+            self._touch(trajectory)
             if snapshot.boundary in ring:
                 continue
             base = self._snapshot_bases[trajectory]
@@ -1746,6 +1876,8 @@ class KVMemWorkspaceWorker:
                 "rows_written": self._authority_rows_written,
                 "missing": self._authority_missing,
                 "unmapped_layers": self._authority_unmapped,
+                "slot_policy": self.slot_policy,
+                "snapshots_refused": self.snapshots_refused,
                 "remat_pages": self._remat_done,
                 "remat_mismatch": self._remat_mismatch,
                 "remat_max_byte_diff": self._remat_max_byte_diff,

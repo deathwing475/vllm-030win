@@ -963,6 +963,11 @@ class KVMemWorkspaceScheduler:
             boundaries = self._snapshots.get(trajectory)
             if boundaries is not None:
                 boundaries.discard(boundary)
+                if not boundaries:
+                    # Step 103: drop the empty shell so len(self._snapshots)
+                    # counts live snapshot trajectories (the asm-miss debug
+                    # row reports it); an empty set matched nothing anyway.
+                    del self._snapshots[trajectory]
         for req_id in list(getattr(worker_meta, "finished_load_reqs", ())):
             self.loads_completed += 1
             logger.info(

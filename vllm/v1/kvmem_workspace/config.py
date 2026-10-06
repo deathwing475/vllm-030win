@@ -342,6 +342,35 @@ def snapshot_trajectories() -> int:
     return _env_int("VLLM_KVMEM_SNAPSHOT_TRAJ", 2)
 
 
+SLOT_POLICIES = ("legacy", "lru")
+
+
+def slot_policy() -> str:
+    """Trajectory-slot replacement policy (O4 step 103, design §5.4).
+
+    The snapshot rings and the authority region hold at most
+    ``snapshot_trajectories()`` / ``authority_trajectories()`` trajectories,
+    and step 102 measured what happens past that: the ring side evicts the
+    earliest-*started* trajectory's ring whole (an assembly source that was
+    matched one step ago dies), while the authority side refuses new
+    trajectories forever. ``legacy`` (default) keeps exactly that behaviour.
+
+    ``lru`` makes both host regions evict **whole trajectories together**
+    (ring + authority + touch record), picking the least recently *touched*
+    slot that has no in-flight activity in this step (capture/store span,
+    snapshot request, assembly load, or an unresolved snapshot copy event).
+    Touches: snapshot capture, assembly load, page-store commit. With no
+    eligible candidate the incoming snapshot is refused (counted) rather
+    than evicting something busy.
+    """
+    value = os.getenv("VLLM_KVMEM_SLOT_POLICY", "legacy").strip().lower()
+    if value not in SLOT_POLICIES:
+        raise ValueError(
+            f"VLLM_KVMEM_SLOT_POLICY must be in {SLOT_POLICIES}, got {value!r}"
+        )
+    return value
+
+
 def snapshot_every_pages() -> int:
     """Capture one snapshot every N page boundaries (step 066).
 
