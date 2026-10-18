@@ -367,6 +367,10 @@ def recall(args: argparse.Namespace) -> dict:
         )
     d = outdir(args.tag)
     base = BASES[args.arm]
+    probe_env = os.environ.copy()
+    # kvmem_ws_probe.post defaults to the GSQ served-model-name; step 100 made
+    # the mismatch a swallowed ok=false. Orca arms must override it.
+    probe_env["KVMEM_PROBE_MODEL"] = MODELS[args.arm]
     engine_text = read_logs([d / "engine.out.log", d / "engine.err.log"])
     rec: dict = {
         "tag": args.tag,
@@ -406,7 +410,7 @@ def recall(args: argparse.Namespace) -> dict:
                 "--out",
                 str(out),
             ]
-            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+            r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, env=probe_env)
             leg = {"depth": depth, "rc": r.returncode, "out": str(out)}
             if out.exists():
                 leg["probe"] = json.loads(out.read_text(encoding="utf-8"))
@@ -434,7 +438,7 @@ def recall(args: argparse.Namespace) -> dict:
         ]
         if args.reset:
             cmd.append("--reset-prefix-cache")
-        r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+        r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, env=probe_env)
         leg = {"depth": args.depths[0], "rc": r.returncode, "out": str(out)}
         if out.exists():
             leg["probe"] = json.loads(out.read_text(encoding="utf-8"))
