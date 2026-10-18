@@ -166,6 +166,7 @@ def parse_mechanism(text: str) -> dict:
         rec["asm_issued_pages"] = int(m.group(1))
         rec["asm_mamba_blocks"] = int(m.group(2))
     rec["asm_prefix_landed"] = "prefix landed" in text
+    rec["asm_mamba_registered"] = "snapshot region" in text
     rec["asm_miss_lines"] = [
         ln.strip() for ln in text.splitlines() if "asm-miss" in ln
     ][:8]
@@ -266,7 +267,7 @@ def boot(args: argparse.Namespace) -> dict:
     if not args.no_kill:
         kill_and_wait(args.wait_mib)
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True)
+    r = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True, env=env)
     if r.returncode != 0:
         raise SystemExit(f"boot_keep failed rc={r.returncode}: {r.stderr[-400:]}")
 
@@ -304,6 +305,8 @@ def boot(args: argparse.Namespace) -> dict:
         **parse_banner(text),
         **parse_mechanism(text),
     }
+    rec["s108_env"] = {k: v for k, v in env.items() if k.startswith("S108_")}
+    rec["shape_ok"] = (args.load == 1) == bool(rec.get("asm_mamba_registered"))
     (d / "boot.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps(rec, ensure_ascii=False, indent=1))
     if not up:
