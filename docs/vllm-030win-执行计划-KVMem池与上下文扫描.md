@@ -74,12 +74,19 @@
 |---|---|---|---|---|---|
 | **108A** | 零 boot | Phase 0：纸面重算 + 新臂 + runner + 离线回归网 + 止损缺口 | — | 0 | 论文表无 <1.05 的点；三条臂 `--check` 过；`kvmem_capture_op_test.py` 仅 2 项既存 FAIL；page.py apply↔revert 往返过 |
 | **108B-A1** | GSQ KVMem main + recall | 联合前沿上段 | 3.4e9/W=131,072；2.6e9/W=98,304；2.0e9/W=65,536 | 6（每点 recall + speed 各 1） | 起服横幅与纸面并发一致（±5%）；recall 点：窗内针 HIT + 窗外 3 深度 HIT/MISS 记边界 + 页步台账；speed 点：8k 中位 + 90% L TTFT/decode |
-| **108B-A2** | 同上 | 下段/边界 | 1.6e9/W=49,152（必做）；1.2e9/W=32,768（可选） | 4 | 同上；1.2e9 只有在 A1 未明显不可用时才做 |
+| **108B-A2** | 同上 | 下段/边界 | 1.6e9/W=49,152（必做，**speed-only**：视窗预留 32,768+16,384+sink 已超 W ⇒ 0 个检索页，recall 结构性 INCOMPLETE）；1.2e9/W=32,768（可选，同 speed-only） | 2 | 8k 中位 + 90% L TTFT/decode + headroom；recall 写 INCOMPLETE（不是 MISS） |
 | **108B-A3** | GSQ 纯 serve `serve_gsq_serve108.cmd` | 同池对照 | 3.4e9/L=163,072（复用 046/105 读数）；2.6e9/L=117,000；2.0e9/L=85,000 | 4（两个新点各 compile+sample） | 同池同 L 下 8k/90% L 对照；回答「KVMem 换来了什么」：KVMem 接受 200,704 但窗外靠检索，纯 serve 接受较短 L 且全程精确 |
 | **108C** | Orca KVMem main + recall | 池 × L（eager） | 3.1e9/W=65,536/L=131,072；2.0e9 同；1.8e9 同（拒起则 1.9e9） | 6 | 起服横幅 ±10%（公式对 Orca 约低 10%）；L>W 触发淘汰；窗外针 3 深度；速度只做 eager 相对不劣化 |
 | **108D** | 定档点 | 三判据全量 | GSQ 与 Orca 各一个推荐点 | 6（每栈 3） | 8k 中位 + 分型；90% L decode；冷 prefill TTFT；页步中位；窗外 3 深度；装配 `matches`/`issued`/`landed` + read-back 0 mismatch；headroom |
 | **108E**（可选） | A/D 同臂 | lru vs legacy | 同池同 L | 6（3×2） | legacy 失败 + lru landed ⇒ 「缩池须先开 lru」；两者都失败 ⇒ 与 lru 无关 |
 | **108F**（可选） | 1.4e9/W=49,152/L=98,304 | Orca 低池边界 | — | 2 | 只在需要证明低池可行性时做 |
+
+**108B-A1 实测修订（2026-10-18，写入计划供后续批次执行）**：
+
+- **一个 viewport 深度一支干净 boot**。同一 boot 内连跑多深度会被 workspace 残留污染：一次被中断的 ingest 留下 54 页轨迹后，三腿 0.45/0.55/0.65 全 MISS，且每次 rewrite 的 page table 只有 54 页（078 干净态 = 136 页）；干净 boot 单深度立即恢复 136 页并 HIT。多深度的「可用上下文」判据须每深度一支干净 boot（A1 只采信 0.65；0.45/0.55 挪到 108D）。
+- **LOAD=1 的 WSMB = 4096**。WSMB 5120 + 快照区 3.00 GiB 在本机当前 pinned 状态装不下（40×1,677,312 B ×8/×12 失败，随后 `KVBlockZeroer` OOM；无 `Tried to allocate` = 必守 27）。WSMB 4096 三点全部 boot 成功（160 槽 > 200k prompt 的 137 页）。
+- **A1 三点结果**：3.4e9/W131072/p55 / 2.6e9/W98304/p32 / 2.0e9/W65536/p10，横幅 1.17/1.13/1.17x（纸面 ±5% 内），0.65 针全 HIT（TTFT 106.3/63.3/28.5 s，baked 55/32/10，read-back 0 mismatch），8k 单 boot 77.95/92.43/115.29，177,959 档 steady 59.12/77.69/106.33，headroom 515/1,075/1,456 MiB。8k 差值不作池因果（83-129 连续谱）；90% L 趋势与窗口缩小一致，待 108D ≥3 boot。
+- **低 W 结构地板**：`pages = floor((W − 32,768 − 16,384)/1,456) − 1`；W=49,152 ⇒ 0 个检索页（且 0 页时压缩窗 + 生成预留 = 50,608 > 49,152）⇒ A2 的 recall 结构性不可用。
 
 **不在本矩阵内**：`VLLM_KVMEM_VIEWPORT=1` 的 **068-071 双坐标大视窗**（已判死回滚）、检索粒度/`TOPN` 寻优（062 NO-GO + 079 耦合陷阱）、GPU 化烘焙、任何生产 launcher 改动。072+ 单坐标视窗的 recall 腿**在**本矩阵内（074/078 协议）。
 
@@ -165,7 +172,7 @@
 
 - **Orca 速度口径**：eager 同口径相对不劣化（默认）；图兼容腿需单独授权。
 - **GSQ 纯 serve 对照**：做（默认，批 A3）。
-- **recall 腿的视窗页数**：baseline W=131,072 用 55 页（head 81,536 = (1+55)×1456），与 074/078 证据对齐。低 W 的页数需按 096 的派生式重算或单 boot 校准；**未算出的 W 只报装配/窗内，不报窗外**（写 INCOMPLETE，不猜）。
+- **recall 腿的视窗页数**：以 W 为上限套 096 派生式 `pages = floor((W − 32,768 − 16,384)/1,456) − 1`，对 W=131,072 逐位复现 55（head = (1+pages)×1456）；W=98,304→32（head 48,048）、W=65,536→10（head 16,016）。**W=49,152 及以下 ⇒ 0 个检索页 ⇒ 只报 main/speed，recall 写 INCOMPLETE**（不猜、不把 0 页当 MISS）。一个深度一支干净 boot。
 - **lru/legacy**：只在缩池撞 authority 先满时做；不预设结论。
 - **止损缺口**：§10 gap 1（page.py apply/revert 工具）与 gap 2（scratch 归档）已在 Phase 0 收口；gap 3（vision）/gap 5（真新 checkpoint）不在本计划范围。
 
