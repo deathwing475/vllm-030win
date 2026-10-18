@@ -104,7 +104,7 @@
 
 | 补丁 | 落在哪 | apply / revert |
 |---|---|---|
-| page 校验缓存化（**gap 三胜之一 −1.3 ms**） | `flashinfer/page.py`（marker `vllm-030win patch`） | **revert 只在 `G:\qwen3.8model\_tmp_line_b\revert_page_patch.py`，未入 git** ⇒ §10 缺口 #1 |
+| page 校验缓存化（**gap 三胜之一 −1.3 ms**） | `flashinfer/page.py`（marker `vllm-030win patch`） | **`tools/patch_flashinfer_page.py`（actions: apply / revert / verify；2026-10-18 步骤 108A 收口；apply↔revert 往返实测，原子写 + 单代备份 `page.py.bak_step108`）** |
 | `seq_lens_cpu` 同步消除（−2.55 ms） | vllm 树内 | `tools/apply_seq_lens_cpu_patch.py`（含 revert，必守 14） |
 | 077 调度器一次性诊断 / 079 计时 / 080 record 同步 / 081 slot_pick / 066 mamba ext / KV 分组 | 各 apply 脚本，**全部默认关 + 实测可逆** | `tools/apply_sched_trace_step077.py`、`apply_kvmem_timing_step079.py`、`apply_kvmem_record_sync_step080.py`、`apply_kvmem_slot_pick_step081.py`、`apply_kvmem_mamba_ext_step066.py`、`apply_kv_group_size_patch.py` |
 | humming 八件套垫片 | `tools/shims/`（**`SHIMS.md` 是索引**）：`humming_device/forward_dynamo/nvrtc/ops_utils.patched.py` + `mapped_file.h.win32` + `build_devinfo.cmd` + `run_ninja.cmd` + `prebuild_nvrtc4.py` + `qwen3_5.py.embed-patched` | **重装环境必重放**（步骤 010 的"七层洋葱"） |
@@ -228,7 +228,7 @@ KVMem：页 1,640,448 B（89 chunks × 18,432 B，kernel block 16）/ remat 误�
 | 生产 | `nvidia-smi` + `prod_headroom_check.ps1` | 独显 **48 MiB / 0%**，`engine python process not found (service down?)` ⇒ **生产停**（必守 30 只记录） |
 | 旧栈入口 shim | `Qwen3.8-27B-3Bit-GSQ\run_dflash2_n2.cmd`（0.27 栈）与 `_base029.cmd`（现役）并存 | 未删，可直起 |
 
-**明确未核（别当成已核）**：①**没跑 0.27.1 venv 的 `import vllm` 冒烟**（不动只读锚；真回退当天才做，判据 = `python -c "import vllm; print(vllm.__version__)"` 输出 0.27.1）；②`_tmp_line_b/revert_page_patch.py` 只确认脚本在位，**没做 apply↔revert 往返复验**（§10 缺口 #1）。
+**明确未核（别当成已核）**：①**没跑 0.27.1 venv 的 `import vllm` 冒烟**（不动只读锚；真回退当天才做，判据 = `python -c "import vllm; print(vllm.__version__)"` 输出 0.27.1）。②**已核（2026-10-18 步骤 108A）**：`tools/patch_flashinfer_page.py` 的 apply↔revert 往返 = `patched → original → patched`，counts 逐步核对，venv 保持 patched（§10 缺口 #1 已收口）。
 **只回配置、不换栈**的两步链（次序不可反）：`tools/apply_prod_ssm_bf16_step046.py revert` → `tools/apply_prod_kvgroup_step036.py revert`（036 的 revert 断言 `max-model-len == 144432`，046 未回滚时必失败）。
 
 ---
@@ -266,8 +266,8 @@ KVMem：页 1,640,448 B（89 chunks × 18,432 B，kernel block 16）/ remat 误�
 
 ## 10 资产缺口（本步如实记录，不做未授权的补救）
 
-1. **flashinfer `page.py` 补丁的 revert 脚本在 git 之外**（`_tmp_line_b/revert_page_patch.py`）⇒ 违反"补丁必须配 revert"的可核性口径（必守 14）。补救 = 把它收进 `tools/` 并补 apply↔revert 往返复验——**属新增改动，须用户授权**（本步是纯文档，未动代码）。
-2. **`_tmp_line_b\` 里的 arm 生成器（`ctx_arm.py`/`mk_arm.py`/`mk_nospec.py`）与 `boot_keep.py` 不入 git**，而 §5/§8 的动作序列依赖它们 ⇒ 换底座若 scratch 被清，需按 §1.2 重写。同样未入 git：`o86_stair.py`、`o88_acc_sample.py`、`roundG1_097.py` 等各步 runner（台账 json 在 `prod029_logs/`，脚本本身不在仓内）。
+1. ~~**flashinfer `page.py` 补丁的 revert 脚本在 git 之外**~~ **已收口（2026-10-18 步骤 108A）**：`tools/patch_flashinfer_page.py`（apply / revert / verify，原子写 + 单代备份），往返实测 `patched → original → patched`，venv 保持 patched；必守 14 的可核性口径恢复。
+2. ~~**`_tmp_line_b\` 里的 arm 生成器与 `boot_keep.py` 不入 git**~~ **部分收口（2026-10-18 步骤 108A）**：`ctx_arm.py`、`mk_arm.py`、`mk_nospec.py`、`roundE1_082.py`、`roundB_082.py`、`boot_keep.py` 已逐字节归档到 `tools/scratch/`（README 记 SHA-256）；步骤 108 起用维护版 `tools/make_kvmem108_arms.py` + `tools/kvmem108_scan.py`。**仍未入 git**：`o86_stair.py`、`o88_acc_sample.py`、`roundG1_097.py` 等单步 runner。
 3. **vision 面从未切到 0.29 栈**（A7 锚未采）⇒ 新底座适配时 vision 只能当"无锚起点"，别照抄本文 §4.4 的 GSQ 数字。
 4. **`kvmem_capture_op_test.py` 2 项既存 FAIL**（097 记账、非该步引入）⇒ KVMem 线解冻前它是脏的回归网。
 5. 泛用链的**真新 checkpoint 全流程未验**（§8 末段）⇒ "零人写数字"目前是双模型复现层面的验收，不是跨模型承诺。
