@@ -88,6 +88,14 @@
 - **A1 三点结果**：3.4e9/W131072/p55 / 2.6e9/W98304/p32 / 2.0e9/W65536/p10，横幅 1.17/1.13/1.17x（纸面 ±5% 内），0.65 针全 HIT（TTFT 106.3/63.3/28.5 s，baked 55/32/10，read-back 0 mismatch），8k 单 boot 77.95/92.43/115.29，177,959 档 steady 59.12/77.69/106.33，headroom 515/1,075/1,456 MiB。8k 差值不作池因果（83-129 连续谱）；90% L 趋势与窗口缩小一致，待 108D ≥3 boot。
 - **低 W 结构地板**：`pages = floor((W − 32,768 − 16,384)/1,456) − 1`；W=49,152 ⇒ 0 个检索页（且 0 页时压缩窗 + 生成预留 = 50,608 > 49,152）⇒ A2 的 recall 结构性不可用。
 
+**108B-A2 + 108C 实测修订（2026-10-18）**：
+
+- **A2 只跑 speed**：W=49,152 的 096 派生式给 0 个检索页（且 0 页时压缩窗 + 生成预留 = 50,608 > 49,152）⇒ recall 结构性 INCOMPLETE。A2 读数 = 横幅 1.16x、8k 107.41、177,959 档 TTFT 166.6 s / steady 101.19、headroom 1,840 MiB；比 2.0e9 只多 384 MiB，不作推荐点。
+- **Orca 可用池 ≤2.0e9**：3.1e9 的横幅 2.11x 与 2.0e9 的 1.36x（纸面 +11.5%）、1.8e9 的 1.22x（纸面 +11%）都以横幅为准；3.1e9 在 KVMem 锁页区叠加后处于池悬崖上方——117,314 档冷 TTFT **1119.6 s** vs 2.0e9 的 **120.7 s**（9.3×），steady 18.92 vs 18.00（同带）；2.0e9/1.8e9 的视窗 recall 都有效 HIT（10 槽、baked 10、read-back 0、TTFT 25.8 s）。**Orca 的 ~18-19 tok/s = eager no-spec 基线，不随池变**；结论限定 eager no-spec，不与生产 FULL+DFlash2 78-87 比。
+- **Orca recall 的有效性前置**：flush 必须把 ingest 的原生块顶掉（日志必须出现 `rewritten` + `baked`）。3.1e9 的池 236 块 > ingest+flush 164 块 ⇒ flush 不驱逐、serve 原生命中、针（76.2k）在原生 65,536 窗内 ⇒ 探针 HIT 是 recency，不采信。C 点的 recall 只在 2.0e9/1.8e9 有效。
+- **headroom 工具的 KVMem 假阳性**：`prod_headroom_check.ps1` 的 `evicted weight pages = engine shared − offload 8192 − 106` 把 workspace + 快照 + 权威区（~9.8-10.7 GiB pinned）算成被驱逐权重；C1/C2/C3 的 DEGRADED 都不成立。**判 KVMem 臂的池悬崖只看 prefill 时间/首请求 TTFT**；真正的新分配仍按 049 看独显余量。
+- **Orca 的 90% L 档用 117,965**（L=131,072），不能照抄 GSQ 的 180,633（会超 L 被拒）。
+
 **不在本矩阵内**：`VLLM_KVMEM_VIEWPORT=1` 的 **068-071 双坐标大视窗**（已判死回滚）、检索粒度/`TOPN` 寻优（062 NO-GO + 079 耦合陷阱）、GPU 化烘焙、任何生产 launcher 改动。072+ 单坐标视窗的 recall 腿**在**本矩阵内（074/078 协议）。
 
 ---
