@@ -350,6 +350,18 @@ def anchor(args: argparse.Namespace) -> dict:
 def recall(args: argparse.Namespace) -> dict:
     if args.arm == "gsq_serve":
         raise SystemExit("the pure-serve control arm has no KVMem recall path")
+    if args.head_tokens is None:
+        if args.arm == "orca":
+            raise SystemExit(
+                "Orca viewport head is not calibrated (W=65,536, pages=40 would "
+                "put head+recent above the window); pass --head-tokens and --w"
+            )
+        args.head_tokens = 81_536  # GSQ W=131072 + 55 pages at page 1456
+    if args.w and args.head_tokens + args.recent_tokens > args.w:
+        raise SystemExit(
+            f"head {args.head_tokens} + recent {args.recent_tokens} exceeds "
+            f"window {args.w}; the viewport probe would not be in-window"
+        )
     d = outdir(args.tag)
     base = BASES[args.arm]
     engine_text = read_logs([d / "engine.out.log", d / "engine.err.log"])
@@ -558,8 +570,10 @@ def main() -> int:
     p.add_argument("--mode", choices=("viewport", "assembly"), required=True)
     p.add_argument("--depths", type=float, nargs="+", default=[0.45, 0.55, 0.65])
     p.add_argument("--tokens", type=int, default=200_000)
-    p.add_argument("--head-tokens", type=int, default=81_536,
-                   help="GSQ W=131072 + 55 pages at page 1456 = (1+55)*1456")
+    p.add_argument("--w", type=int, default=0,
+                   help="sliding window, used to check head+recent <= W")
+    p.add_argument("--head-tokens", type=int, default=None,
+                   help="GSQ default 81,536 = (1+55)*1456; Orca requires an explicit calibrated value")
     p.add_argument("--recent-tokens", type=int, default=16_384)
     p.add_argument("--tail-tokens", type=int, default=768)
     p.add_argument("--reset", action="store_true")
